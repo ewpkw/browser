@@ -109,8 +109,10 @@
   const validUAPlatforms = ['macOS', 'Windows', 'Linux', 'FreeBSD', 'Unknown'];
   testing.expectEqual(true, validUAPlatforms.includes(navigator.userAgentData.platform));
 
-  testing.expectEqual(1, navigator.userAgentData.brands.length);
-  testing.expectEqual({brand: 'Lightpanda', version: "1"}, navigator.userAgentData.brands[0]);
+  testing.expectEqual(3, navigator.userAgentData.brands.length);
+  testing.expectEqual({brand: 'Not=A?Brand', version: "99"}, navigator.userAgentData.brands[0]);
+  testing.expectEqual({brand: 'Microsoft Edge', version: "151"}, navigator.userAgentData.brands[1]);
+  testing.expectEqual({brand: 'Chromium', version: "151"}, navigator.userAgentData.brands[2]);
 
   // Same instance returned on repeated access
   testing.expectEqual(true, navigator.userAgentData === navigator.userAgentData);
@@ -119,7 +121,7 @@
   testing.expectEqual(false, json.mobile);
   testing.expectEqual(navigator.userAgentData.platform, json.platform);
   testing.expectEqual(true, Array.isArray(json.brands));
-  testing.expectEqual('Lightpanda', json.brands[0].brand);
+  testing.expectEqual('Not=A?Brand', json.brands[0].brand);
 </script>
 
 <script id=userAgentData_highEntropy type=module>
@@ -135,8 +137,9 @@
       testing.expectEqual(navigator.userAgentData.platform, v.platform);
       testing.expectEqual(true, Array.isArray(v.brands));
       testing.expectEqual(true, Array.isArray(v.fullVersionList));
-      testing.expectEqual('Lightpanda', v.fullVersionList[0].brand);
-      testing.expectEqual('1.0.0.0', v.uaFullVersion);
+      testing.expectEqual('Not=A?Brand', v.fullVersionList[0].brand);
+      testing.expectEqual('Microsoft Edge', v.fullVersionList[1].brand);
+      testing.expectEqual('151.0.7813.2', v.uaFullVersion);
       testing.expectEqual(false, v.wow64);
       testing.expectEqual(true, Array.isArray(v.formFactor));
       testing.expectEqual('Desktop', v.formFactor[0]);

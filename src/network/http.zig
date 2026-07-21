@@ -132,7 +132,18 @@ pub const Headers = struct {
             return error.OutOfMemory;
         }
 
-        return .{ .headers = updated_headers };
+        const with_platform = libcurl.curl_slist_append(updated_headers, Config.HttpHeaders.sec_ch_ua_platform);
+        if (with_platform == null) return error.OutOfMemory;
+        const with_mobile = libcurl.curl_slist_append(with_platform, Config.HttpHeaders.sec_ch_ua_mobile);
+        if (with_mobile == null) return error.OutOfMemory;
+        const with_arch = libcurl.curl_slist_append(with_mobile, Config.HttpHeaders.sec_ch_ua_arch);
+        if (with_arch == null) return error.OutOfMemory;
+        const with_bitness = libcurl.curl_slist_append(with_arch, Config.HttpHeaders.sec_ch_ua_bitness);
+        if (with_bitness == null) return error.OutOfMemory;
+        const with_wow64 = libcurl.curl_slist_append(with_bitness, Config.HttpHeaders.sec_ch_ua_wow64);
+        if (with_wow64 == null) return error.OutOfMemory;
+
+        return .{ .headers = with_wow64 };
     }
 
     pub fn deinit(self: *const Headers) void {

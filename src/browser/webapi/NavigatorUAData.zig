@@ -56,21 +56,16 @@ pub fn toJSON(_: *const NavigatorUAData) struct {
 }
 
 pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
-    // This should always return `brands` + `mobile` + `platform` and then whatever
-    // "hints" field is requested (assuming the browser has permission), but it's
-    // also valid to just return everything.
-
     _ = hints;
-
     return exec.js.local.?.resolvePromise(.{
         .brands = brandList(),
         .mobile = false,
         .platform = uaPlatform(),
-        .architecture = uaArchitecture(),
-        .bitness = uaBitness(),
+        .architecture = "x86",
+        .bitness = "64",
         .model = "",
-        .platformVersion = "",
-        .uaFullVersion = "1.0.0.0",
+        .platformVersion = "15.0.0",
+        .uaFullVersion = "151.0.7813.2",
         .fullVersionList = brandList(),
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
@@ -91,13 +86,7 @@ fn brandList() []const Brand {
 }
 
 fn uaPlatform() []const u8 {
-    return switch (builtin.os.tag) {
-        .macos => "macOS",
-        .windows => "Windows",
-        .linux => "Linux",
-        .freebsd => "FreeBSD",
-        else => "Unknown",
-    };
+    return "Windows";
 }
 
 fn uaArchitecture() []const u8 {

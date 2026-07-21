@@ -42,12 +42,12 @@ pub fn getUserAgent(_: *const Navigator, exec: *const Execution) []const u8 {
     return exec.session.browser.http_client.getUserAgent();
 }
 
-pub fn getLanguages(_: *const Navigator) [2][]const u8 {
-    return .{ "en-US", "en" };
+pub fn getLanguages(_: *const Navigator) [3][]const u8 {
+    return .{ "zh-CN", "en-US", "en" };
 }
 
 pub fn getDoNotTrack(_: *const Navigator) ?[]const u8 {
-    return null;
+    return "1";
 }
 
 pub fn getAppName(_: *const Navigator) []const u8 {
@@ -59,11 +59,11 @@ pub fn getAppCodeName(_: *const Navigator) []const u8 {
 }
 
 pub fn getAppVersion(_: *const Navigator) []const u8 {
-    return "1.0";
+    return "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0";
 }
 
 pub fn getLanguage(_: *const Navigator) []const u8 {
-    return "en-US";
+    return "zh-CN";
 }
 
 pub fn getOnLine(_: *const Navigator) bool {
@@ -75,19 +75,19 @@ pub fn getCookieEnabled(_: *const Navigator) bool {
 }
 
 pub fn getHardwareConcurrency(_: *const Navigator) u32 {
-    return 4;
+    return 32;
 }
 
 pub fn getDeviceMemory(_: *const Navigator) f64 {
-    return 8.0;
+    return 32;
 }
 
 pub fn getMaxTouchPoints(_: *const Navigator) u32 {
-    return 0;
+    return 10;
 }
 
 pub fn getVendor(_: *const Navigator) []const u8 {
-    return "";
+    return "Google Inc.";
 }
 
 pub fn getProduct(_: *const Navigator) []const u8 {
@@ -108,13 +108,7 @@ pub fn getGlobalPrivacyControl(_: *const Navigator) bool {
 }
 
 pub fn getPlatform(_: *const Navigator) []const u8 {
-    return switch (builtin.os.tag) {
-        .macos => "MacIntel",
-        .windows => "Win32",
-        .linux => "Linux x86_64",
-        .freebsd => "FreeBSD",
-        else => "Unknown",
-    };
+    return "Win32";
 }
 
 /// Returns whether Java is enabled (always false)

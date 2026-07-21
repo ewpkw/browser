@@ -380,11 +380,10 @@
     \\          Path to the SQLite database file for persistent storage.
     \\          Use ":memory:" for in-memory storage.
     \\  --user-agent <STRING>
-    \\          Override the User-Agent header entirely. Must not impersonate other
-    \\          browsers; any value containing "Mozilla" is forbidden. The browser
-    \\          still sends Sec-Ch-Ua. Incompatible with --user-agent-suffix.
+    \\          Override the User-Agent header entirely. The browser still sends
+    \\          Sec-Ch-Ua. Incompatible with --user-agent-suffix.
     \\  --user-agent-suffix <STRING>
-    \\          Suffix appended to the Lightpanda/X.Y User-Agent.
+    \\          Suffix appended to the default User-Agent.
     \\  --v8-flags-unsafe <FLAGS>
     \\          Flags passed as-is to the V8 JavaScript engine, space-separated.
     \\          e.g. --v8-flags-unsafe "--expose-gc --stack-size 1000".

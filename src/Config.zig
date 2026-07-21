@@ -653,7 +653,7 @@ pub const WaitUntil = enum {
 /// Pre-formatted HTTP headers for reuse across Http and Client.
 /// Must be initialized with an allocator that outlives all HTTP connections.
 pub const HttpHeaders = struct {
-    const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
+    const user_agent_base: [:0]const u8 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0";
 
     const Brand = struct {
         brand: [:0]const u8,
@@ -664,7 +664,9 @@ pub const HttpHeaders = struct {
     /// HTTP header and navigator.userAgentData.brands derive from this
     /// list, so the two sides cannot drift.
     pub const brands = [_]Brand{
-        .{ .brand = "Lightpanda", .version = "1" },
+        .{ .brand = "Not=A?Brand", .version = "99" },
+        .{ .brand = "Microsoft Edge", .version = "151" },
+        .{ .brand = "Chromium", .version = "151" },
     };
 
     pub const sec_ch_ua: [:0]const u8 = blk: {
@@ -681,6 +683,12 @@ pub const HttpHeaders = struct {
     // treating it as a bot signal. Ship a neutral default so we look like a
     // normal client.
     pub const accept_language: [:0]const u8 = "Accept-Language: en-US,en;q=0.9";
+
+    pub const sec_ch_ua_platform: [:0]const u8 = "Sec-Ch-Ua-Platform: \"Windows\"";
+    pub const sec_ch_ua_mobile: [:0]const u8 = "Sec-Ch-Ua-Mobile: ?0";
+    pub const sec_ch_ua_arch: [:0]const u8 = "Sec-Ch-Ua-Arch: \"x86\"";
+    pub const sec_ch_ua_bitness: [:0]const u8 = "Sec-Ch-Ua-Bitness: \"64\"";
+    pub const sec_ch_ua_wow64: [:0]const u8 = "Sec-Ch-Ua-WoW64: ?0";
 
     // Document-navigation Accept value Chrome sends.
     pub const navigation_accept: [:0]const u8 = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
@@ -843,10 +851,6 @@ pub fn validateUserAgent(ua: []const u8) !void {
         if (!std.ascii.isPrint(c)) {
             return error.NonPrintable;
         }
-    }
-
-    if (std.ascii.indexOfIgnoreCase(ua, "mozilla") != null) {
-        return error.Reserved;
     }
 }
 

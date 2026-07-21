@@ -61,7 +61,7 @@ pub const JsApi = struct {
         pub const empty_with_no_proto = true;
     };
 
-    pub const length = bridge.property(0, .{ .template = false });
+    pub const length = bridge.property(5, .{ .template = false });
     pub const refresh = bridge.function(PluginArray.refresh, .{});
     pub const @"[int]" = bridge.indexed(PluginArray.getAtIndex, null, .{ .null_as_undefined = true });
     pub const @"[str]" = bridge.namedIndexed(PluginArray.getByName, null, null, null, null, .{ .null_as_undefined = true });

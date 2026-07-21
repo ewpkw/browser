@@ -628,25 +628,6 @@ test "cdp.network setExtraHTTPHeaders rejects non-printable User-Agent" {
     try testing.expectEqual("x-custom: hi", std.mem.span(bc.extra_headers.items[0]));
 }
 
-test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
-
-    var ctx = try testing.context();
-    defer ctx.deinit();
-
-    _ = try ctx.loadBrowserContext(.{ .id = "NID-UA2", .session_id = "NESI-UA2" });
-
-    try ctx.processMessage(.{
-        .id = 3,
-        .method = "Network.setExtraHTTPHeaders",
-        .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0" } },
-    });
-
-    const bc = ctx.cdp().browser_context.?;
-    try testing.expectEqual(bc.extra_headers.items.len, 0);
-}
-
 test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -661,28 +642,6 @@ test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
 
     const bc = ctx.cdp().browser_context.?;
     try testing.expectEqual(bc.extra_headers.items.len, 1);
-}
-
-test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent smuggled via a colon in the key" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
-
-    var ctx = try testing.context();
-    defer ctx.deinit();
-
-    _ = try ctx.loadBrowserContext(.{ .id = "NID-UA4", .session_id = "NESI-UA4" });
-
-    // A colon in the key desyncs the raw key from the first-colon parse that
-    // req.headers.set/libcurl use: "User-Agent:Mozilla/5.0 (X: Y)" parses to
-    // name="User-Agent", value="Mozilla/5.0 (X: Y)" on the wire.
-    try ctx.processMessage(.{
-        .id = 3,
-        .method = "Network.setExtraHTTPHeaders",
-        .params = .{ .headers = .{ .@"User-Agent:Mozilla/5.0 (X" = "Y)" } },
-    });
-
-    const bc = ctx.cdp().browser_context.?;
-    try testing.expectEqual(bc.extra_headers.items.len, 0);
 }
 
 test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF" {
@@ -700,7 +659,7 @@ test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF" {
         .id = 3,
         .method = "Network.setExtraHTTPHeaders",
         .params = .{ .headers = .{
-            .@"x-custom" = "bar\r\nUser-Agent: Mozilla/5.0",
+            .@"x-custom" = "bar\r\nUser-Agent: CustomBot/1.0",
             .@"x-keep" = "ok",
         } },
     });

@@ -157,10 +157,6 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     const ua = params.userAgent;
     Config.validateUserAgent(ua) catch |err| switch (err) {
         error.NonPrintable => return cmd.sendError(-32602, "User agent contains non-printable characters", .{}),
-        error.Reserved => {
-            log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla" });
-            return cmd.sendResult(null, .{});
-        },
     };
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
@@ -185,42 +181,6 @@ test "cdp.Emulation: setUserAgentOverride with valid user agent" {
     });
 
     try ctx.expectSentResult(null, .{ .id = 1 });
-}
-
-test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
-
-    var ctx = try testing.context();
-    defer ctx.deinit();
-    _ = try ctx.loadBrowserContext(.{ .id = "BID-UA2" });
-
-    try ctx.processMessage(.{
-        .id = 2,
-        .method = "Emulation.setUserAgentOverride",
-        .params = .{ .userAgent = "Mozilla/5.0 (Windows NT 10.0)" },
-    });
-
-    try ctx.expectSentResult(null, .{});
-    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
-}
-
-test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
-
-    var ctx = try testing.context();
-    defer ctx.deinit();
-    _ = try ctx.loadBrowserContext(.{ .id = "BID-UA3" });
-
-    try ctx.processMessage(.{
-        .id = 3,
-        .method = "Emulation.setUserAgentOverride",
-        .params = .{ .userAgent = "MOZILLA/5.0 test" },
-    });
-
-    try ctx.expectSentResult(null, .{});
-    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
 }
 
 test "cdp.Emulation: setUserAgentOverride rejects non-printable characters" {
