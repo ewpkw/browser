@@ -625,7 +625,9 @@ make download-v8
 
 echo "==> [5/6] 编译 release 版本..."
 export LIGHTPANDA_DISABLE_TELEMETRY=1
-make build
+# make build  # 默认针对编译机 CPU 优化（AMD EPYC 9T25），可能不兼容 Intel
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译，确保指令集兼容
+make build ZIGFLAGS="-Dcpu=skylake-avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
 
 echo "==> [6/6] 安装到 ~/.local/bin..."
 mkdir -p "$HOME/.local/bin"
@@ -650,7 +652,9 @@ chmod +x init.sh && sudo ./init.sh /path/to/browser
 make download-v8
 
 # 编译 release 版本（含 V8 snapshot）
-make build
+# make build  # 默认针对编译机 CPU 优化，可能不兼容其他 CPU
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译
+make build ZIGFLAGS="-Dcpu=skylake-avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
 
 # 安装到 ~/.local/bin（确保 ~/.local/bin 在 PATH 中）
 mkdir -p ~/.local/bin
@@ -669,9 +673,16 @@ lightpanda serve --host 0.0.0.0 --port 9222
 ### 8.3 增量编译
 
 ```bash
-make build    # 仅重新编译（V8 不变）
+# make build    # 默认针对编译机 CPU 优化
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译
+make build ZIGFLAGS="-Dcpu=skylake-avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
 make clean    # 完全清理（保留 V8 缓存）
 ```
+
+> **CPU 指令集说明**：编译机为 AMD EPYC 9T25（Zen 5），默认编译会启用 Zen 5 特有指令（如 AVX-512 VNNI/VBMI），
+> 这些指令在 Intel Xeon Platinum（Skylake-SP）上不存在，导致运行时 `SIGILL`（非法指令）崩溃。
+> 使用 `-Dcpu=skylake-avx512` 确保只生成 Skylake-SP 支持的指令集（AVX-512 F/DQ/CD/BW/VL）。
+> 如需兼容更老的 CPU，改用 `-Dcpu=baseline`（任何 x86_64 都能跑，性能损失约 5-10%）。
 
 ### 8.4 编译产物
 
@@ -780,7 +791,8 @@ git merge main
 #    - src/cdp/domains/network.zig
 
 # 5. 编译验证（确认合并无误）
-make build && make test
+# make build && make test  # 默认针对编译机 CPU
+make build ZIGFLAGS="-Dcpu=skylake-avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a" && make test
 
 # 6. 备份到自己的远程仓库
 #    如果用 rebase 了需要 force push
@@ -811,7 +823,9 @@ git push origin chrome
 
 ```bash
 # 1. 编译
-make build
+# make build  # 默认针对编译机 CPU 优化
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译
+make build ZIGFLAGS="-Dcpu=skylake-avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
 
 # 2. 运行测试
 make test
