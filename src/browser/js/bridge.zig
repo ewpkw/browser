@@ -882,19 +882,12 @@ pub const JsApiLookup = struct {
     ///    const index_id = types.getId(@TypeOf(res));
     ///
     pub const Enum = blk: {
-        var fields: [JsApis.len]std.builtin.Type.EnumField = undefined;
+        var names: [JsApis.len][:0]const u8 = undefined;
         for (JsApis, 0..) |JsApi, i| {
-            fields[i] = .{ .name = @typeName(JsApi), .value = i };
+            names[i] = @typeName(JsApi);
         }
 
-        break :blk @Type(.{
-            .@"enum" = .{
-                .fields = &fields,
-                .tag_type = BackingInt,
-                .is_exhaustive = true,
-                .decls = &.{},
-            },
-        });
+        break :blk @Enum(BackingInt, .exhaustive, &names, &std.simd.iota(BackingInt, JsApis.len));
     };
 
     /// Returns a boolean indicating if a type exist in the lookup.
@@ -1077,6 +1070,12 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/element/svg/Polyline.zig"),
     @import("../webapi/svg/AnimatedString.zig"),
     @import("../webapi/svg/Number.zig"),
+    @import("../webapi/svg/Length.zig"),
+    @import("../webapi/svg/Angle.zig"),
+    @import("../webapi/svg/Transform.zig"),
+    @import("../webapi/svg/AnimatedLength.zig"),
+    @import("../webapi/svg/PreserveAspectRatio.zig"),
+    @import("../webapi/svg/AnimatedPreserveAspectRatio.zig"),
     @import("../webapi/encoding/TextDecoder.zig"),
     @import("../webapi/encoding/TextEncoder.zig"),
     @import("../webapi/encoding/TextEncoderStream.zig"),

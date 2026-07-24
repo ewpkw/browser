@@ -336,7 +336,7 @@ pub fn stringToPersistedFunction(
     self: *Context,
     function_body: []const u8,
     comptime parameter_names: []const []const u8,
-    extensions: []const v8.Object,
+    extensions: []const *const v8.Object,
 ) !js.Function.Global {
     var ls: js.Local.Scope = undefined;
     self.localScope(&ls);
@@ -1087,6 +1087,17 @@ pub fn queueIntersectionDelivery(self: *Context) !void {
         fn run(ctx: *Context) void {
             switch (ctx.global) {
                 .frame => |frame| Frame.observers.deliverIntersections(frame),
+                .worker => unreachable,
+            }
+        }
+    }.run);
+}
+
+pub fn queueResizeDelivery(self: *Context) !void {
+    self.enqueueMicrotask(struct {
+        fn run(ctx: *Context) void {
+            switch (ctx.global) {
+                .frame => |frame| Frame.observers.deliverResizes(frame),
                 .worker => unreachable,
             }
         }

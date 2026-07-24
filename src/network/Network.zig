@@ -24,6 +24,7 @@ const App = @import("../App.zig");
 const Config = @import("../Config.zig");
 
 const CDP = @import("../cdp/CDP.zig");
+const sys_net = @import("../sys/net.zig");
 const libcurl = @import("../sys/libcurl.zig");
 const crypto = @import("../sys/libcrypto.zig");
 
@@ -37,7 +38,6 @@ const Cache = @import("cache/Cache.zig");
 const FsCache = @import("cache/FsCache.zig");
 
 const log = lp.log;
-const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const DoublyLinkedList = std.DoublyLinkedList;
@@ -94,12 +94,12 @@ web_bot_auth: ?WebBotAuth,
 
 connections: []http.Connection,
 available: DoublyLinkedList = .{},
-conn_mutex: std.Thread.Mutex = .{},
+conn_mutex: std.Io.Mutex = .init,
 
-ws_pool: std.heap.MemoryPool(http.Connection),
+ws_pool: std.heap.memory_pool.ExtraManaged(http.Connection, .{}),
 ws_count: usize = 0,
 ws_max: u8,
-ws_mutex: std.Thread.Mutex = .{},
+ws_mutex: std.Io.Mutex = .init,
 
 pollfds: []posix.pollfd,
 listener: ?Listener = null,
@@ -115,8 +115,8 @@ shutdown: std.atomic.Value(bool) = .init(false),
 // serialized by cdp_mutex. cdp_unregister signals when a link
 // transitions to .removed so unregisterCdp can return.
 cdp_links: DoublyLinkedList = .{},
-cdp_mutex: std.Thread.Mutex = .{},
-cdp_unregister: std.Thread.Condition = .{},
+cdp_mutex: std.Io.Mutex = .init,
+cdp_unregister: std.Io.Condition = .init,
 // Per-iteration snapshot of CdpLinks whose sockets are in pollfds.
 // Sized at maxConnections at init time so we never allocate inside
 // run(). Parallel to pollfds[cdp_start..cdp_start + cdp_poll_count].
@@ -164,7 +164,7 @@ pub fn init(allocator: Allocator, app: *App, config: *const Config) !Network {
     globalInit(allocator);
     errdefer globalDeinit();
 
-    const pipe = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const pipe = try sys_net.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
 
     // pollfds layout:
     //   [0]                                  wakeup pipe
@@ -183,7 +183,14 @@ pub fn init(allocator: Allocator, app: *App, config: *const Config) !Network {
 
     const x509_store = blk: {
         if (config.tlsVerifyHost()) {
-            break :blk try createX509Store(allocator);
+            break :blk try prepareX509Store(allocator, config);
+        }
+        // Verification is off, so the store is never consulted — but still
+        // take ownership of a user-supplied one so the flags compose and
+        // nothing leaks.
+        if (config.customCertStore()) |store| {
+            log.warn(.app, "custom CA ignored", .{ .arg = "--ca-cert, --ca-path", .reason = "TLS verification disabled" });
+            break :blk store;
         }
         break :blk crypto.X509_STORE_new() orelse {
             return error.FailedToCreateX509Store;
@@ -269,7 +276,7 @@ pub fn init(allocator: Allocator, app: *App, config: *const Config) !Network {
 pub fn deinit(self: *Network) void {
     for (&self.wakeup_pipe) |*fd| {
         if (fd.* >= 0) {
-            posix.close(fd.*);
+            _ = std.c.close(fd.*);
             fd.* = -1;
         }
     }
@@ -303,7 +310,7 @@ pub fn deinit(self: *Network) void {
 
 pub fn bind(
     self: *Network,
-    address: *net.Address,
+    address: *sys_net.IpAddress,
     ctx: *anyopaque,
     on_accept: *const fn (ctx: *anyopaque, socket: posix.socket_t) void,
 ) !void {
@@ -312,23 +319,24 @@ pub fn bind(
     self.accept.store(true, .release);
 
     const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
-    const listener = try posix.socket(address.any.family, flags, posix.IPPROTO.TCP);
-    errdefer posix.close(listener);
+    const listener = try sys_net.socket(sys_net.family(address), flags, posix.IPPROTO.TCP);
+    errdefer _ = std.c.close(listener);
 
     try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     if (@hasDecl(posix.TCP, "NODELAY")) {
         try posix.setsockopt(listener, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
     }
 
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    try posix.listen(listener, self.config.maxPendingConnections());
+    const sa = sys_net.sockaddrFromAddress(address);
+    try sys_net.bind(listener, sa.ptr(), sa.len);
+    try sys_net.listen(listener, self.config.maxPendingConnections());
 
     // When the caller requests port 0, the OS assigns an ephemeral port; read
     // the actual bound address back so callers (e.g. logging) see the real port.
     var bound: posix.sockaddr.storage = undefined;
     var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    try posix.getsockname(listener, @ptrCast(&bound), &bound_len);
-    address.* = net.Address.initPosix(@ptrCast(@alignCast(&bound)));
+    try sys_net.getsockname(listener, @ptrCast(&bound), &bound_len);
+    address.* = sys_net.addressFromSockaddr(@ptrCast(&bound));
 
     self.listener = .{
         .socket = listener,
@@ -351,10 +359,10 @@ pub fn unbind(self: *Network) void {
 // owns the link and must keep it alive until unregisterCdp is called.
 // The caller must not read from the socket.
 pub fn registerCdp(self: *Network, link: *CdpLink) void {
-    self.cdp_mutex.lock();
+    self.cdp_mutex.lockUncancelable(lp.io);
     self.cdp_links.append(&link.node);
     self.cdp_dirty = true;
-    self.cdp_mutex.unlock();
+    self.cdp_mutex.unlock(lp.io);
     self.wakeupPoll();
 }
 
@@ -364,8 +372,8 @@ pub fn registerCdp(self: *Network, link: *CdpLink) void {
 // the link unsolicited (state == .removed) — returns immediately in
 // that case.
 pub fn unregisterCdp(self: *Network, link: *CdpLink) void {
-    self.cdp_mutex.lock();
-    defer self.cdp_mutex.unlock();
+    self.cdp_mutex.lockUncancelable(lp.io);
+    defer self.cdp_mutex.unlock(lp.io);
     if (link.state == .live) {
         link.state = .unregistering;
         self.cdp_dirty = true;
@@ -374,21 +382,30 @@ pub fn unregisterCdp(self: *Network, link: *CdpLink) void {
 
     while (link.state != .removed) {
         // condition variable, waiting for a signal
-        self.cdp_unregister.wait(&self.cdp_mutex);
+        self.cdp_unregister.waitUncancelable(lp.io, &self.cdp_mutex);
     }
 }
 
+const DropCdpOpts = struct {
+    // on_disconnect is fired iff `notify` is true. false when the worker already
+    // knows the link is dead.
+    notify: bool,
+
+    // Set when we know the peer is dead. Can help unblock a blocked worker's send()
+    shutdown_socket: bool = false,
+};
+
 // Drop a link from the poll set. Caller must hold cdp_mutex.
-//   - on_disconnect is fired iff `notify` is true. Set notify=false
-//     when the consumer already knows the link is dead (e.g. close
-//     frame just went through on_bytes; the .close message in the
-//     inbox is enough to wake the worker).
-//   - The worker is woken via curl_multi_wakeup either way.
-fn dropCdp(self: *Network, link: *CdpLink, err: ?anyerror, notify: bool) void {
+fn dropCdp(self: *Network, link: *CdpLink, err: ?anyerror, opts: DropCdpOpts) void {
     self.cdp_links.remove(&link.node);
     link.state = .removed;
     self.cdp_dirty = true;
-    if (notify) {
+
+    if (opts.shutdown_socket) {
+        sys_net.shutdown(link.socket, .both) catch {};
+    }
+
+    if (opts.notify) {
         link.cdp.terminateFromNetwork();
 
         // notify=true means the worker hasn't been told yet — push the
@@ -409,8 +426,8 @@ fn dropCdp(self: *Network, link: *CdpLink, err: ?anyerror, notify: bool) void {
 fn prepareCdpPollFds(self: *Network) void {
     const cdp_start = self.cdp_start;
 
-    self.cdp_mutex.lock();
-    defer self.cdp_mutex.unlock();
+    self.cdp_mutex.lockUncancelable(lp.io);
+    defer self.cdp_mutex.unlock(lp.io);
 
     // Idle fast-path: link set unchanged since last rebuild, so the
     // snapshot + pollfds entries from the previous iteration are still
@@ -449,8 +466,8 @@ fn processCdpEvents(self: *Network) void {
     var any_removed = false;
     const cdp_start = self.cdp_start;
 
-    self.cdp_mutex.lock();
-    defer self.cdp_mutex.unlock();
+    self.cdp_mutex.lockUncancelable(lp.io);
+    defer self.cdp_mutex.unlock(lp.io);
 
     // First pass: pending unregister requests.
     var it = self.cdp_links.first;
@@ -458,7 +475,7 @@ fn processCdpEvents(self: *Network) void {
         const next = node.next;
         const link: *CdpLink = @fieldParentPtr("node", node);
         if (link.state == .unregistering) {
-            self.dropCdp(link, null, false);
+            self.dropCdp(link, null, .{ .notify = false });
             any_removed = true;
         }
         it = next;
@@ -478,7 +495,7 @@ fn processCdpEvents(self: *Network) void {
 
         const fatal_events: i16 = comptime @intCast(posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL);
         if (pfd.revents & fatal_events != 0) {
-            self.dropCdp(link, null, true);
+            self.dropCdp(link, null, .{ .notify = true, .shutdown_socket = true });
             any_removed = true;
             continue;
         }
@@ -492,7 +509,7 @@ fn processCdpEvents(self: *Network) void {
             error.WouldBlock => continue,
             else => {
                 lp.log.warn(.cdp, "CDP read", .{ .err = err });
-                self.dropCdp(link, err, true);
+                self.dropCdp(link, err, .{ .notify = true, .shutdown_socket = true });
                 any_removed = true;
                 continue;
             },
@@ -500,7 +517,7 @@ fn processCdpEvents(self: *Network) void {
 
         if (n == 0) {
             // peer EOF
-            self.dropCdp(link, null, true);
+            self.dropCdp(link, null, .{ .notify = true, .shutdown_socket = true });
             any_removed = true;
             continue;
         }
@@ -513,7 +530,7 @@ fn processCdpEvents(self: *Network) void {
             // on_disconnect surfaces a .disconnect into the inbox.
             // dropCdp wakes the worker.
             lp.log.info(.cdp, "CDP onData", .{ .err = err });
-            self.dropCdp(link, err, true);
+            self.dropCdp(link, err, .{ .notify = true });
             any_removed = true;
             continue;
         };
@@ -528,13 +545,13 @@ fn processCdpEvents(self: *Network) void {
             // Close frame: the handler already pushed .close. Worker's
             // drainInbox will call on_disconnect itself after replying,
             // so we drop without re-notifying.
-            self.dropCdp(link, null, false);
+            self.dropCdp(link, null, .{ .notify = false });
             any_removed = true;
         }
     }
 
     if (any_removed) {
-        self.cdp_unregister.broadcast();
+        self.cdp_unregister.broadcast(lp.io);
     }
 }
 
@@ -547,19 +564,19 @@ fn processCdpEvents(self: *Network) void {
 // pushes a .disconnect into the worker's inbox and wakes it, so
 // cdp.tick() returns false and the worker exits.
 fn shutdownCdpLinks(self: *Network) void {
-    self.cdp_mutex.lock();
-    defer self.cdp_mutex.unlock();
+    self.cdp_mutex.lockUncancelable(lp.io);
+    defer self.cdp_mutex.unlock(lp.io);
 
     var it = self.cdp_links.first;
     while (it) |node| {
         it = node.next;
         const link: *CdpLink = @fieldParentPtr("node", node);
         if (link.state == .live) {
-            self.dropCdp(link, null, true);
+            self.dropCdp(link, null, .{ .notify = true });
         }
     }
 
-    self.cdp_unregister.broadcast();
+    self.cdp_unregister.broadcast(lp.io);
 }
 
 pub fn run(self: *Network) void {
@@ -575,7 +592,7 @@ pub fn run(self: *Network) void {
     // thread, so nothing here drives libcurl.
     while (true) {
         if (self.listener != null and !self.accept.load(.acquire)) {
-            posix.close(self.listener.?.socket);
+            _ = std.c.close(self.listener.?.socket);
             self.listener = null;
             self.pollfds[1] = .{ .fd = -1, .events = 0, .revents = 0 };
         }
@@ -613,7 +630,7 @@ pub fn run(self: *Network) void {
     }
 
     if (self.listener) |listener| {
-        posix.shutdown(listener.socket, .both) catch |err| blk: {
+        sys_net.shutdown(listener.socket, .both) catch |err| blk: {
             if (err == error.SocketNotConnected and builtin.os.tag != .linux) {
                 // This error is normal/expected on BSD/MacOS. We probably
                 // shouldn't bother calling shutdown at all, but I guess this
@@ -622,12 +639,12 @@ pub fn run(self: *Network) void {
             }
             lp.log.warn(.app, "listener shutdown", .{ .err = err });
         };
-        posix.close(listener.socket);
+        _ = std.c.close(listener.socket);
     }
 }
 
 fn wakeupPoll(self: *Network) void {
-    _ = posix.write(self.wakeup_pipe[1], &.{1}) catch {};
+    _ = sys_net.write(self.wakeup_pipe[1], &.{1}) catch {};
 }
 
 pub fn stop(self: *Network) void {
@@ -642,7 +659,7 @@ fn acceptConnections(self: *Network) void {
     const listener = self.listener orelse return;
 
     while (true) {
-        const socket = posix.accept(listener.socket, null, null, posix.SOCK.NONBLOCK) catch |err| {
+        const socket = sys_net.accept(listener.socket, null, null, posix.SOCK.NONBLOCK) catch |err| {
             switch (err) {
                 error.WouldBlock => break,
                 error.SocketNotListening => {
@@ -666,8 +683,8 @@ fn acceptConnections(self: *Network) void {
 }
 
 pub fn getConnection(self: *Network) ?*http.Connection {
-    self.conn_mutex.lock();
-    defer self.conn_mutex.unlock();
+    self.conn_mutex.lockUncancelable(lp.io);
+    defer self.conn_mutex.unlock(lp.io);
 
     const node = self.available.popFirst() orelse return null;
     return @fieldParentPtr("node", node);
@@ -677,8 +694,8 @@ pub fn releaseConnection(self: *Network, conn: *http.Connection) void {
     switch (conn.transport) {
         .websocket => {
             conn.deinit();
-            self.ws_mutex.lock();
-            defer self.ws_mutex.unlock();
+            self.ws_mutex.lockUncancelable(lp.io);
+            defer self.ws_mutex.unlock(lp.io);
             self.ws_pool.destroy(conn);
             self.ws_count -= 1;
         },
@@ -686,8 +703,8 @@ pub fn releaseConnection(self: *Network, conn: *http.Connection) void {
             conn.reset(self.config, self.x509_store, self.ip_filter) catch |err| {
                 lp.assert(false, "couldn't reset curl easy", .{ .err = err });
             };
-            self.conn_mutex.lock();
-            defer self.conn_mutex.unlock();
+            self.conn_mutex.lockUncancelable(lp.io);
+            defer self.conn_mutex.unlock(lp.io);
             self.available.append(&conn.node);
         },
     }
@@ -695,8 +712,8 @@ pub fn releaseConnection(self: *Network, conn: *http.Connection) void {
 
 pub fn newConnection(self: *Network) ?*http.Connection {
     const conn = blk: {
-        self.ws_mutex.lock();
-        defer self.ws_mutex.unlock();
+        self.ws_mutex.lockUncancelable(lp.io);
+        defer self.ws_mutex.unlock(lp.io);
 
         if (self.ws_count >= self.ws_max) {
             return null;
@@ -709,8 +726,8 @@ pub fn newConnection(self: *Network) ?*http.Connection {
 
     // don't do this under lock
     conn.* = http.Connection.init(self.x509_store, self.config, self.ip_filter) catch {
-        self.ws_mutex.lock();
-        defer self.ws_mutex.unlock();
+        self.ws_mutex.lockUncancelable(lp.io);
+        defer self.ws_mutex.unlock(lp.io);
         self.ws_pool.destroy(conn);
         self.ws_count -= 1;
 
@@ -720,24 +737,38 @@ pub fn newConnection(self: *Network) ?*http.Connection {
     return conn;
 }
 
-const CreateX509StoreError = std.crypto.Certificate.Bundle.RescanError || error{FailedToCreateX509Store};
-
 /// NEVER give full ownership of store to `SSL_CTX`, always rely on ref counting.
 /// Allocations made through passed `allocator` are freed before this function returns.
-pub fn createX509Store(allocator: Allocator) CreateX509StoreError!*crypto.X509_STORE {
+pub fn prepareX509Store(allocator: Allocator, config: *const Config) !*crypto.X509_STORE {
+    // A user-supplied store replaces system trust entirely.
+    if (config.customCertStore()) |store| {
+        return store;
+    }
+    return storeFromSystemCA(allocator);
+}
+
+/// Creates an X509_STORE from system root CA.
+fn storeFromSystemCA(allocator: Allocator) !*crypto.X509_STORE {
     const store = crypto.X509_STORE_new() orelse return error.FailedToCreateX509Store;
     errdefer crypto.X509_STORE_free(store);
 
+    var count: usize = 0;
+    defer {
+        if (count == 0) {
+            log.warn(.app, "No certificates loaded", .{});
+        }
+    }
+
     switch (comptime builtin.os.tag) {
         .linux, .openbsd, .netbsd, .freebsd => blk: {
-            // Iterate over known directories.
-            inline for ([_][:0]const u8{
+            // Iterate over known directories; this may or may not succeed.
+            const cwd = std.Io.Dir.cwd();
+            inline for ([_][]const u8{
                 "/etc/ssl/certs", // Debian/Ubuntu/Gentoo/Alpine, SUSE
                 "/etc/pki/tls/certs", // Fedora/RHEL
-            }) |dir| {
-                if (loadHashedDirectory(store, dir)) {
-                    break :blk;
-                }
+            }) |dir_path| {
+                count += try loadFromDirectory(allocator, store, cwd, dir_path);
+                if (count > 0) break :blk;
             }
 
             // Iterate over known files.
@@ -750,23 +781,18 @@ pub fn createX509Store(allocator: Allocator) CreateX509StoreError!*crypto.X509_S
                 "/etc/ssl/cert.pem", // Alpine, *BSD
             }) |file| {
                 if (crypto.X509_STORE_load_locations(store, file, null) == 1) {
+                    count += 1;
                     break :blk;
                 }
             }
-
-            log.warn(.app, "No system certificates", .{});
         },
         else => {
             // Prefer stdlib's cert scanner.
-            var bundle: std.crypto.Certificate.Bundle = .{};
-            try bundle.rescan(allocator);
+            var bundle: std.crypto.Certificate.Bundle = .empty;
+            try bundle.rescan(allocator, lp.io, std.Io.Clock.now(.real, lp.io));
             defer bundle.deinit(allocator);
 
             const bytes = bundle.bytes.items;
-            if (bytes.len == 0) {
-                log.warn(.app, "No system certificates", .{});
-                return store;
-            }
             var it = bundle.map.valueIterator();
             while (it.next()) |index| {
                 // d2i_X509 reads the cert's own DER length header to find its end and
@@ -782,6 +808,7 @@ pub fn createX509Store(allocator: Allocator) CreateX509StoreError!*crypto.X509_S
                 if (result != 1) {
                     log.warn(.app, "Failed to add X509 cert to store", .{});
                 }
+                count += 1;
             }
         },
     }
@@ -789,19 +816,27 @@ pub fn createX509Store(allocator: Allocator) CreateX509StoreError!*crypto.X509_S
     return store;
 }
 
-fn loadHashedDirectory(store: *crypto.X509_STORE, dir: [:0]const u8) bool {
-    var handle = std.fs.openDirAbsolute(dir, .{ .iterate = true }) catch return false;
-    defer handle.close();
+/// Loads certificates from given `path`; returning how many CA loaded.
+fn loadFromDirectory(
+    allocator: Allocator,
+    store: *crypto.X509_STORE,
+    cwd: std.Io.Dir,
+    dir_path: []const u8,
+) Allocator.Error!usize {
+    var count: usize = 0;
+    var dir = cwd.openDir(lp.io, dir_path, .{ .iterate = true }) catch return count;
+    defer dir.close(lp.io);
 
-    var hashed = false;
-    var it = handle.iterate();
-    while (it.next() catch return false) |entry| {
-        if (std.mem.endsWith(u8, entry.name, ".0")) {
-            hashed = true;
-            break;
+    var it = dir.iterate();
+    while (it.next(lp.io) catch return count) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+
+        const path = try std.fs.path.joinZ(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(path);
+
+        if (crypto.X509_STORE_load_locations(store, path, null) == 1) {
+            count += 1;
         }
     }
-    if (!hashed) return false;
-
-    return crypto.X509_STORE_load_locations(store, null, dir.ptr) == 1;
+    return count;
 }

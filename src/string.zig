@@ -17,7 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
+const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const M = @This();
 
@@ -25,15 +27,14 @@ const M = @This();
 pub const String = packed struct {
     len: i32,
     payload: packed union {
-        // Zig won't let you put an array in a packed struct/union. But it will
-        // let you put a vector.
-        content: @Vector(12, u8),
-        heap: packed struct { prefix: @Vector(4, u8), ptr: [*]const u8 },
+        // u96 / u32 act as the 12-byte inline buffer and 4-byte prefix.
+        content: u96,
+        heap: packed struct { prefix: u32, ptr: usize },
     },
 
     const tombstone = -1;
-    pub const empty = String{ .len = 0, .payload = .{ .content = @splat(0) } };
-    pub const deleted = String{ .len = tombstone, .payload = .{ .content = @splat(0) } };
+    pub const empty = String{ .len = 0, .payload = .{ .content = 0 } };
+    pub const deleted = String{ .len = tombstone, .payload = .{ .content = 0 } };
 
     // for packages that already have String imported, then can use String.Global
     pub const Global = M.Global;
@@ -52,7 +53,7 @@ pub const String = packed struct {
 
             var content: [12]u8 = @splat(0);
             @memcpy(content[0..l], input);
-            return .{ .len = @intCast(l), .payload = .{ .content = content } };
+            return .{ .len = @intCast(l), .payload = .{ .content = @bitCast(content) } };
         }
 
         // Runtime path - handle both String and []const u8
@@ -65,14 +66,14 @@ pub const String = packed struct {
         if (l <= 12) {
             var content: [12]u8 = @splat(0);
             @memcpy(content[0..l], input);
-            return .{ .len = @intCast(l), .payload = .{ .content = content } };
+            return .{ .len = @intCast(l), .payload = .{ .content = @bitCast(content) } };
         }
 
         return .{
             .len = @intCast(l),
             .payload = .{ .heap = .{
-                .prefix = input[0..4].*,
-                .ptr = input.ptr,
+                .prefix = @bitCast(input[0..4].*),
+                .ptr = @intFromPtr(input.ptr),
             } },
         };
     }
@@ -88,14 +89,14 @@ pub const String = packed struct {
         if (l <= 12) {
             var content: [12]u8 = @splat(0);
             @memcpy(content[0..l], input);
-            return .{ .len = @intCast(l), .payload = .{ .content = content } };
+            return .{ .len = @intCast(l), .payload = .{ .content = @bitCast(content) } };
         }
 
         return .{
             .len = @intCast(l),
             .payload = .{ .heap = .{
-                .prefix = input[0..4].*,
-                .ptr = (intern(input) orelse (if (opts.dupe) (try allocator.dupe(u8, input)) else input)).ptr,
+                .prefix = @bitCast(input[0..4].*),
+                .ptr = @intFromPtr((intern(input) orelse (if (opts.dupe) (try allocator.dupe(u8, input)) else input)).ptr),
             } },
         };
     }
@@ -103,7 +104,8 @@ pub const String = packed struct {
     pub fn deinit(self: *const String, allocator: Allocator) void {
         const len = self.len;
         if (len > 12) {
-            allocator.free(self.payload.heap.ptr[0..@intCast(len)]);
+            const p: [*]const u8 = @ptrFromInt(self.payload.heap.ptr);
+            allocator.free(p[0..@intCast(len)]);
         }
     }
 
@@ -128,7 +130,7 @@ pub const String = packed struct {
                 @memcpy(content[pos..][0..part.len], part);
                 pos += part.len;
             }
-            return .{ .len = @intCast(total_len), .payload = .{ .content = content } };
+            return .{ .len = @intCast(total_len), .payload = .{ .content = @bitCast(content) } };
         }
 
         const result = try allocator.alloc(u8, total_len);
@@ -141,8 +143,8 @@ pub const String = packed struct {
         return .{
             .len = @intCast(total_len),
             .payload = .{ .heap = .{
-                .prefix = result[0..4].*,
-                .ptr = (intern(result) orelse result).ptr,
+                .prefix = @bitCast(result[0..4].*),
+                .ptr = @intFromPtr((intern(result) orelse result).ptr),
             } },
         };
     }
@@ -160,7 +162,8 @@ pub const String = packed struct {
             return slice[4 .. ul + 4];
         }
 
-        return self.payload.heap.ptr[0..ul];
+        const p: [*]const u8 = @ptrFromInt(self.payload.heap.ptr);
+        return p[0..ul];
     }
 
     pub fn isDeleted(self: *const String) bool {
@@ -182,13 +185,15 @@ pub const String = packed struct {
         }
 
         if (len <= 12) {
-            return @reduce(.And, a.payload.content == b.payload.content);
+            return a.payload.content == b.payload.content;
         }
 
         // a.len == b.len at this point
         const al: usize = @intCast(len);
         const bl: usize = @intCast(len);
-        return std.mem.eql(u8, a.payload.heap.ptr[0..al], b.payload.heap.ptr[0..bl]);
+        const ap: [*]const u8 = @ptrFromInt(a.payload.heap.ptr);
+        const bp: [*]const u8 = @ptrFromInt(b.payload.heap.ptr);
+        return std.mem.eql(u8, ap[0..al], bp[0..bl]);
     }
 
     pub fn eqlSlice(a: String, b: []const u8) bool {
@@ -409,6 +414,40 @@ pub fn truncateUtf8(bytes: []const u8, max_bytes: usize) []const u8 {
     return bytes[0..i];
 }
 
+/// Reinterprets `bytes` as Latin-1 (each byte one codepoint) and encodes it
+/// as UTF-8. For bytes that aren't valid UTF-8 but must become a valid UTF-8
+/// string (JSON, filenames).
+pub fn latin1ToUtf8(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var extra: usize = 0;
+    for (bytes) |b| {
+        if (b >= 0x80) {
+            extra += 1;
+        }
+    }
+    if (comptime IS_DEBUG) {
+        // The way this is currently used:
+        // 1 - the caller always wants the value duped,
+        // 2 - the caller only got here because utf8ValidateSlice failed.
+        // If both of those ever change, maybe it's worth reconsidering whether
+        // this API unconditionally dupes.
+        std.debug.assert(extra != 0);
+    }
+
+    const out = try allocator.alloc(u8, bytes.len + extra);
+    var i: usize = 0;
+    for (bytes) |b| {
+        if (b < 0x80) {
+            out[i] = b;
+            i += 1;
+        } else {
+            out[i] = 0xC0 | (b >> 6);
+            out[i + 1] = 0x80 | (b & 0x3F);
+            i += 2;
+        }
+    }
+    return out;
+}
+
 // Discriminatory type that signals the bridge to use arena instead of call_arena
 // Use this for strings that need to persist beyond the current call
 // The caller can unwrap and store just the underlying .str field
@@ -453,6 +492,20 @@ test "truncateUtf8" {
     // Invalid leader byte counts as one byte so the loop terminates.
     try testing.expectEqual("\xFF", truncateUtf8("\xFFx", 1));
     try testing.expectEqual("\xFFx", truncateUtf8("\xFFx", 2));
+}
+
+test "latin1ToUtf8" {
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "caf\xE9.txt", .out = "café.txt" },
+        .{ .in = "report\xFF.csv", .out = "report\xC3\xBF.csv" },
+        .{ .in = "\x82\xd3\x82\xe9.xlsx", .out = "\xC2\x82\xC3\x93\xC2\x82\xC3\xA9.xlsx" },
+    };
+    for (cases) |case| {
+        const out = try latin1ToUtf8(testing.allocator, case.in);
+        defer testing.allocator.free(out);
+        try testing.expectEqual(case.out, out);
+        try testing.expectEqual(true, std.unicode.utf8ValidateSlice(out));
+    }
 }
 
 test "String" {

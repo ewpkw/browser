@@ -17,10 +17,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const lp = @import("lightpanda");
-const log = lp.log;
-const builtin = @import("builtin");
 const zenai = @import("zenai");
+const lp = @import("lightpanda");
+const builtin = @import("builtin");
 
 const cli = @import("cli.zig");
 const dump = @import("browser/dump.zig");
@@ -28,6 +27,8 @@ const dump = @import("browser/dump.zig");
 const Storage = @import("storage/Storage.zig");
 const WebBotAuthConfig = @import("network/WebBotAuth.zig").Config;
 
+const log = lp.log;
+const crypto = @import("sys/libcrypto.zig");
 const Allocator = std.mem.Allocator;
 
 // TCP keepalive parameters applied to accepted CDP connections.
@@ -35,10 +36,11 @@ const Allocator = std.mem.Allocator;
 pub const CDP_KEEPALIVE_IDLE_S: c_int = 4;
 pub const CDP_KEEPALIVE_INTVL_S: c_int = 2;
 pub const CDP_KEEPALIVE_CNT: c_int = 3;
+pub const CDP_TCP_USER_TIMEOUT_MS: c_int = 10_000;
 
 const Config = @This();
 
-fn logFilterScopesValidator(allocator: Allocator, args: *std.process.ArgIterator, list: *std.ArrayList(log.FilterRule)) !void {
+fn logFilterScopesValidator(allocator: Allocator, args: *std.process.Args.Iterator, list: *std.ArrayList(log.FilterRule)) !void {
     const str = args.next() orelse return error.InvalidOption;
 
     var it = std.mem.splitScalar(u8, str, ',');
@@ -72,16 +74,106 @@ fn logFilterScopesValidator(allocator: Allocator, args: *std.process.ArgIterator
     }
 }
 
-fn logLevelValidator(_: Allocator, args: *std.process.ArgIterator) !?log.Level {
+fn logLevelValidator(_: Allocator, args: *std.process.Args.Iterator, target: *?log.Level) !void {
     const str = args.next() orelse return error.MissingArgument;
     if (std.mem.eql(u8, str, "error")) {
-        return .err;
+        target.* = .err;
+        return;
     }
 
-    return std.meta.stringToEnum(log.Level, str) orelse {
+    target.* = std.meta.stringToEnum(log.Level, str) orelse {
         log.fatal(.app, "invalid option choice", .{ .arg = "--log-level", .value = str });
         return error.InvalidArgument;
     };
+}
+
+const Cert = struct {
+    /// On successful CLI argument parsing phase, ownership of this transferred
+    /// to `Network`. Consider it as invalid.
+    store: ?*crypto.X509_STORE = null,
+    // Number of certificate sources loaded into `store`.
+    count: usize = 0,
+
+    fn deinit(self: *Cert) void {
+        if (self.store) |store| {
+            crypto.X509_STORE_free(store);
+        }
+        self.* = .{};
+    }
+
+    /// Returns the store, creating it on first use. The store is shared by
+    /// every `--ca-cert`/`--ca-path` occurrence.
+    fn getOrCreate(self: *Cert) !*crypto.X509_STORE {
+        if (self.store) |store| {
+            return store;
+        }
+        const store = crypto.X509_STORE_new() orelse
+            return error.FailedToCreateCertStore;
+        self.store = store;
+        return store;
+    }
+};
+
+fn caCertValidator(
+    _: Allocator,
+    args: *std.process.Args.Iterator,
+    cert: *Cert,
+) !void {
+    const file_name = args.next() orelse return error.MissingArgument;
+    const store = try cert.getOrCreate();
+    errdefer cert.deinit();
+
+    if (crypto.X509_STORE_load_locations(store, file_name, null) != 1) {
+        log.fatal(.app, "Invalid CA cert", .{ .arg = "--ca-cert", .value = file_name });
+        return error.InvalidArgument;
+    }
+    cert.count += 1;
+}
+
+fn caPathValidator(
+    allocator: Allocator,
+    args: *std.process.Args.Iterator,
+    cert: *Cert,
+) !void {
+    const dir_path = args.next() orelse return error.MissingArgument;
+
+    var dir = std.Io.Dir.cwd().openDir(lp.io, dir_path, .{ .iterate = true }) catch {
+        log.fatal(.app, "Invalid CA path", .{ .arg = "--ca-path", .value = dir_path });
+        return error.InvalidArgument;
+    };
+    defer dir.close(lp.io);
+
+    const store = try cert.getOrCreate();
+    errdefer cert.deinit();
+
+    // Eagerly load every certificate in the directory rather than
+    // registering a lazy hashed lookup: the directory doesn't need to be
+    // c_rehash'ed, bad entries surface at startup and `count` reflects
+    // what was actually loaded.
+    const count_before = cert.count;
+    var it = dir.iterate();
+    while (it.next(lp.io) catch {
+        log.fatal(.app, "Invalid CA path", .{ .arg = "--ca-path", .value = dir_path });
+        return error.InvalidArgument;
+    }) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+
+        const path = try std.fs.path.joinZ(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(path);
+
+        if (crypto.X509_STORE_load_locations(store, path, null) != 1) {
+            log.warn(.app, "Skipping invalid CA cert", .{ .arg = "--ca-path", .value = path });
+            continue;
+        }
+        cert.count += 1;
+    }
+
+    // An empty directory (or one with no readable certificates) is
+    // indistinguishable from a typo; treat it as an error.
+    if (cert.count == count_before) {
+        log.fatal(.app, "No certificates loaded", .{ .arg = "--ca-path", .value = dir_path });
+        return error.InvalidArgument;
+    }
 }
 
 /// Common CLI args.
@@ -107,6 +199,7 @@ const CommonOptions = .{
     .{ .name = "user_agent", .type = ?[]const u8 },
     .{ .name = "block_private_networks", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8 },
+    .{ .name = "block_urls", .type = ?[]const u8 },
     .{ .name = "cookie", .type = ?[]const u8 },
     .{ .name = "cookie_jar", .type = ?[]const u8 },
     .{ .name = "storage_engine", .type = ?Storage.EngineType },
@@ -117,24 +210,46 @@ const CommonOptions = .{
     .{ .name = "v8_flags_unsafe", .type = ?[]const u8 },
     .{ .name = "v8_max_heap_mb", .type = ?u32 },
     .{ .name = "watchdog_ms", .type = ?u32 },
+    .{
+        .name = "ca_cert",
+        .field_name = "cert",
+        .type = .{
+            .cli = [:0]const u8,
+            .memory = Cert,
+        },
+        .default = Cert{},
+        .validator = caCertValidator,
+    },
+    .{
+        .name = "ca_path",
+        .field_name = "cert",
+        .type = .{
+            .cli = []const u8,
+            .memory = Cert,
+        },
+        .default = Cert{},
+        .validator = caPathValidator,
+    },
 };
 
-fn dumpValidator(_: Allocator, args: *std.process.ArgIterator) !?DumpFormat {
+fn dumpValidator(_: Allocator, args: *std.process.Args.Iterator, target: *?DumpFormat) !void {
     // Peek next argument.
     var peek_args = args.*;
     if (peek_args.next()) |next_arg| {
         const mode = std.meta.stringToEnum(DumpFormat, next_arg) orelse {
-            return .html;
+            target.* = .html;
+            return;
         };
 
         // Skip the argument we peek if successful.
         _ = args.next();
-        return mode;
+        target.* = mode;
+        return;
     }
 
     // Means we couldn't get something like `--dump html` but we do have
     // `--dump`; which should fall to `html` by default.
-    return .html;
+    target.* = .html;
 }
 
 pub const AiProvider = std.meta.Tag(zenai.provider.Client);
@@ -159,13 +274,13 @@ pub const AgentVerbosity = enum {
     }
 };
 
-fn waitScriptFileValidator(allocator: Allocator, args: *std.process.ArgIterator) !?[:0]const u8 {
+fn waitScriptFileValidator(allocator: Allocator, args: *std.process.Args.Iterator, target: *?[:0]const u8) !void {
     const path = args.next() orelse {
         log.fatal(.app, "missing argument value", .{ .arg = "--wait-script-file" });
         return error.InvalidArgument;
     };
 
-    return std.fs.cwd().readFileAllocOptions(allocator, path, 1024 * 1024, null, .of(u8), 0) catch |err| {
+    target.* = std.Io.Dir.cwd().readFileAllocOptions(lp.io, path, allocator, .limited(1024 * 1024), .of(u8), 0) catch |err| {
         log.fatal(.app, "failed to read file", .{ .arg = "--wait-script-file", .path = path, .err = err });
         return error.InvalidArgument;
     };
@@ -173,7 +288,7 @@ fn waitScriptFileValidator(allocator: Allocator, args: *std.process.ArgIterator)
 
 fn injectScriptFileValidator(
     allocator: Allocator,
-    args: *std.process.ArgIterator,
+    args: *std.process.Args.Iterator,
     list: *std.ArrayList([]const u8),
 ) !void {
     const path = args.next() orelse {
@@ -181,7 +296,7 @@ fn injectScriptFileValidator(
         return error.InvalidArgument;
     };
 
-    const bytes = std.fs.cwd().readFileAllocOptions(allocator, path, std.math.maxInt(usize), null, .of(u8), null) catch |err| {
+    const bytes = std.Io.Dir.cwd().readFileAllocOptions(lp.io, path, allocator, .unlimited, .of(u8), null) catch |err| {
         log.fatal(.app, "failed to read file", .{ .arg = "--inject-script-file", .path = path, .err = err });
         return error.InvalidArgument;
     };
@@ -476,9 +591,9 @@ pub fn agentVerbosity(opts: Agent) AgentVerbosity {
 /// path (every gate check resolves through it). Cache once — the fd
 /// doesn't change after process start.
 var stderr_tty_cached: bool = undefined;
-var stderr_tty_once = std.once(initStderrTty);
+var stderr_tty_once = lp.once(initStderrTty);
 fn initStderrTty() void {
-    stderr_tty_cached = std.posix.isatty(std.posix.STDERR_FILENO);
+    stderr_tty_cached = std.Io.File.stderr().isTty(lp.io) catch false;
 }
 fn stderrIsTty() bool {
     stderr_tty_once.call();
@@ -575,6 +690,14 @@ pub fn blockCidrs(self: *const Config) ?[]const u8 {
     };
 }
 
+pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scalar) {
+    const patterns = switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.block_urls,
+        else => unreachable,
+    } orelse return null;
+    return std.mem.splitScalar(u8, patterns, ',');
+}
+
 pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_connections,
@@ -631,6 +754,20 @@ pub fn storageSqlitePath(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
         inline .serve, .fetch, .mcp, .agent => |opts| opts.storage_sqlite_path,
         else => unreachable,
+    };
+}
+
+/// Returns the user-supplied certificate store (`--ca-cert`/`--ca-path`),
+/// if any was loaded during argument parsing. The caller takes ownership.
+pub fn customCertStore(self: *const Config) ?*crypto.X509_STORE {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent => |opts| {
+            const store = opts.cert.store orelse return null;
+            // Validators guarantee a created store loaded something.
+            lp.assert(opts.cert.count > 0, "empty custom cert store", .{});
+            return store;
+        },
+        else => null,
     };
 }
 
@@ -768,52 +905,62 @@ pub fn printUsageAndExit(self: *const Config, allocator: Allocator, help_for: Ru
 
     if (success) {
         printPaged(allocator, text);
-        return std.process.cleanExit();
+        return std.process.cleanExit(lp.io);
     }
-    var stderr = std.fs.File.stderr().writer(&.{});
+    var stderr = std.Io.File.stderr().writerStreaming(lp.io, &.{});
     stderr.interface.writeAll(text) catch {};
     std.process.exit(1);
 }
 
 fn printPlain(text: []const u8) void {
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout = std.Io.File.stdout().writerStreaming(lp.io, &.{});
     stdout.interface.writeAll(text) catch {};
 }
 
 /// Pages explicitly requested help through $PAGER (fallback: less) when
 /// stdout is an interactive terminal; prints plainly otherwise.
 fn printPaged(allocator: Allocator, text: []const u8) void {
-    if (!std.posix.isatty(std.posix.STDOUT_FILENO)) {
+    const is_tty = std.Io.File.stdout().isTty(lp.io) catch false;
+    if (!is_tty) {
         return printPlain(text);
     }
-    const term = std.posix.getenv("TERM") orelse "";
+    const term = if (std.c.getenv("TERM")) |t| std.mem.span(t) else "";
     if (term.len == 0 or std.mem.eql(u8, term, "dumb")) {
         return printPlain(text);
     }
 
-    const pager = std.posix.getenv("PAGER") orelse "";
+    const pager = if (std.c.getenv("PAGER")) |p| std.mem.span(p) else "";
     const argv: []const []const u8 = if (pager.len > 0)
         &.{ "/bin/sh", "-c", pager }
     else
         &.{ "less", "-FIRX" };
 
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.spawn() catch return printPlain(text);
+    // Pass the real environment so the pager sees TERM/LESS.
+    var environ_map = lp.environMap(allocator) catch return printPlain(text);
+    defer environ_map.deinit();
+
+    // lp.io cannot spawn children: failing allocator, empty environ (no PATH).
+    var pager_threaded: std.Io.Threaded = .init(allocator, .{ .environ = lp.environ() });
+    defer pager_threaded.deinit();
+    const pager_io = pager_threaded.io();
+
+    var child = std.process.spawn(pager_io, .{
+        .argv = argv,
+        .environ_map = &environ_map,
+        .stdin = .pipe,
+    }) catch return printPlain(text);
 
     if (child.stdin) |stdin| {
-        var writer = stdin.writer(&.{});
+        var writer = stdin.writerStreaming(pager_io, &.{});
         // A write error here is the pager exiting early (user quit, or the
         // command failed) — wait() below decides which.
         writer.interface.writeAll(text) catch {};
-        stdin.close();
+        stdin.close(pager_io);
         child.stdin = null;
     }
 
-    const term_result = child.wait() catch return printPlain(text);
-    const clean_exit = term_result == .Exited and term_result.Exited == 0;
+    const term_result = child.wait(pager_io) catch return printPlain(text);
+    const clean_exit = term_result == .exited and term_result.exited == 0;
     // Quitting the pager early is still exit 0; a non-zero exit means the
     // pager failed (e.g. $PAGER not found) and the help was never shown.
     if (!clean_exit) {
@@ -821,8 +968,8 @@ fn printPaged(allocator: Allocator, text: []const u8) void {
     }
 }
 
-pub fn parseArgs(allocator: Allocator) !Config {
-    const exec_name, var command = try Commands.parse(allocator);
+pub fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
+    const exec_name, var command = try Commands.parse(allocator, proc_args);
     if (command == .serve and command.serve.timeout != null) {
         log.warn(.app, "--timeout is deprecated", .{});
     }
@@ -844,6 +991,18 @@ pub fn parseArgs(allocator: Allocator) !Config {
     var config = try Config.init(allocator, exec_name, command);
     config.command = invoked;
     return config;
+}
+
+test "Config: blockedUrlPatterns splits comma-separated patterns" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .block_urls = "*doubleclick*,*://*/*.png",
+    } });
+    defer config.deinit(std.testing.allocator);
+
+    var patterns = config.blockedUrlPatterns().?;
+    try std.testing.expectEqualStrings("*doubleclick*", patterns.next().?);
+    try std.testing.expectEqualStrings("*://*/*.png", patterns.next().?);
+    try std.testing.expectEqual(null, patterns.next());
 }
 
 pub fn validateUserAgent(ua: []const u8) !void {

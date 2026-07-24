@@ -166,6 +166,10 @@ pub fn isBigInt64Array(self: Value) bool {
     return v8.v8__Value__IsBigInt64Array(self.handle);
 }
 
+pub fn isFloat16Array(self: Value) bool {
+    return v8.v8__Value__IsFloat16Array(self.handle);
+}
+
 pub fn isFloat32Array(self: Value) bool {
     return v8.v8__Value__IsFloat32Array(self.handle);
 }
@@ -232,6 +236,10 @@ pub fn toBool(self: Value) bool {
 pub fn typeOf(self: Value) js.String {
     const str_handle = v8.v8__Value__TypeOf(self.handle, self.local.isolate.handle).?;
     return js.String{ .local = self.local, .handle = str_handle };
+}
+
+pub fn toF16(self: Value) !f16 {
+    return @floatCast(try self.toF64());
 }
 
 pub fn toF32(self: Value) !f32 {

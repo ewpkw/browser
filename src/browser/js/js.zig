@@ -98,10 +98,10 @@ pub const GlobalSlot = struct {
 pub const GlobalTracker = struct {
     allocator: Allocator,
     list: std.ArrayList(*GlobalSlot) = .empty,
-    pool: std.heap.MemoryPool(GlobalSlot),
+    pool: std.heap.memory_pool.ExtraManaged(GlobalSlot, .{}),
 
     pub fn init(allocator: Allocator) GlobalTracker {
-        return .{ .allocator = allocator, .pool = std.heap.MemoryPool(GlobalSlot).init(allocator) };
+        return .{ .allocator = allocator, .pool = .init(allocator) };
     }
 
     pub fn deinit(self: *GlobalTracker) void {
@@ -479,8 +479,6 @@ test "TaggedAnyOpaque" {
 // Page. This is to ensure that, if v8 doesn't finalize the value, we can
 // release on Page teardown.
 pub const FinalizerCallback = struct {
-    page: *Page,
-    arena: Allocator,
     resolved_ptr_id: usize,
     finalizer_ptr_id: usize,
     release_ref: *const fn (ptr_id: usize, page: *Page) void,
@@ -528,7 +526,6 @@ pub const FinalizerCallback = struct {
             id = identity.next;
         }
         self.release_ref(self.finalizer_ptr_id, page);
-        page.releaseArena(self.arena);
     }
 };
 

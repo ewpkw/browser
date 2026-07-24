@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
+const SafeString = @import("../SafeString.zig");
 
 const Config = @import("../../Config.zig");
 const URL = @import("../../browser/URL.zig");
@@ -28,6 +29,7 @@ const Mime = @import("../../browser/Mime.zig");
 const Notification = @import("../../Notification.zig");
 const timestamp = @import("../../datetime.zig").timestamp;
 
+const HttpClient = @import("../../network/HttpClient.zig");
 const Cache = @import("../../network/cache/Cache.zig");
 const Headers = @import("../../network/HttpClient.zig").Headers;
 const Transfer = @import("../../network/HttpClient.zig").Transfer;
@@ -42,6 +44,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         enable,
         disable,
         setCacheDisabled,
+        setBlockedURLs,
         setExtraHTTPHeaders,
         setUserAgentOverride,
         deleteCookies,
@@ -59,6 +62,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .enable => return enable(cmd),
         .disable => return disable(cmd),
         .setCacheDisabled => return setCacheDisabled(cmd),
+        .setBlockedURLs => return setBlockedURLs(cmd),
         .setUserAgentOverride => return @import("emulation.zig").setUserAgentOverride(cmd),
         .setExtraHTTPHeaders => return setExtraHTTPHeaders(cmd),
         .deleteCookies => return deleteCookies(cmd),
@@ -95,6 +99,16 @@ fn setCacheDisabled(cmd: *CDP.Command) !void {
     if (!bc.cdp.disable_set_cache_disabled) {
         client.disableCache(params.cacheDisabled);
     }
+    return cmd.sendResult(null, .{});
+}
+
+fn setBlockedURLs(cmd: *CDP.Command) !void {
+    const params = (try cmd.params(struct {
+        urlPatterns: []const HttpClient.BlockPattern,
+    })) orelse return error.InvalidParams;
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    try bc.cdp.browser.http_client.setBlockedUrlPatterns(params.urlPatterns);
     return cmd.sendResult(null, .{});
 }
 
@@ -282,7 +296,9 @@ fn getResponseBody(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const resp = bc.captured_responses.getPtr(key) orelse return error.RequestNotFound;
 
-    if (!resp.must_encode) {
+    // must_encode trusts the declared charset; a server can declare UTF-8 and
+    // still send invalid bytes.
+    if (!resp.must_encode and std.unicode.utf8ValidateSlice(resp.data.items)) {
         return cmd.sendResult(.{
             .body = resp.data.items,
             .base64Encoded = false,
@@ -316,6 +332,7 @@ pub fn httpRequestFail(bc: *CDP.BrowserContext, msg: *const Notification.Request
         .type = "Ping",
         .errorText = msg.err,
         .canceled = false,
+        .blockedReason = msg.blocked_reason,
     }, .{ .session_id = session_id });
 }
 
@@ -435,8 +452,8 @@ pub const RequestWriter = struct {
             try jws.beginObject();
             var it = request.headers.iterator();
             while (it.next()) |hdr| {
-                try jws.objectField(hdr.name);
-                try writeHeaderValue(jws, hdr.value);
+                try SafeString.writeObjectField(jws, hdr.name);
+                try jws.write(SafeString.wrap(hdr.value));
             }
             if (try request.getCookieString(transfer.arena)) |cookies| {
                 try jws.objectField("Cookie");
@@ -540,41 +557,14 @@ const ResponseWriter = struct {
             try jws.beginObject();
             var map_it = map.iterator();
             while (map_it.next()) |entry| {
-                try jws.objectField(entry.key_ptr.*);
-                try writeHeaderValue(jws, entry.value_ptr.*);
+                try SafeString.writeObjectField(jws, entry.key_ptr.*);
+                try jws.write(SafeString.wrap(entry.value_ptr.*));
             }
             try jws.endObject();
         }
         try jws.endObject();
     }
 };
-
-// HTTP header values are octets; per historical practice non-UTF-8 bytes are
-// interpreted as Latin-1 (ISO-8859-1), which is what Chrome does for DevTools.
-// Transcode so we emit a JSON string — std.json would otherwise serialize
-// invalid UTF-8 as a JSON array of numbers.
-fn writeHeaderValue(jws: anytype, value: []const u8) !void {
-    if (std.unicode.utf8ValidateSlice(value)) {
-        return jws.write(value);
-    }
-    // Latin-1 -> UTF-8: each byte is a codepoint U+0000..U+00FF (max 2 bytes)
-    try jws.beginWriteRaw();
-    try jws.writer.writeByte('"');
-    var start: usize = 0;
-    for (value, 0..) |b, i| {
-        if (b < 0x80) {
-            continue;
-        }
-        try std.json.Stringify.encodeJsonStringChars(value[start..i], jws.options, jws.writer);
-        var buf: [2]u8 = undefined;
-        const n = std.unicode.utf8Encode(b, &buf) catch unreachable;
-        try jws.writer.writeAll(buf[0..n]);
-        start = i + 1;
-    }
-    try std.json.Stringify.encodeJsonStringChars(value[start..], jws.options, jws.writer);
-    try jws.writer.writeByte('"');
-    jws.endWriteRaw();
-}
 
 fn keyFromRequestId(request_id: []const u8) !CDP.BrowserContext.CapturedResponseKey {
     const key = std.fmt.parseInt(u32, request_id[4..], 10) catch return error.InvalidParams;
@@ -669,42 +659,6 @@ test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF" {
 
     try testing.expectEqual(bc.extra_headers.items.len, 1);
     try testing.expectEqual("x-keep: ok", std.mem.span(bc.extra_headers.items[0]));
-}
-
-test "cdp.network writeHeaderValue" {
-    const expectHeaderJson = struct {
-        fn expect(expected: []const u8, value: []const u8) !void {
-            var buf: [256]u8 = undefined;
-            var writer = std.Io.Writer.fixed(&buf);
-            var jws: std.json.Stringify = .{ .writer = &writer };
-            try writeHeaderValue(&jws, value);
-            try std.testing.expectEqualStrings(expected, writer.buffered());
-        }
-    }.expect;
-
-    // valid UTF-8 is written as-is
-    try expectHeaderJson(
-        "\"mié, 15 jul 2026 13:19:10 GMT\"",
-        "mié, 15 jul 2026 13:19:10 GMT",
-    );
-
-    // Latin-1 bytes are transcoded to UTF-8 instead of a byte array
-    try expectHeaderJson(
-        "\"mié, 15 jul 2026 13:19:10 GMT\"",
-        "mi\xE9, 15 jul 2026 13:19:10 GMT",
-    );
-
-    // JSON escaping still applies around transcoded bytes
-    try expectHeaderJson(
-        "\"a\\\"é\\nb\"",
-        "a\"\xE9\nb",
-    );
-
-    // pure ASCII untouched
-    try expectHeaderJson(
-        "\"max-age=180, s-maxage=180, public\"",
-        "max-age=180, s-maxage=180, public",
-    );
 }
 
 test "cdp.Network: cookies" {
@@ -939,4 +893,90 @@ test "cdp.Network: configured CDP ignores setCacheDisabled" {
     });
     try ctx.expectSentResult(null, .{ .id = 2 });
     try testing.expect(client.cache == &cache);
+}
+
+test "cdp.Network: setBlockedURLs blocks requests with inspector reason" {
+    const filter: testing.LogFilter = .init(&.{.http});
+    defer filter.deinit();
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{
+        .id = "BID-BLOCK",
+        .session_id = "SID-BLOCK",
+    });
+    const page = try bc.session.createPage();
+    const client = &bc.cdp.browser.http_client;
+    defer client.setBlockedUrls(&.{}) catch unreachable;
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Network.enable",
+    });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.setBlockedURLs",
+        .params = .{ .urlPatterns = &[_]HttpClient.BlockPattern{
+            .{ .urlPattern = "*://blocked.test/*", .block = true },
+        } },
+    });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+
+    const ErrorContext = struct {
+        err: ?anyerror = null,
+
+        fn callback(raw: *anyopaque, err: anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.err = err;
+        }
+    };
+    var error_context: ErrorContext = .{};
+
+    try client.request(.{
+        .frame_id = page.frame_id,
+        .loader_id = 1,
+        .method = .GET,
+        .url = "https://blocked.test/script.js",
+        .cookie_jar = null,
+        .cookie_origin = "https://blocked.test/",
+        .resource_type = .script,
+        .notification = bc.session.notification,
+        .ctx = &error_context,
+        .error_callback = ErrorContext.callback,
+        .shutdown_callback = HttpClient.noopShutdown,
+    }, null);
+
+    try ctx.expectSentEvent("Network.loadingFailed", .{
+        .errorText = error.UrlBlocked,
+        .blockedReason = "inspector",
+    }, .{ .session_id = "SID-BLOCK" });
+    try testing.expectEqual(error.UrlBlocked, error_context.err.?);
+
+    try client.setBlockedUrls(&.{"*redirect-target*"});
+    error_context.err = null;
+
+    var redirect_request_id: [14]u8 = undefined;
+    _ = std.fmt.bufPrint(&redirect_request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+
+    try client.request(.{
+        .frame_id = page.frame_id,
+        .loader_id = 1,
+        .method = .GET,
+        .url = "http://127.0.0.1:9582/redirect-no-fragment",
+        .cookie_jar = null,
+        .cookie_origin = "http://127.0.0.1:9582/",
+        .resource_type = .script,
+        .notification = bc.session.notification,
+        .ctx = &error_context,
+        .error_callback = ErrorContext.callback,
+        .shutdown_callback = HttpClient.noopShutdown,
+    }, null);
+
+    try ctx.expectSentEvent("Network.loadingFailed", .{
+        .requestId = &redirect_request_id,
+        .errorText = error.UrlBlocked,
+        .blockedReason = "inspector",
+    }, .{ .session_id = "SID-BLOCK" });
+    try testing.expectEqual(error.UrlBlocked, error_context.err.?);
 }

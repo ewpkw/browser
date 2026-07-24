@@ -42,6 +42,8 @@ const Event = @import("webapi/Event.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
 const Element = @import("webapi/Element.zig");
 const HtmlElement = @import("webapi/element/Html.zig");
+const AnimatedLength = @import("webapi/svg/AnimatedLength.zig");
+const AnimatedPreserveAspectRatio = @import("webapi/svg/AnimatedPreserveAspectRatio.zig");
 const AnimatedString = @import("webapi/svg/AnimatedString.zig");
 const Window = @import("webapi/Window.zig");
 const Location = @import("webapi/Location.zig");
@@ -142,6 +144,8 @@ _element_shadow_roots: Element.ShadowRootLookup = .empty,
 _node_owner_documents: Node.OwnerDocumentLookup = .empty,
 _element_scroll_positions: Element.ScrollPositionLookup = .empty,
 _element_namespace_uris: Element.NamespaceUriLookup = .empty,
+_svg_animated_lengths: AnimatedLength.Lookup = .empty,
+_svg_animated_preserve_aspect_ratios: AnimatedPreserveAspectRatio.Lookup = .empty,
 _svg_animated_strings: AnimatedString.Lookup = .empty,
 
 // Same as above, but for Nodes (slot assigments apply to both Element AND
@@ -171,15 +175,15 @@ _event_target_attr_listeners: GlobalEventHandlersLookup = .empty,
 
 // FileLists owned by `<input type=file>` elements. Each holds refs on its
 // File objects (reference counted via their Blob proto); released at teardown.
-_file_lists: std.ArrayList(*FileList) = .{},
+_file_lists: std.ArrayList(*FileList) = .empty,
 
 /// Element `load`/`error` events queued to fire on the next scheduler tick,
 /// and flushed before window's `load` event.
 /// A call to `documentIsComplete` (which calls `_documentIsComplete`) resets it.
 /// Double-buffered so that dispatching events (which may trigger JS that
 /// creates new elements) doesn't invalidate the list while iterating.
-_queued_events_1: std.ArrayList(QueuedEvent) = .{},
-_queued_events_2: std.ArrayList(QueuedEvent) = .{},
+_queued_events_1: std.ArrayList(QueuedEvent) = .empty,
+_queued_events_2: std.ArrayList(QueuedEvent) = .empty,
 _queued_events: *std.ArrayList(QueuedEvent) = undefined,
 
 _style_manager: StyleManager,
@@ -200,7 +204,8 @@ _broadcast_channels: std.DoublyLinkedList = .{},
 // List of MessagePorts living in this frame's context.
 _message_ports: std.DoublyLinkedList = .{},
 
-// MutationObserver / IntersectionObserver bookkeeping. See frame/observers.zig.
+// See frame/observers.zig.
+_resize: observers.Resize = .{},
 _mutation: observers.Mutation = .{},
 _intersection: observers.Intersection = .{},
 
@@ -225,7 +230,7 @@ _upgrading_element: ?*Node = null,
 _skip_custom_element_upgrade: bool = false,
 
 // List of custom elements that were created before their definition was registered
-_undefined_custom_elements: std.ArrayList(*Element.Html.Custom) = .{},
+_undefined_custom_elements: std.ArrayList(*Element.Html.Custom) = .empty,
 
 // Pending custom-element reactions (connected/disconnected/adopted/attribute
 // changed). Reactions are enqueued during DOM mutation and drained at the
@@ -296,10 +301,10 @@ document: *Document,
 iframe: ?*IFrame = null,
 
 child_frames_sorted: bool = true,
-child_frames: std.ArrayList(*Frame) = .{},
+child_frames: std.ArrayList(*Frame) = .empty,
 
 // Workers created by this frame. Cleaned up when frame is destroyed.
-workers: std.ArrayList(*Worker) = .{},
+workers: std.ArrayList(*Worker) = .empty,
 
 // This is maybe not great. It's a counter on the number of events that we're
 // waiting on before triggering the "load" event. Essentially, we need all
@@ -463,7 +468,7 @@ pub fn deinit(self: *Frame) void {
         // Uncomment if you want slab statistics to print.
         // const stats = self._factory._slab.getStats(self.arena) catch unreachable;
         // var buffer: [256]u8 = undefined;
-        // var stream = std.fs.File.stderr().writer(&buffer).interface;
+        // var stream = std.Io.File.stderr().writerStreaming(lp.io, &buffer).interface;
         // stats.print(&stream) catch unreachable;
     }
 
@@ -1286,6 +1291,9 @@ fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.
 // (allow/allowAndName) and the response carries Content-Disposition: attachment.
 // See issue #2701.
 fn maybeStartDownload(self: *Frame, transfer: *HttpClient.Transfer) !bool {
+    const uuidv4 = @import("../id.zig").uuidv4;
+    const latin1ToUtf8 = @import("../string.zig").latin1ToUtf8;
+
     const session = self._session;
     switch (session.download_behavior) {
         .allow, .allow_and_name => {},
@@ -1313,11 +1321,16 @@ fn maybeStartDownload(self: *Frame, transfer: *HttpClient.Transfer) !bool {
     // `guid` is the CDP "Global Unique Identifier" that ties the
     // downloadWillBegin / downloadProgress events to one download.
     var guid_buf: [36]u8 = undefined;
-    @import("../id.zig").uuidv4(&guid_buf);
+    uuidv4(&guid_buf);
     const guid = try self.arena.dupe(u8, &guid_buf);
 
+    // Content-Disposition filenames can be in a legacy encoding (e.g.
+    // Shift_JIS) but must yield valid UTF-8
     const suggested = dispositionFilename(disposition) orelse (try urlBasename(self.arena, self.url)) orelse guid;
-    const suggested_filename = try self.arena.dupe(u8, suggested);
+    const suggested_filename = if (std.unicode.utf8ValidateSlice(suggested))
+        try self.arena.dupe(u8, suggested)
+    else
+        try latin1ToUtf8(self.arena, suggested);
 
     // allowAndName stores the file under its guid; allow uses the suggested name.
     const on_disk_name = switch (session.download_behavior) {
@@ -1325,16 +1338,16 @@ fn maybeStartDownload(self: *Frame, transfer: *HttpClient.Transfer) !bool {
         else => suggested_filename,
     };
 
-    std.fs.cwd().makePath(download_path) catch |err| {
+    std.Io.Dir.cwd().createDirPath(lp.io, download_path) catch |err| {
         log.err(.frame, "download makePath", .{ .err = err, .path = download_path });
         return false;
     };
-    var dir = std.fs.cwd().openDir(download_path, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(lp.io, download_path, .{}) catch |err| {
         log.err(.frame, "download openDir", .{ .err = err, .path = download_path });
         return false;
     };
-    defer dir.close();
-    const file = dir.createFile(on_disk_name, .{ .truncate = true }) catch |err| {
+    defer dir.close(lp.io);
+    const file = dir.createFile(lp.io, on_disk_name, .{ .truncate = true }) catch |err| {
         log.err(.frame, "download createFile", .{ .err = err, .name = on_disk_name });
         return false;
     };
@@ -1520,7 +1533,7 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
         },
         .raw, .image => |*buf| try buf.appendSlice(self.arena, data),
         .download => |*download| {
-            download.file.writeAll(data) catch |err| {
+            download.file.writeStreamingAll(lp.io, data) catch |err| {
                 // TODO(#2701 follow-up): surface the write failure properly. We
                 // can't set `_parse_state = .err` here because the next chunk
                 // would then hit the `.err => unreachable` branch below, and we
@@ -1633,7 +1646,7 @@ fn frameDoneCallback(ctx: *anyopaque) !void {
             self.documentIsComplete();
         },
         .download => |*download| {
-            download.file.close();
+            download.file.close(lp.io);
 
             // Capture before invalidating the union below.
             const guid = download.guid;
@@ -1944,14 +1957,10 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
 pub fn domChanged(self: *Frame) void {
     self._page.dom_version += 1;
 
-    if (self._intersection.check_scheduled) {
-        return;
-    }
-
-    self._intersection.check_scheduled = true;
-    self.js.queueIntersectionChecks() catch |err| {
-        log.err(.frame, "frame.schedIntersectChecks", .{ .err = err, .type = self._type, .url = self.url });
-    };
+    // A DOM change is our "rendering opportunity": re-evaluate the layout
+    // observers. Both are no-ops unless something they track actually changed.
+    observers.scheduleIntersectionChecks(self);
+    observers.scheduleResizeDelivery(self);
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };
@@ -3033,7 +3042,7 @@ const ParseState = union(enum) {
             // Only reached when a frame is torn down mid-download (the normal
             // completion path in frameDoneCallback already closes the file and
             // transitions to .complete).
-            .download => |*download| download.file.close(),
+            .download => |*download| download.file.close(lp.io),
             else => {},
         }
     }
@@ -3045,7 +3054,7 @@ const ParseState = union(enum) {
 const Download = struct {
     // uuidv4, arena-owned. Matches the guid reported in the CDP events.
     guid: []const u8,
-    file: std.fs.File,
+    file: std.Io.File,
     // suggested filename surfaced to the client, arena-owned.
     filename: []const u8,
     received: u64,
