@@ -518,16 +518,17 @@ apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-dev clang make curl git
 ```
 
-#### 8.1.2 Zig 编译器（v0.15.2）
+#### 8.1.2 Zig 编译器（v0.16.0）
 
 ```bash
-ZIG_VERSION="0.15.2"
+ZIG_VERSION="0.16.0"
 curl -LO https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz
 tar xf zig-x86_64-linux-${ZIG_VERSION}.tar.xz
+rm -rf /usr/local/lib/zig-x86_64-linux-${ZIG_VERSION}
 mv zig-x86_64-linux-${ZIG_VERSION} /usr/local/lib
 ln -sf /usr/local/lib/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 rm zig-x86_64-linux-${ZIG_VERSION}.tar.xz
-zig version  # 应输出 0.15.2
+zig version  # 应输出 0.16.0
 ```
 
 #### 8.1.3 Rust 工具链（使用国内镜像）
@@ -565,6 +566,9 @@ rustc --version
 
 ```bash
 make download-v8
+# 或手动下载 v0.5.2 版本
+curl -fL -o .lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a \
+  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a
 ```
 
 #### 8.1.5 环境变量
@@ -591,13 +595,14 @@ echo "==> [1/6] 安装系统依赖..."
 apt-get update -qq && apt-get install -y --no-install-recommends \
     xz-utils ca-certificates pkg-config libglib2.0-dev clang make curl git
 
-echo "==> [2/6] 安装 Zig 0.15.2..."
+echo "==> [2/6] 安装 Zig 0.16.0..."
 cd /tmp
-curl -fsSLO https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
-tar xf zig-x86_64-linux-0.15.2.tar.xz
-mv zig-x86_64-linux-0.15.2 /usr/local/lib
-ln -sf /usr/local/lib/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
-rm zig-x86_64-linux-0.15.2.tar.xz
+curl -fsSLO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+tar xf zig-x86_64-linux-0.16.0.tar.xz
+rm -rf /usr/local/lib/zig-x86_64-linux-0.16.0
+mv zig-x86_64-linux-0.16.0 /usr/local/lib
+ln -sf /usr/local/lib/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
+rm zig-x86_64-linux-0.16.0.tar.xz
 zig version
 
 echo "==> [3/6] 安装 Rust（国内镜像）..."
@@ -698,12 +703,12 @@ make clean    # 完全清理（保留 V8 缓存）
 cargo --version
 
 # Zig 版本不对
-zig version  # 必须 0.15.2
+zig version  # 必须 0.16.0
 
 # V8 下载失败 → 手动下载后放入缓存
 mkdir -p .lp-cache/prebuilt-v8/
 curl -fL -o .lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a \
-  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.1/libc_v8_14.9.207.35_linux_x86_64.a
+  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a
 ```
 
 ---
