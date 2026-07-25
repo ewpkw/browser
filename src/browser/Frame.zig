@@ -1960,7 +1960,7 @@ pub fn domChanged(self: *Frame) void {
     // A DOM change is our "rendering opportunity": re-evaluate the layout
     // observers. Both are no-ops unless something they track actually changed.
     observers.scheduleIntersectionChecks(self);
-    observers.scheduleResizeDelivery(self);
+    observers.scheduleResizeChecks(self);
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };
@@ -2914,6 +2914,9 @@ fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, opts: F
 
     var parser = Parser.init(self.call_arena, node, self, .{ .allow_declarative_shadow = opts.allow_declarative_shadow });
     parser.parseFragment(html);
+    if (parser.terminated) {
+        return error.ExecutionTerminated;
+    }
 
     // html5ever wraps fragment output in an <html> element; unwrap so its
     // children land directly on `node`. See https://github.com/servo/html5ever/issues/583.
