@@ -567,7 +567,7 @@ rustc --version
 ```bash
 make download-v8
 # 或手动下载 v0.5.2 版本
-curl -fL -o .lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a \
+curl -fL -o .lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a \
   https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a
 ```
 
@@ -632,7 +632,7 @@ echo "==> [5/6] 编译 release 版本..."
 export LIGHTPANDA_DISABLE_TELEMETRY=1
 # make build  # 默认针对编译机 CPU 优化（AMD EPYC 9T25），可能不兼容 Intel
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译，确保指令集兼容
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
 
 echo "==> [6/6] 安装到 ~/.local/bin..."
 mkdir -p "$HOME/.local/bin"
@@ -659,7 +659,7 @@ make download-v8
 # 编译 release 版本（含 V8 snapshot）
 # make build  # 默认针对编译机 CPU 优化，可能不兼容其他 CPU
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
 
 # 安装到 ~/.local/bin（确保 ~/.local/bin 在 PATH 中）
 mkdir -p ~/.local/bin
@@ -680,7 +680,7 @@ lightpanda serve --host 0.0.0.0 --port 9222
 ```bash
 # make build    # 默认针对编译机 CPU 优化
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
 make clean    # 完全清理（保留 V8 缓存）
 ```
 
@@ -694,7 +694,7 @@ make clean    # 完全清理（保留 V8 缓存）
 - 可执行文件：`./zig-out/bin/lightpanda`（编译输出）
 - 安装位置：`~/.local/bin/lightpanda`（安装后）
 - V8 snapshot：`src/snapshot.bin`
-- V8 缓存：`.lp-cache/prebuilt-v8/`
+- V8 缓存：`.lp-cache/prebuilt-v8/v0.5.2/`
 
 ### 8.5 常见问题
 
@@ -706,8 +706,8 @@ cargo --version
 zig version  # 必须 0.16.0
 
 # V8 下载失败 → 手动下载后放入缓存
-mkdir -p .lp-cache/prebuilt-v8/
-curl -fL -o .lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a \
+mkdir -p .lp-cache/prebuilt-v8/v0.5.2/
+curl -fL -o .lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a \
   https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a
 ```
 
@@ -797,11 +797,9 @@ git merge main
 
 # 5. 编译验证（确认合并无误）
 # make build && make test  # 默认针对编译机 CPU
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
 
 cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda
-
-lightpanda version
 
 # 6. 备份到自己的远程仓库
 #    如果用 rebase 了需要 force push
@@ -834,7 +832,7 @@ git push origin chrome
 # 1. 编译
 # make build  # 默认针对编译机 CPU 优化
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
 
 # 2. 运行测试
 make test
