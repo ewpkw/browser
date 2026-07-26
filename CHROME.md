@@ -800,6 +800,7 @@ git merge main
 make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
 
 cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda
+~/.local/bin/lightpanda version
 
 # 6. 备份到自己的远程仓库
 #    如果用 rebase 了需要 force push
