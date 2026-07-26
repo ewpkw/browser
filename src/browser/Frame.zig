@@ -73,6 +73,7 @@ const milliTimestamp = @import("../datetime.zig").milliTimestamp;
 
 const GlobalEventHandlersLookup = @import("webapi/global_event_handlers.zig").Lookup;
 
+pub const parse = @import("frame/parse.zig");
 pub const preload = @import("frame/preload.zig");
 pub const observers = @import("frame/observers.zig");
 pub const user_input = @import("frame/user_input.zig");
@@ -1024,7 +1025,9 @@ pub fn makeRequest(self: *Frame, req: HttpClient.Request) !void {
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
 pub fn newRequest(self: *Frame, req: HttpClient.Request) !*HttpClient.Transfer {
-    return self._session.browser.http_client.newRequest(req, &self._http_owner);
+    var r = req;
+    r.document_frame_id = self._frame_id;
+    return self._session.browser.http_client.newRequest(r, &self._http_owner);
 }
 
 // Synchronously abort every transfer and WebSocket owned by this frame
@@ -2867,77 +2870,6 @@ pub fn updateRangesForNodeRemoval(self: *Frame, parent: *Node, child: *Node, chi
     }
 }
 
-// TODO: optimize and cleanup, this is called a lot (e.g., innerHTML = '')
-pub fn parseHtmlAsChildren(self: *Frame, node: *Node, html: []const u8) !void {
-    return self.parseHtmlAsChildrenInner(node, html, .{});
-}
-
-// setHTMLUnsafe variant: parse a fragment that may contain declarative shadow node
-pub fn parseHtmlUnsafeAsChildren(self: *Frame, node: *Node, html: []const u8) !void {
-    return self.parseHtmlAsChildrenInner(node, html, .{ .allow_declarative_shadow = true });
-}
-
-// Range.createContextualFragment variant: unlike innerHTML et al., its scripts
-// are run when the fragment is inserted into a document.
-pub fn parseContextualFragment(self: *Frame, node: *Node, html: []const u8) !void {
-    return self.parseHtmlAsChildrenInner(node, html, .{ .scripts_runnable = true });
-}
-
-const FragmentParseOpts = struct {
-    scripts_runnable: bool = false,
-    allow_declarative_shadow: bool = false,
-};
-
-fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, opts: FragmentParseOpts) !void {
-    const previous_parse_mode = self._parse_mode;
-    self._parse_mode = .fragment;
-    defer self._parse_mode = previous_parse_mode;
-
-    // The html5ever wrapper-unwrap below rebinds children without going
-    // through the insertion path, so recompute slot assignments for any
-    // shadow tree this fragment landed in (idempotent; signals only on diff).
-    defer if (self._element_shadow_roots.count() != 0) {
-        const root = node.getRootNode(.{});
-        if (root.is(ShadowRoot) != null) {
-            slotting.assignSlottablesForTree(root, self);
-        }
-        if (node.is(Element)) |el| {
-            if (self._element_shadow_roots.get(el)) |shadow_root| {
-                slotting.assignSlottablesForTree(shadow_root.asNode(), self);
-            }
-        }
-    };
-
-    const previous_scripts_runnable = self._fragment_scripts_runnable;
-    self._fragment_scripts_runnable = opts.scripts_runnable;
-    defer self._fragment_scripts_runnable = previous_scripts_runnable;
-
-    var parser = Parser.init(self.call_arena, node, self, .{ .allow_declarative_shadow = opts.allow_declarative_shadow });
-    parser.parseFragment(html);
-    if (parser.terminated) {
-        return error.ExecutionTerminated;
-    }
-
-    // html5ever wraps fragment output in an <html> element; unwrap so its
-    // children land directly on `node`. See https://github.com/servo/html5ever/issues/583.
-    // Because of custom element callbacks, the structure might not be what
-    // we expect, and nodes might be altogether removed. We deal with this in a
-    // few different places, but always the same way: leave it as-is.
-    const children = node._children orelse return;
-    const first = Node.linkToNode(children.first.?);
-    if (first.is(Element.Html.Html) == null) {
-        return;
-    }
-    node._children = first._children;
-
-    // No mutation records for the unwrapped children either; see the comment
-    // about fragment parses in _insertNodeRelative.
-    var it = node.childrenIterator();
-    while (it.next()) |child| {
-        child._parent = node;
-    }
-}
-
 // Runs the "ready" work for an inserted node and, when it's an element with
 // children, for its descendants in tree order: appending a subtree
 // containing scripts must execute them all, after the whole insertion.
@@ -3382,9 +3314,6 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
     form_data.acquireRef();
     defer form_data.releaseRef(self._page);
 
-    const arena = try self._session.getArena(.medium, "submitForm");
-    errdefer self._session.releaseArena(arena);
-
     // Per HTML spec form-submission algorithm, when the submitter is a submit
     // button, its formaction/formmethod/formenctype attributes override the
     // form's corresponding attributes (matching how formtarget is honored above).
@@ -3402,7 +3331,36 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         break :blk form_element.getAttributeSafe(comptime .wrap("method"));
     };
     const method = Element.Html.Form.normalizeMethod(method_attr, "get");
+
+    // Per the HTML form-submission algorithm, the dialog method closes the
+    // form's nearest ancestor dialog with the submitter's value and performs no
+    // navigation. Falling through here would submit the form as a GET, which
+    // both reloads the page and leaves the dialog open forever.
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm
+    if (std.mem.eql(u8, method, "dialog")) {
+        // A submit button always has a value (empty when unset); with no
+        // submitter at all the dialog's existing returnValue is left untouched.
+        const result: ?[]const u8 = if (submit_button) |s| blk: {
+            if (s.is(Element.Html.Form.Input)) |input| {
+                break :blk input.getValue();
+            }
+            // if not an Input, it has to be a Button (checked above by isSubmitButton)
+            break :blk s.as(Element.Html.Form.Button).getValue();
+        } else null;
+
+        var ancestor: ?*Element = form_element;
+        while (ancestor) |el| : (ancestor = el.parentElement()) {
+            const dialog = el.is(Element.Html.Dialog) orelse continue;
+            try dialog.close(result, self);
+            break;
+        }
+        return;
+    }
+
     const is_post = std.mem.eql(u8, method, "post");
+
+    const arena = try self._session.getArena(.medium, "submitForm");
+    errdefer self._session.releaseArena(arena);
 
     // Get charset from accept-charset attribute or fall back to document charset
     const charset: []const u8 = blk: {
