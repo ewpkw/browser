@@ -70,11 +70,11 @@ pub fn getY(self: *Svg, frame: *Frame) !*AnimatedLength {
 }
 
 pub fn getWidth(self: *Svg, frame: *Frame) !*AnimatedLength {
-    return AnimatedLength.getOrCreate(self.asElement(), .width, frame);
+    return AnimatedLength.getOrCreate(self.asElement(), .svg_width, frame);
 }
 
 pub fn getHeight(self: *Svg, frame: *Frame) !*AnimatedLength {
-    return AnimatedLength.getOrCreate(self.asElement(), .height, frame);
+    return AnimatedLength.getOrCreate(self.asElement(), .svg_height, frame);
 }
 
 pub fn getPreserveAspectRatio(self: *Svg, frame: *Frame) !*AnimatedPreserveAspectRatio {
@@ -82,7 +82,9 @@ pub fn getPreserveAspectRatio(self: *Svg, frame: *Frame) !*AnimatedPreserveAspec
 }
 
 pub fn createSVGPoint(_: *Svg, frame: *Frame) !*DOMPoint {
-    return DOMPoint.create(0, 0, 0, 1, frame._page);
+    const point = try DOMPoint.create(0, 0, 0, 1, frame._page);
+    point._proto.restrict();
+    return point;
 }
 
 pub fn createSVGMatrix(_: *Svg, frame: *Frame) !*DOMMatrix {
@@ -100,7 +102,7 @@ pub fn createSVGRect(_: *Svg, frame: *Frame) !*DOMRect {
 }
 
 pub fn createSVGNumber(_: *Svg, frame: *Frame) !*SvgNumber {
-    return frame._factory.create(SvgNumber{});
+    return SvgNumber.detached(frame);
 }
 
 pub fn createSVGLength(_: *Svg, frame: *Frame) !*SvgLength {

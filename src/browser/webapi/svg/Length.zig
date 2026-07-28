@@ -32,6 +32,8 @@ _element: ?*Element = null,
 _attr_name: String = .empty,
 _direction: Direction = .unspecified,
 _read_only: bool = false,
+_default_value: f64 = 0,
+_default_unit: Unit = .number,
 
 pub const Direction = enum {
     horizontal,
@@ -39,7 +41,7 @@ pub const Direction = enum {
     unspecified,
 };
 
-const Unit = enum(u16) {
+pub const Unit = enum(u16) {
     unknown = 0,
     number = 1,
     percentage = 2,
@@ -68,9 +70,35 @@ pub fn reflected(element: *Element, attr_name: String, direction: Direction, rea
     });
 }
 
+pub fn reflectedConfigured(
+    element: *Element,
+    attr_name: String,
+    direction: Direction,
+    default_value: f64,
+    default_unit: Unit,
+    read_only: bool,
+    frame: *Frame,
+) !*Length {
+    return frame._factory.create(Length{
+        ._element = element,
+        ._attr_name = attr_name,
+        ._direction = direction,
+        ._read_only = read_only,
+        ._default_value = default_value,
+        ._default_unit = default_unit,
+    });
+}
+
 pub fn getUnitType(self: *Length) u16 {
     self.syncFromAttribute();
     return @intFromEnum(self._unit);
+}
+
+// An attribute SVG could not parse reports the unknown unit type. Callers that
+// need geometry substitute the property's default instead.
+pub fn hasKnownUnit(self: *Length) bool {
+    self.syncFromAttribute();
+    return self._unit != .unknown;
 }
 
 pub fn getValue(self: *Length, frame: *Frame) f64 {
@@ -149,13 +177,13 @@ fn ensureFinite(value: f64) !void {
 fn syncFromAttribute(self: *Length) void {
     const element = self._element orelse return;
     const raw = element.getAttributeSafe(self._attr_name) orelse {
-        self._value = 0;
-        self._unit = .number;
+        self._value = self._default_value;
+        self._unit = self._default_unit;
         return;
     };
     const parsed = parse(raw) catch {
-        self._value = 0;
-        self._unit = .unknown;
+        self._value = self._default_value;
+        self._unit = self._default_unit;
         return;
     };
     self._value = parsed.value;
@@ -285,6 +313,10 @@ fn resolvedFontSizeAt(element: ?*Element, frame: *Frame, depth: u8) f64 {
     return resolvedFontSizeAt(parent, frame, depth + 1);
 }
 
+pub fn fontSizeForElement(element: *Element, frame: *Frame) f64 {
+    return resolvedFontSize(element, frame);
+}
+
 fn parseFontSize(raw: []const u8, parent: ?*Element, frame: *Frame, depth: u8) ?f64 {
     const value = std.mem.trim(u8, raw, " \t\r\n\x0c");
     if (std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset")) {
@@ -303,7 +335,8 @@ fn parseFontSize(raw: []const u8, parent: ?*Element, frame: *Frame, depth: u8) ?
         .ex => parent_size / 2.0,
         else => unreachable,
     };
-    return parsed.value * factor;
+    const size = parsed.value * factor;
+    return if (size >= 0 and std.math.isFinite(size)) size else null;
 }
 
 fn absoluteUnitFactor(unit: Unit) ?f64 {
