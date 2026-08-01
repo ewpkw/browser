@@ -79,18 +79,20 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 };
 ```
 
-### 1.4 删除 CDP network.zig 中 Mozilla UA 拒绝的测试用例
+### 1.4 将 CDP 测试用例从「拒绝 Mozilla」反转为「接受 Mozilla」
 
 **文件**: `src/cdp/domains/network.zig`
 
-删除以下测试用例（它们验证 Mozilla 应被拒绝，修改后不再适用）：
-- 第 631-648 行: `test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent"` —— 直接删除
-- 第 666-686 行: `test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent smuggled via a colon in the key"` —— 直接删除
-- 第 688-710 行: `test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF"` —— **保留测试但替换载荷**，将 `Mozilla/5.0` 改为其他任意字符串（如 `CustomBot/1.0`），因为该测试的核心是验证 CRLF 注入防护，Mozilla 只是注入载荷。
+将上游的 Mozilla 拒绝测试反转为正向验证（本分支的核心意义就是允许 Mozilla UA）：
+- `test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent"` → 改为 `accepts a Mozilla User-Agent`，期望 `extra_headers.items.len == 1`
+- `test "...rejects a Mozilla User-Agent smuggled via a colon in the key"` → 改为 `accepts a Mozilla User-Agent with colon in key`，期望 `extra_headers.items.len == 1`
+- `test "...rejects a header that smuggles CRLF"` → **保留测试但替换载荷**，将 `Mozilla/5.0` 改为 `CustomBot/1.0`（该测试核心是 CRLF 注入防护，与 Mozilla 无关）
 
-在 emulation.zig 中删除：
-- 第 190-206 行: `test "cdp.Emulation: setUserAgentOverride ignores mozilla"`
-- 第 208-224 行: `test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive"`
+**文件**: `src/cdp/domains/emulation.zig`
+
+将上游的 2 个 Mozilla 拒绝测试合并为 1 个正向测试：
+- 删除: `test "...ignores mozilla"` 和 `test "...ignores mozilla case insensitive"`
+- 新增: `test "cdp.Emulation: setUserAgentOverride accepts Mozilla user agent"`，期望 `user_agent_changed == true`
 
 ### 1.5 更新 help.zon 中的说明
 
