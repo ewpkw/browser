@@ -33,9 +33,9 @@ const WorkerGlobalScope = @import("WorkerGlobalScope.zig");
 
 const MessageEvent = @import("event/MessageEvent.zig");
 
-const Allocator = std.mem.Allocator;
-
 const DedicatedWorkerGlobalScope = @This();
+
+pub const Proto = WorkerGlobalScope;
 
 _proto: *WorkerGlobalScope,
 _worker: *Worker,
@@ -51,21 +51,19 @@ _on_messageerror: ?js.Function.Global = null,
 _pending_messages: std.ArrayList(?js.Value.Global) = .empty,
 
 pub fn init(worker: *Worker, url: [:0]const u8) !*DedicatedWorkerGlobalScope {
-    const self = try worker._arena.create(DedicatedWorkerGlobalScope);
-    const proto = try WorkerGlobalScope.init(
-        worker._arena,
+    return WorkerGlobalScope.init(
+        worker._arena.allocator(),
         url,
-        .{ .dedicated = self },
+        .dedicated,
+        DedicatedWorkerGlobalScope{
+            ._worker = worker,
+            ._proto = undefined,
+        },
         worker._type == .module,
         worker._frame_id,
         worker._loader_id,
         worker._frame,
     );
-    self.* = .{
-        ._worker = worker,
-        ._proto = proto,
-    };
-    return self;
 }
 
 pub fn deinit(self: *DedicatedWorkerGlobalScope) void {
@@ -152,7 +150,7 @@ fn scheduleMessage(self: *DedicatedWorkerGlobalScope, cloned_data: ?js.Value.Glo
     const session = wgs._session;
 
     const message_arena = try session.getArena(.tiny, "DedicatedWorkerGlobalScope.receiveMessage");
-    errdefer session.releaseArena(message_arena);
+    errdefer message_arena.release();
 
     const callback = try message_arena.create(ReceiveMessageCallback);
     callback.* = .{
@@ -184,7 +182,7 @@ pub fn drainPendingMessages(self: *DedicatedWorkerGlobalScope) void {
 
 const ReceiveMessageCallback = struct {
     data: ?js.Value.Global,
-    arena: Allocator,
+    arena: *lp.Arena,
     worker_scope: *DedicatedWorkerGlobalScope,
 
     fn cancelled(ctx: *anyopaque) void {
@@ -196,7 +194,7 @@ const ReceiveMessageCallback = struct {
     }
 
     fn deinit(self: *ReceiveMessageCallback) void {
-        self.worker_scope._proto._session.releaseArena(self.arena);
+        self.arena.release();
     }
 
     fn run(ctx: *anyopaque) !?u32 {

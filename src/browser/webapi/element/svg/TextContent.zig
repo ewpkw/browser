@@ -22,19 +22,23 @@ const text_measure = @import("../../../text_measure.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
+const Factory = @import("../../../Factory.zig");
 
 const AnimatedEnumeration = @import("../../svg/AnimatedEnumeration.zig");
 const AnimatedLength = @import("../../svg/AnimatedLength.zig");
-const Length = @import("../../svg/Length.zig");
 
 const Graphics = @import("Graphics.zig");
 
 pub const TextPositioning = @import("TextPositioning.zig");
 pub const TextPath = @import("TextPath.zig");
 
+const IS_DEBUG = @import("builtin").mode == .Debug;
+
 const TextContent = @This();
-_proto: *Graphics,
+
+pub const Proto = Graphics;
 _type: Type,
+_proto_canary: if (IS_DEBUG) *Graphics else void = undefined,
 
 pub const Type = union(enum) {
     positioning: *TextPositioning,
@@ -52,7 +56,7 @@ pub fn is(self: *TextContent, comptime T: type) ?*T {
 }
 
 pub fn asElement(self: *TextContent) *Element {
-    return self._proto.asElement();
+    return Factory.protoOf(self).asElement();
 }
 pub fn asNode(self: *TextContent) *Node {
     return self.asElement().asNode();
@@ -63,7 +67,7 @@ fn text(self: *TextContent, frame: *Frame) []const u8 {
 }
 
 fn fontSize(self: *TextContent, frame: *Frame) f64 {
-    return Length.fontSizeForElement(self.asElement(), frame);
+    return frame._style_manager.computedFontSize(self.asElement());
 }
 
 fn getTextLength(self: *TextContent, frame: *Frame) !*AnimatedLength {

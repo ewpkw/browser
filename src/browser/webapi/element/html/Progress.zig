@@ -6,10 +6,12 @@ const HtmlElement = @import("../Html.zig");
 
 const Progress = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Progress) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Progress) *Node {
     return self.asElement().asNode();

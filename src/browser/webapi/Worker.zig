@@ -31,10 +31,11 @@ const ErrorEvent = @import("event/ErrorEvent.zig");
 const DedicatedWorkerGlobalScope = @import("DedicatedWorkerGlobalScope.zig");
 
 const log = lp.log;
-const Allocator = std.mem.Allocator;
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Worker = @This();
+
+pub const Proto = EventTarget;
 
 pub const WorkerType = enum {
     classic,
@@ -49,13 +50,13 @@ _loader_id: u32,
 
 _proto: *EventTarget,
 _frame: *Frame,
-_arena: Allocator,
+_arena: *lp.Arena,
 _worker_scope: *DedicatedWorkerGlobalScope,
 
 _url: [:0]const u8,
 _type: WorkerType = .classic,
 _script_loaded: bool = false,
-_script_arena: ?Allocator = null,
+_script_arena: ?*lp.Arena = null,
 _script_buffer: std.ArrayList(u8) = .empty,
 _http_transfer: ?*Transfer = null,
 
@@ -72,10 +73,10 @@ pub fn init(url: []const u8, options: ?WorkerOptions, frame: *Frame) !*Worker {
     const session = frame._session;
 
     const arena = try session.getArena(.small, "Worker");
-    errdefer session.releaseArena(arena);
+    errdefer arena.release();
 
-    const resolved_url = try URL.resolve(arena, frame.base(), url, .{ .encoding = frame.charset });
-    const self = try frame._page.factory.eventTargetWithAllocator(arena, Worker{
+    const resolved_url = try URL.resolve(arena.allocator(), frame.base(), url, .{ .encoding = frame.charset });
+    const self = try frame._page.factory.eventTargetWithAllocator(arena.allocator(), Worker{
         ._arena = arena,
         ._proto = undefined,
         ._frame = frame,
@@ -150,7 +151,7 @@ pub fn deinit(self: *Worker) void {
     }
     self.releaseScriptArena();
     self._worker_scope.deinit();
-    self._frame._session.releaseArena(self._arena);
+    self._arena.release();
 }
 
 pub fn asEventTarget(self: *Worker) *EventTarget {
@@ -170,7 +171,7 @@ fn httpHeaderCallback(transfer: *Transfer) !Transfer.HeaderResult {
     }
 
     if (transfer.getContentLength()) |cl| {
-        try self._script_buffer.ensureTotalCapacity(self._script_arena.?, cl);
+        try self._script_buffer.ensureTotalCapacity(self._script_arena.?.allocator(), cl);
     }
 
     return .proceed;
@@ -178,7 +179,7 @@ fn httpHeaderCallback(transfer: *Transfer) !Transfer.HeaderResult {
 
 fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
     const self: *Worker = @ptrCast(@alignCast(transfer.req.ctx));
-    try self._script_buffer.appendSlice(self._script_arena.?, data);
+    try self._script_buffer.appendSlice(self._script_arena.?.allocator(), data);
 }
 
 fn httpDoneCallback(ctx: *anyopaque) !void {
@@ -242,7 +243,7 @@ fn loadInitialScript(self: *Worker, script: []const u8) !void {
             }
 
             js_context.page.recordJsError(err);
-            const caught = try_catch.caughtOrError(self._script_arena.?, err);
+            const caught = try_catch.caughtOrError(self._script_arena.?.allocator(), err);
             log.err(.browser, "worker script error", .{ .url = self._url, .caught = caught });
             self.fireErrorEvent(caught.exception orelse @errorName(err), null);
             return;
@@ -253,7 +254,7 @@ fn loadInitialScript(self: *Worker, script: []const u8) !void {
             }
 
             js_context.page.recordJsError(err);
-            const caught = try_catch.caughtOrError(self._script_arena.?, err);
+            const caught = try_catch.caughtOrError(self._script_arena.?.allocator(), err);
             log.err(.browser, "worker module error", .{ .url = self._url, .caught = caught });
             self.fireErrorEvent(caught.exception orelse @errorName(err), null);
             return;
@@ -293,7 +294,7 @@ fn releaseScriptArena(self: *Worker) void {
     const arena = self._script_arena orelse return;
     self._script_arena = null;
     self._script_buffer = .empty;
-    self._frame._session.releaseArena(arena);
+    arena.release();
 }
 
 // Fire an error event on the Worker object (parent context)
@@ -354,7 +355,7 @@ pub fn receiveMessage(self: *Worker, data: js.Value) !void {
     };
 
     const message_arena = try frame.getArena(.tiny, "Worker.receiveMessage");
-    errdefer frame.releaseArena(message_arena);
+    errdefer message_arena.release();
 
     const callback = try message_arena.create(ReceiveMessageCallback);
     callback.* = .{
@@ -409,7 +410,7 @@ fn getFunctionFromSetter(setter_: ?FunctionSetter) ?js.Function.Global {
 
 const ReceiveMessageCallback = struct {
     data: anyerror!js.Value.Global,
-    arena: Allocator,
+    arena: *lp.Arena,
     worker: *Worker,
 
     fn cancelled(ctx: *anyopaque) void {
@@ -421,7 +422,7 @@ const ReceiveMessageCallback = struct {
     }
 
     fn deinit(self: *ReceiveMessageCallback) void {
-        self.worker._frame._session.releaseArena(self.arena);
+        self.arena.release();
     }
 
     fn run(ctx: *anyopaque) !?u32 {
@@ -488,8 +489,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: Worker" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
 
     // Worker tests chain a worker-script fetch with a dynamic-import fetch
     // and a cross-context postMessage. The default 2 s assertion budget can

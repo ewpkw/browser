@@ -50,12 +50,12 @@ const CSSStyleProperties = @import("css/CSSStyleProperties.zig");
 const CustomElementRegistry = @import("CustomElementRegistry.zig");
 const Selection = @import("Selection.zig");
 const Timers = @import("Timers.zig");
+const Scheduler = @import("Scheduler.zig");
 const Notification = @import("../../Notification.zig");
 
 const log = lp.log;
 const IS_DEBUG = builtin.mode == .Debug;
 
-const Allocator = std.mem.Allocator;
 const Execution = js.Execution;
 
 pub fn registerTypes() []const type {
@@ -63,6 +63,8 @@ pub fn registerTypes() []const type {
 }
 
 const Window = @This();
+
+pub const Proto = EventTarget;
 
 _proto: *EventTarget,
 _frame: *Frame,
@@ -93,6 +95,7 @@ _reporting_error: bool = false,
 _current_event: ?*Event = null,
 _location: *Location,
 _timers: Timers = .{},
+_scheduler: Scheduler = .{},
 _custom_elements: CustomElementRegistry = .{},
 _scroll_pos: struct {
     x: u32,
@@ -245,6 +248,10 @@ pub fn getNavigator(self: *Window) *Navigator {
     return &self._navigator;
 }
 
+pub fn getScheduler(self: *Window) *Scheduler {
+    return &self._scheduler;
+}
+
 pub fn getModelContext(self: *Window) *ModelContext {
     return &self._model_context;
 }
@@ -342,7 +349,7 @@ pub fn getHistory(_: *Window, frame: *Frame) *History {
 }
 
 pub fn getNavigation(_: *Window, frame: *Frame) *Navigation {
-    return &frame._session.navigation;
+    return frame._session.navigation;
 }
 
 pub fn setNavigation(self: *Window, value: js.Value) void {
@@ -814,7 +821,7 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
     const source_window = target_frame.js.getIncumbent().window;
 
     const arena = try target_frame.getArena(.medium, "Window.postMessage");
-    errdefer target_frame.releaseArena(arena);
+    errdefer arena.release();
 
     // StructuredSerialize runs synchronously (per spec): clone the message into
     // the target window's realm now. The receiver gets a fresh, independent copy
@@ -1077,13 +1084,13 @@ pub const Access = union(enum) {
 const PostMessageCallback = struct {
     frame: *Frame,
     source: *Window,
-    arena: Allocator,
+    arena: *lp.Arena,
     origin: []const u8,
     message: js.Value.Global,
     ports: []const *MessagePort,
 
     fn deinit(self: *PostMessageCallback) void {
-        self.frame.releaseArena(self.arena);
+        self.arena.release();
     }
 
     // Called by the scheduler if the task is dropped before it runs. `run` and
@@ -1171,6 +1178,7 @@ pub const JsApi = struct {
     pub const window = bridge.accessor(Window.getWindow, null, .{});
     pub const parent = bridge.accessor(Window.getParent, Window.setParent, .{});
     pub const navigator = bridge.accessor(Window.getNavigator, null, .{});
+    pub const scheduler = bridge.accessor(Window.getScheduler, null, .{});
     pub const screen = bridge.accessor(Window.getScreen, Window.setScreen, .{});
     pub const visualViewport = bridge.accessor(Window.getVisualViewport, Window.setVisualViewport, .{});
     pub const performance = bridge.accessor(Window.getPerformance, Window.setPerformance, .{});

@@ -6,10 +6,12 @@ const HtmlElement = @import("../Html.zig");
 
 const Time = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Time) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Time) *Node {
     return self.asElement().asNode();

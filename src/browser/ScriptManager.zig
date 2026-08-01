@@ -112,8 +112,8 @@ pub fn preloadScript(self: *ScriptManager, element: ?*Element.Html, url: []const
     }
 
     const frame = self.frame;
-    const arena = try frame.getArena(.large, "SM.preloadScript");
-    errdefer frame.releaseArena(arena);
+    const arena = try frame.getArena(.small, "SM.preloadScript");
+    errdefer arena.release();
 
     const owned_url = try arena.dupeZ(u8, url);
 
@@ -240,12 +240,12 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
     // released early on the adoption path — so the errdefer can't double-free.
     var handover = false;
 
-    const arena = try frame.getArena(.large, "SM.addFromElement");
+    const arena = try frame.getArena(.small, "SM.addFromElement");
     errdefer if (handover == false) {
-        frame.releaseArena(arena);
+        arena.release();
     };
 
-    const remote_url = try URL.resolve(arena, base_url, src, .{ .encoding = frame.charset });
+    const remote_url = try URL.resolve(arena.allocator(), base_url, src, .{ .encoding = frame.charset });
     script_element._executed = true;
 
     const mode: Script.Extra.FrameExtra.Mode = blk: {
@@ -304,7 +304,7 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
             // The adopted Script has its own arena; ours held only the URL
             // resolution, which nothing below needs.
             handover = true;
-            frame.releaseArena(arena);
+            arena.release();
 
             if (pre.complete and mode == .async) {
                 // The fetch already finished, so no doneCallback will move it
@@ -354,7 +354,7 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
                 script.status = pre.status;
                 script.complete = true;
             } else {
-                const response = try self.base.client.syncRequest(arena, .{
+                const response = try self.base.client.syncRequest(.{
                     .url = remote_url,
                     .method = .GET,
                     .frame_id = frame._frame_id,
@@ -367,6 +367,9 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
                     .shutdown_callback = HttpClient.noopShutdown, // syncRequest installs its own
                 }, &frame._http_owner);
 
+                // Take the body's arena rather than releasing it: `source`
+                // has to outlive this call, up to script.deinit().
+                script.source_arena = response.arena;
                 script.source = .{ .remote = response.body };
                 script.status = response.status;
                 script.complete = true;
@@ -430,7 +433,7 @@ fn addInlineScript(self: *ScriptManager, script_element: *Element.Html.Script, k
 
     const frame = self.frame;
     const arena = try frame.getArena(source_len + @sizeOf(Script) + 1, "SM.addInlineScript");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
 
     const source = blk: {
         const buf = try arena.alloc(u8, source_len + 1);
@@ -566,7 +569,6 @@ const PreloadedScript = struct {
 const testing = @import("../testing.zig");
 
 test "ScriptManager: PreloadedScript.shutdownCallback drops a .loading preload" {
-    defer testing.reset();
     const page = try testing.pageTest("mcp_nav.html", .{});
     defer page.close();
 
@@ -598,7 +600,6 @@ test "ScriptManager: PreloadedScript.shutdownCallback drops a .loading preload" 
 }
 
 test "ScriptManager: waitForPreload stops when teardown is pending" {
-    defer testing.reset();
     const page = try testing.pageTest("mcp_nav.html", .{});
     defer page.close();
 
@@ -627,7 +628,7 @@ test "ScriptManager: waitForPreload stops when teardown is pending" {
         .raw = try message_arena.dupe(u8, "{}"),
         .input = .{ .method = "Target.closeTarget" },
     } });
-    defer client.inbox.pop().?.deinit(client.arena_pool);
+    defer client.inbox.pop().?.deinit();
 
     try testing.expect(sm.waitForPreload(url) == null);
 }

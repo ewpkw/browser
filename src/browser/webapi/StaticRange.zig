@@ -24,6 +24,8 @@ const AbstractRange = @import("AbstractRange.zig");
 
 const StaticRange = @This();
 
+pub const Proto = AbstractRange;
+
 // The boundary points and `collapsed` accessor live on the shared AbstractRange
 // prototype. Unlike Range, a StaticRange is *static*: the factory keeps it out
 // of the frame's live-range list, so DOM mutations never move its boundaries.
@@ -48,7 +50,7 @@ pub fn init(opts: StaticRangeInit, frame: *Frame) !*StaticRange {
     }
 
     const arena = try frame.getArena(.medium, "StaticRange");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
 
     const static_range = try frame._factory.abstractRange(arena, StaticRange{ ._proto = undefined }, frame);
     const proto = static_range._proto;

@@ -9,12 +9,14 @@ const String = lp.String;
 
 const Mod = @This();
 
+pub const Proto = HtmlElement;
+
 _tag_name: String,
 _tag: Element.Tag,
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Mod) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Mod) *Node {
     return self.asElement().asNode();

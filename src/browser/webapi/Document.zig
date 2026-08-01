@@ -50,6 +50,8 @@ const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Document = @This();
 
+pub const Proto = Node;
+
 _type: Type,
 _proto: *Node,
 _frame: ?*Frame = null,
@@ -402,7 +404,6 @@ pub fn createElementNS(self: *Document, namespace: ?[]const u8, name: []const u8
 pub fn createAttribute(_: *const Document, name: String.Global, frame: *Frame) !?*Element.Attribute {
     try Element.Attribute.validateAttributeName(name.str);
     return frame._factory.node(Element.Attribute{
-        ._proto = undefined,
         ._name = name.str,
         ._value = String.empty,
         ._element = null,
@@ -416,7 +417,6 @@ pub fn createAttributeNS(_: *const Document, namespace: []const u8, name: String
 
     try Element.Attribute.validateAttributeName(name.str);
     return frame._factory.node(Element.Attribute{
-        ._proto = undefined,
         ._name = name.str,
         ._value = String.empty,
         ._element = null,
@@ -1054,9 +1054,9 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
     defer frame._parse_mode = previous_parse_mode;
 
     const arena = try frame.getArena(.medium, "Document.write");
-    defer frame.releaseArena(arena);
+    defer arena.release();
 
-    var parser = Parser.init(arena, fragment_node, frame, .{ .allow_declarative_shadow = true });
+    var parser = Parser.init(arena.allocator(), fragment_node, frame, .{ .allow_declarative_shadow = true });
     parser.parseFragment(html);
 
     // Extract children from wrapper HTML element (html5ever wraps fragments)
@@ -1068,7 +1068,7 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
 
     var it = if (first.is(Element.Html.Html) == null) fragment_node.childrenIterator() else first.childrenIterator();
     while (it.next()) |child| {
-        try children_to_insert.append(arena, child);
+        try children_to_insert.append(arena.allocator(), child);
     }
 
     if (children_to_insert.items.len == 0) {

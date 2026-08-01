@@ -6,10 +6,12 @@ const HtmlElement = @import("../Html.zig");
 
 const Param = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Param) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Param) *Node {
     return self.asElement().asNode();

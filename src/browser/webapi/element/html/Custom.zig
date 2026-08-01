@@ -33,6 +33,8 @@ const log = lp.log;
 const String = lp.String;
 
 const Custom = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 _tag_name: String,
 _definition: ?*CustomElementDefinition,
@@ -40,7 +42,7 @@ _connected_callback_invoked: bool = false,
 _disconnected_callback_invoked: bool = false,
 
 pub fn asElement(self: *Custom) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Custom) *Node {
     return self.asElement().asNode();

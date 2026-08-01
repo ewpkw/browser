@@ -20,6 +20,8 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const Frame = @import("../Frame.zig");
+const Factory = @import("../Factory.zig");
+const reflect = @import("../reflect.zig");
 
 const js = @import("js.zig");
 const Caller = @import("Caller.zig");
@@ -108,7 +110,7 @@ pub fn Builder(comptime T: type) type {
                 const Next = PrototypeType(Prototype).?;
                 entry.* = .{
                     .index = JsApiLookup.getId(Next.JsApi),
-                    .offset = @offsetOf(Prototype, "_proto"),
+                    .offset = Factory.protoOffset(Prototype),
                 };
                 Prototype = Next;
             }
@@ -780,7 +782,7 @@ pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8
 
 fn logUnknownProperty(local: *const js.Local, key: []const u8) !void {
     const ctx = local.ctx;
-    const gop = try ctx.unknown_properties.getOrPut(ctx.arena, key);
+    const gop = try ctx.unknown_properties.getOrPut(ctx.arena.allocator(), key);
     if (gop.found_existing) {
         gop.value_ptr.count += 1;
     } else {
@@ -805,10 +807,7 @@ fn prototypeChainLength(comptime T: type) usize {
 
 // Given a Type, gets its prototype Type (if any)
 fn PrototypeType(comptime T: type) ?type {
-    if (!@hasField(T, "_proto")) {
-        return null;
-    }
-    return Struct(std.meta.fieldInfo(T, ._proto).type);
+    return reflect.Proto(T);
 }
 
 fn flattenTypes(comptime Types: []const type) [countFlattenedTypes(Types)]type {
@@ -933,6 +932,10 @@ pub const SubType = enum {
 pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/AbortController.zig"),
     @import("../webapi/AbortSignal.zig"),
+    @import("../webapi/Scheduler.zig"),
+    @import("../webapi/TaskController.zig"),
+    @import("../webapi/TaskSignal.zig"),
+    @import("../webapi/event/TaskPriorityChangeEvent.zig"),
     @import("../webapi/CData.zig"),
     @import("../webapi/cdata/Comment.zig"),
     @import("../webapi/cdata/Text.zig"),
@@ -963,6 +966,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/DocumentType.zig"),
     @import("../webapi/ShadowRoot.zig"),
     @import("../webapi/DOMException.zig"),
+    @import("../webapi/QuotaExceededError.zig"),
     @import("../webapi/DOMImplementation.zig"),
     @import("../webapi/DOMTreeWalker.zig"),
     @import("../webapi/DOMNodeIterator.zig"),
@@ -1230,6 +1234,7 @@ const worker_common_apis = [_]type{
     @import("../webapi/event/PromiseRejectionEvent.zig"),
     @import("../webapi/event/CloseEvent.zig"),
     @import("../webapi/DOMException.zig"),
+    @import("../webapi/QuotaExceededError.zig"),
     @import("../webapi/DOMRectReadOnly.zig"),
     @import("../webapi/DOMRect.zig"),
     @import("../webapi/DOMMatrixReadOnly.zig"),
@@ -1260,6 +1265,10 @@ const worker_common_apis = [_]type{
     @import("../webapi/encoding/TextDecoderStream.zig"),
     @import("../webapi/AbortSignal.zig"),
     @import("../webapi/AbortController.zig"),
+    @import("../webapi/Scheduler.zig"),
+    @import("../webapi/TaskController.zig"),
+    @import("../webapi/TaskSignal.zig"),
+    @import("../webapi/event/TaskPriorityChangeEvent.zig"),
     @import("../webapi/URL.zig"),
     @import("../webapi/canvas/OffscreenCanvas.zig"),
     @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
@@ -1305,7 +1314,7 @@ pub const JsApis = blk: {
     break :blk base ++ [_]type{@import("../webapi/WebDriver.zig").JsApi};
 };
 
-// Whether Child is Ancestor or inherits from it, following the _proto chain.
+// Whether Child is Ancestor or inherits from it, following the Proto chain.
 pub fn inheritsOrIs(comptime Child: type, comptime Ancestor: type) bool {
     comptime {
         const target = Ancestor.bridge.type;
@@ -1314,10 +1323,7 @@ pub fn inheritsOrIs(comptime Child: type, comptime Ancestor: type) bool {
             if (T == target) {
                 return true;
             }
-            if (!@hasField(T, "_proto")) {
-                return false;
-            }
-            T = @typeInfo(std.meta.fieldInfo(T, ._proto).type).pointer.child;
+            T = reflect.Proto(T) orelse return false;
         }
     }
 }

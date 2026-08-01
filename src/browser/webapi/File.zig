@@ -20,10 +20,13 @@ const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
+const Factory = @import("../Factory.zig");
 
 const Blob = @import("Blob.zig");
 
 const File = @This();
+
+pub const Proto = Blob;
 
 _proto: *Blob,
 _name: []const u8,
@@ -39,24 +42,25 @@ pub fn init(
     parts_: ?[]const js.Value,
     name: []const u8,
     opts_: ?InitOptions,
-    page: *Page,
+    exec: *js.Execution,
 ) !*File {
     const opts = opts_ orelse InitOptions{};
-    const blob = try Blob.init(parts_, .{
+    const blob = try Blob.buildValue(parts_, .{
         .type = opts.type,
         .endings = opts.endings,
-    }, page);
+    }, exec);
 
-    errdefer blob.deinit(page);
+    const file = try Factory.chainedWithAllocator(blob._arena.allocator(), .{
+        blob,
+        File{
+            ._proto = undefined,
+            ._name = try blob._arena.dupe(u8, name),
+            ._last_modified = opts.lastModified orelse @intCast(lp.datetime.milliTimestamp(.real)),
+        },
+    });
+    file._proto._type = .{ .file = file };
 
-    const file = try blob._arena.create(File);
-    file.* = .{
-        ._proto = blob,
-        ._name = try blob._arena.dupe(u8, name),
-        ._last_modified = opts.lastModified orelse @intCast(lp.datetime.milliTimestamp(.real)),
-    };
-    blob._type = .{ .file = file };
-
+    blob._arena.report();
     return file;
 }
 
@@ -79,19 +83,31 @@ pub fn structuredSerialize(self: *const File, writer: *js.StructuredWriter) !voi
 }
 
 pub fn structuredDeserialize(reader: *js.StructuredReader, page: *Page) !*File {
-    const blob = try Blob.structuredDeserialize(reader, page);
-    errdefer blob.deinit(page);
-
+    const mime = try reader.readBytes();
+    const data = try reader.readBytes();
     const name = try reader.readBytes();
     const last_modified = try reader.readUint64();
 
-    const file = try blob._arena.create(File);
-    file.* = .{
-        ._proto = blob,
-        ._name = try blob._arena.dupe(u8, name),
-        ._last_modified = @bitCast(last_modified),
-    };
-    blob._type = .{ .file = file };
+    const arena = try page.getPinnedArena(data.len + mime.len + name.len + 256, "Blob.clone");
+    errdefer arena.release();
+
+    const file = try Factory.chainedWithAllocator(arena.allocator(), .{
+        Blob{
+            ._rc = .{},
+            ._arena = arena,
+            ._type = undefined,
+            ._slice = try arena.dupe(u8, data),
+            // the serialized mime is already in normalized form; copy it verbatim
+            ._mime = try arena.dupe(u8, mime),
+        },
+        File{
+            ._proto = undefined,
+            ._name = try arena.dupe(u8, name),
+            ._last_modified = @bitCast(last_modified),
+        },
+    });
+    file._proto._type = .{ .file = file };
+    arena.report();
     return file;
 }
 

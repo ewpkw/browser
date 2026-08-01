@@ -31,6 +31,8 @@ const ValidityState = @import("ValidityState.zig");
 
 const TextArea = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 _value: ?[]const u8 = null,
 
@@ -65,10 +67,10 @@ fn dispatchInputEvent(self: *TextArea, data: ?[]const u8, input_type: []const u8
 }
 
 pub fn asElement(self: *TextArea) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asConstElement(self: *const TextArea) *const Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *TextArea) *Node {
     return self.asElement().asNode();

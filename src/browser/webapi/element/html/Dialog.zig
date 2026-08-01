@@ -8,13 +8,15 @@ const HtmlElement = @import("../Html.zig");
 
 const Dialog = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Dialog) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asConstElement(self: *const Dialog) *const Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Dialog) *Node {
     return self.asElement().asNode();

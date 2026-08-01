@@ -30,13 +30,15 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 const HtmlElement = @import("../Html.zig");
 
 const IFrame = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 _src: []const u8 = "",
 _executed: bool = false,
 _window: ?*Window = null,
 
 pub fn asElement(self: *IFrame) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *IFrame) *Node {
     return self.asElement().asNode();

@@ -44,7 +44,7 @@ pub const Writer = struct {
     frame: *Frame,
     visibility_cache: *DOMNode.Element.VisibilityCache,
     label_index: *Label.LabelByForIndex,
-    temp_arena: std.mem.Allocator,
+    temp_arena: *lp.Arena,
     // When null, emit the full AX tree (getFullAXTree). When set, walk the
     // subtree visiting all nodes (including AX-ignored ones, per the
     // queryAXTree spec) and emit only nodes whose role + accessible name
@@ -703,7 +703,7 @@ pub const Writer = struct {
             if (!std.mem.eql(u8, needle, resolved.role)) return;
         }
 
-        const name = (try axn.getName(self.frame, self.temp_arena)) orelse "";
+        const name = (try axn.getName(self.frame, self.temp_arena.allocator())) orelse "";
         if (filter.accessible_name) |needle| {
             if (!std.mem.eql(u8, needle, name)) return;
         }
@@ -970,12 +970,12 @@ pub fn getName(self: AXNode, frame: *Frame, allocator: std.mem.Allocator) !?[]co
 
 fn writeName(
     axnode: AXNode,
-    temp_arena: ?std.mem.Allocator,
+    temp_arena: ?*lp.Arena,
     w: anytype,
     frame: *Frame,
     label_index: ?*Label.LabelByForIndex,
 ) !?AXSource {
-    defer if (temp_arena) |a| frame._session.arena_pool.reset(a, scratch_retain_limit);
+    defer if (temp_arena) |a| a.reset(scratch_retain_limit);
 
     const node = axnode.dom;
 
@@ -988,8 +988,8 @@ fn writeName(
             else => null,
         },
         .cdata => |cd| switch (cd._type) {
-            .text => |*text| {
-                try writeString(text.ownData(), w);
+            .text => {
+                try writeString(cd._data.str(), w);
                 return .contents;
             },
             else => null,
@@ -1108,8 +1108,8 @@ fn writeAccessibleNameFallback(node: *DOMNode, writer: *std.Io.Writer, frame: *F
     while (it.next()) |child| {
         switch (child._type) {
             .cdata => |cd| switch (cd._type) {
-                .text => |*text| {
-                    const content = std.mem.trim(u8, text.ownData(), &std.ascii.whitespace);
+                .text => {
+                    const content = std.mem.trim(u8, cd._data.str(), &std.ascii.whitespace);
                     if (content.len > 0) {
                         try writer.writeAll(content);
                         try writer.writeByte(' ');
@@ -1227,7 +1227,7 @@ fn labelPromotionTarget(
 }
 
 fn writeLabelName(
-    temp_arena: ?std.mem.Allocator,
+    temp_arena: ?*lp.Arena,
     node: *DOMNode,
     el: *DOMNode.Element,
     frame: *Frame,
@@ -1256,7 +1256,7 @@ fn writeLabelName(
 }
 
 fn writeLabelInnerText(
-    temp_arena: ?std.mem.Allocator,
+    temp_arena: ?*lp.Arena,
     label_el: *DOMNode.Element,
     frame: *Frame,
     w: anytype,
@@ -1272,8 +1272,8 @@ fn writeLabelInnerText(
 /// Allocator for throwaway name-resolution buffers: prefers the writer's
 /// temp arena so multiple calls reuse its retained page; falls back to
 /// `frame.call_arena` on the non-Writer `getName` path.
-fn scratchAllocator(temp_arena: ?std.mem.Allocator, frame: *Frame) std.mem.Allocator {
-    return temp_arena orelse frame.call_arena;
+fn scratchAllocator(temp_arena: ?*lp.Arena, frame: *Frame) std.mem.Allocator {
+    return if (temp_arena) |a| a.allocator() else frame.call_arena;
 }
 
 fn isHidden(elt: *DOMNode.Element, frame: *Frame, cache: *DOMNode.Element.VisibilityCache) bool {
@@ -1524,7 +1524,7 @@ test "AXNode: writer" {
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
         .registry = &registry,
@@ -1616,7 +1616,7 @@ test "AXNode: writer prunes hidden and resolves labels" {
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
         .registry = &registry,
@@ -1751,7 +1751,7 @@ test "AXNode: Writer query filters by role" {
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
 
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
@@ -1816,7 +1816,7 @@ test "AXNode: writer maps password input to textbox" {
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
         .registry = &registry,
@@ -1869,7 +1869,7 @@ test "AXNode: Writer query filters by accessible name" {
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
 
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,
@@ -1910,7 +1910,7 @@ test "AXNode: Writer query combined role+name filter promotes hidden-input label
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
 
     // Fixture has a CSS-hidden checkbox `<input id="toggle-switch" ...>` plus
     // `<label for="toggle-switch">Enable feature</label>`. Walking finds both:
@@ -1963,7 +1963,7 @@ test "AXNode: Writer query no match returns empty array" {
     var visibility_cache: DOMNode.Element.VisibilityCache = .empty;
     var label_index: Label.LabelByForIndex = .{};
     const temp_arena = try frame.getArena(.medium, "AXNode");
-    defer frame.releaseArena(temp_arena);
+    defer temp_arena.release();
 
     const json = try std.json.Stringify.valueAlloc(testing.allocator, Writer{
         .root = node,

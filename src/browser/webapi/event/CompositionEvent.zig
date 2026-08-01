@@ -28,6 +28,8 @@ const String = lp.String;
 
 const CompositionEvent = @This();
 
+pub const Proto = UIEvent;
+
 _proto: *UIEvent,
 _data: []const u8 = "",
 
@@ -39,8 +41,8 @@ const Options = Event.inheritOptions(CompositionEvent, CompositionEventOptions);
 
 pub fn init(typ: []const u8, opts_: ?Options, frame: *Frame) !*CompositionEvent {
     const arena = try frame.getArena(.tiny, "CompositionEvent");
-    errdefer frame.releaseArena(arena);
-    const type_string = try String.init(arena, typ, .{});
+    errdefer arena.release();
+    const type_string = try String.init(arena.allocator(), typ, .{});
 
     const opts = opts_ orelse Options{};
     const event = try frame._factory.uiEvent(
@@ -80,7 +82,7 @@ pub fn initCompositionEvent(
 
     const arena = event._arena;
     event._initialized = true;
-    event._type_string = try String.init(arena, typ, .{});
+    event._type_string = try String.init(arena.allocator(), typ, .{});
     event._bubbles = bubbles orelse false;
     event._cancelable = cancelable orelse false;
     ui._view = view;

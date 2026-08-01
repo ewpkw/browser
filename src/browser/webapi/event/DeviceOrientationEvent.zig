@@ -28,6 +28,8 @@ const String = lp.String;
 // https://w3c.github.io/deviceorientation/#deviceorientationevent
 const DeviceOrientationEvent = @This();
 
+pub const Proto = Event;
+
 _proto: *Event,
 _alpha: ?f64 = null,
 _beta: ?f64 = null,
@@ -45,8 +47,8 @@ const Options = Event.inheritOptions(DeviceOrientationEvent, DeviceOrientationEv
 
 pub fn init(typ: []const u8, _opts: ?Options, frame: *Frame) !*DeviceOrientationEvent {
     const arena = try frame.getArena(.tiny, "DeviceOrientationEvent");
-    errdefer frame.releaseArena(arena);
-    const type_string = try String.init(arena, typ, .{});
+    errdefer arena.release();
+    const type_string = try String.init(arena.allocator(), typ, .{});
 
     const opts = _opts orelse Options{};
     const event = try frame._factory.event(

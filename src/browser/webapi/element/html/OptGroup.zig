@@ -6,10 +6,12 @@ const HtmlElement = @import("../Html.zig");
 
 const OptGroup = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 
 pub fn asElement(self: *OptGroup) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *OptGroup) *Node {
     return self.asElement().asNode();

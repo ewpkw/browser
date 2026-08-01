@@ -32,6 +32,7 @@ const MouseEvent = @import("webapi/event/MouseEvent.zig");
 const Element = @import("webapi/Element.zig");
 const Document = @import("webapi/Document.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
+const AbortSignal = @import("webapi/AbortSignal.zig");
 const XMLHttpRequestEventTarget = @import("webapi/net/XMLHttpRequestEventTarget.zig");
 const Blob = @import("webapi/Blob.zig");
 const AbstractRange = @import("webapi/AbstractRange.zig");
@@ -76,18 +77,11 @@ pub fn eventTargetWithAllocator(_: *const Factory, allocator: Allocator, child: 
     return chain.get(1);
 }
 
-pub fn standaloneEventTarget(self: *Factory, child: anytype) !*EventTarget {
-    const allocator = self._slab.allocator();
-    const et = try allocator.create(EventTarget);
-    et.* = .{ ._type = unionInit(EventTarget.Type, child) };
-    return et;
-}
-
 // this is a root object
-pub fn event(_: *const Factory, arena: Allocator, typ: String, child: anytype) !*@TypeOf(child) {
+pub fn event(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
     const chain = try PrototypeChain(
         &.{ Event, @TypeOf(child) },
-    ).allocate(arena);
+    ).allocate(arena.allocator());
 
     // Special case: Event has a _type_string field, so we need manual setup
     const event_ptr = chain.get(0);
@@ -97,10 +91,10 @@ pub fn event(_: *const Factory, arena: Allocator, typ: String, child: anytype) !
     return chain.get(1);
 }
 
-pub fn uiEvent(_: *const Factory, arena: Allocator, typ: String, child: anytype) !*@TypeOf(child) {
+pub fn uiEvent(_: *const Factory, arena: *lp.Arena, typ: String, child: anytype) !*@TypeOf(child) {
     const chain = try PrototypeChain(
         &.{ Event, UIEvent, @TypeOf(child) },
-    ).allocate(arena);
+    ).allocate(arena.allocator());
 
     // Special case: Event has a _type_string field, so we need manual setup
     const event_ptr = chain.get(0);
@@ -111,10 +105,10 @@ pub fn uiEvent(_: *const Factory, arena: Allocator, typ: String, child: anytype)
     return chain.get(2);
 }
 
-pub fn mouseEvent(_: *const Factory, arena: Allocator, typ: String, mouse: MouseEvent, child: anytype) !*@TypeOf(child) {
+pub fn mouseEvent(_: *const Factory, arena: *lp.Arena, typ: String, mouse: MouseEvent, child: anytype) !*@TypeOf(child) {
     const chain = try PrototypeChain(
         &.{ Event, UIEvent, MouseEvent, @TypeOf(child) },
-    ).allocate(arena);
+    ).allocate(arena.allocator());
 
     // Special case: Event has a _type_string field, so we need manual setup
     const event_ptr = chain.get(0);
@@ -196,14 +190,22 @@ fn PrototypeChain(comptime types: []const type) type {
             assert(index < types.len);
 
             const ptr = self.get(index);
-            ptr.* = .{ ._proto = self.get(index - 1), ._type = unionInit(T, self.get(index + 1)) };
+            ptr.* = if (comptime @hasField(types[index], "_proto"))
+                .{ ._proto = undefined, ._type = unionInit(T, self.get(index + 1)) }
+            else
+                .{ ._type = unionInit(T, self.get(index + 1)) };
+            setProto(ptr, self.get(index - 1));
         }
 
         fn setMiddleWithValue(self: *const Self, comptime index: usize, comptime T: type, value: anytype) void {
             assert(index >= 1);
 
             const ptr = self.get(index);
-            ptr.* = .{ ._proto = self.get(index - 1), ._type = unionInit(T, value) };
+            ptr.* = if (comptime @hasField(types[index], "_proto"))
+                .{ ._proto = undefined, ._type = unionInit(T, value) }
+            else
+                .{ ._type = unionInit(T, value) };
+            setProto(ptr, self.get(index - 1));
         }
 
         fn setLeaf(self: *const Self, comptime index: usize, value: anytype) void {
@@ -211,7 +213,7 @@ fn PrototypeChain(comptime types: []const type) type {
 
             const ptr = self.get(index);
             ptr.* = value;
-            ptr._proto = self.get(index - 1);
+            setProto(ptr, self.get(index - 1));
         }
     };
 }
@@ -235,7 +237,7 @@ fn AutoPrototypeChain(comptime types: []const type) type {
     };
 }
 
-fn eventInit(arena: Allocator, typ: String, value: anytype) !Event {
+fn eventInit(arena: *lp.Arena, typ: String, value: anytype) !Event {
     // Round to 2ms for privacy (browsers do this)
     // Same (already coarsened) clock as the performance time origin, so the
     // timeStamp getter can report it relative to that origin.
@@ -254,7 +256,7 @@ pub fn blob(_: *const Factory, arena: Allocator, child: anytype) !*@TypeOf(child
     // Special case: Blob has slice and mime fields, so we need manual setup
     const chain = try PrototypeChain(
         &.{ Blob, @TypeOf(child) },
-    ).allocate(arena);
+    ).allocate(arena.allocator());
 
     const blob_ptr = chain.get(0);
     blob_ptr.* = .{
@@ -269,8 +271,8 @@ pub fn blob(_: *const Factory, arena: Allocator, child: anytype) !*@TypeOf(child
     return chain.get(1);
 }
 
-pub fn abstractRange(_: *const Factory, arena: Allocator, child: anytype, frame: *Frame) !*@TypeOf(child) {
-    const chain = try PrototypeChain(&.{ AbstractRange, @TypeOf(child) }).allocate(arena);
+pub fn abstractRange(_: *const Factory, arena: *lp.Arena, child: anytype, frame: *Frame) !*@TypeOf(child) {
+    const chain = try PrototypeChain(&.{ AbstractRange, @TypeOf(child) }).allocate(arena.allocator());
 
     const doc = frame.document.asNode();
     const abstract_range = chain.get(0);
@@ -318,6 +320,129 @@ pub fn node(self: *Factory, child: anytype) !*@TypeOf(child) {
     ).create(allocator, child);
 }
 
+// CData nodes: {EventTarget, Node, CData, [Text,] Leaf}.
+// CData is special, it's _type is a bare tag, not a tagged union. A website can
+// have tens of thousands of Text nodes, and this allows a few optimization to
+// both reduce the # of allocations and the size
+pub fn cdataNode(self: *Factory, cd: Node.CData, leaf: anytype) !*Node.CData {
+    const types = comptime prototypeTypes(@TypeOf(leaf));
+    comptime assert(types[0] == EventTarget and types[1] == Node and types[2] == Node.CData);
+
+    const chain = try PrototypeChain(types).allocate(self._slab.allocator());
+    chain.setRoot(EventTarget.Type);
+    chain.setMiddle(1, Node.Type);
+
+    const cd_ptr = chain.get(2);
+    cd_ptr.* = cd;
+    setProto(cd_ptr, chain.get(1));
+
+    // only the CDATASection chain has a middle here (its Text)
+    inline for (3..types.len - 1) |i| {
+        chain.set(i, .{ ._proto = chain.get(i - 1) });
+    }
+    chain.setLeaf(types.len - 1, leaf);
+    return cd_ptr;
+}
+
+// The full type list for a leaf. Walks the Proto chain.
+// For example CData.Text -> [_]type{EventTarget, Node, CData, Text}).
+pub fn prototypeTypes(comptime Leaf: type) []const type {
+    comptime {
+        var types: []const type = &.{Leaf};
+        var T = Leaf;
+        while (reflect.Proto(T)) |P| {
+            T = P;
+            types = &[_]type{P} ++ types;
+        }
+        return types;
+    }
+}
+
+// Byte offset of T within the chain allocation for `Leaf`. This is what lets
+// a child reach its parent without a stored pointer.
+pub fn chainOffsetOf(comptime Leaf: type, comptime T: type) usize {
+    comptime {
+        var offset: usize = 0;
+        for (prototypeTypes(Leaf)) |C| {
+            offset = std.mem.alignForward(usize, offset, @alignOf(C));
+            if (C == T) return offset;
+            offset += @sizeOf(C);
+        }
+        @compileError(@typeName(T) ++ " is not in the prototype chain of " ++ @typeName(Leaf));
+    }
+}
+
+// Offset from T to its Proto
+pub fn protoOffset(comptime T: type) usize {
+    const P = reflect.Proto(T).?;
+    return chainOffsetOf(T, T) - chainOffsetOf(T, P);
+}
+
+// Get the Proto of a value.
+pub fn protoOf(value: anytype) *reflect.Proto(reflect.Struct(@TypeOf(value))).? {
+    const T = reflect.Struct(@TypeOf(value));
+    const proto: *reflect.Proto(T).? = @ptrFromInt(@intFromPtr(value) - comptime protoOffset(T));
+    if (comptime IS_DEBUG) {
+        // In debug, we'll assert that our offset and the _proto field agree.
+        std.debug.assert(proto == if (comptime hasStoredProto(T)) value._proto else value._proto_canary);
+    }
+    return proto;
+}
+
+// Assigns a chain member's stored `_proto`
+fn setProto(ptr: anytype, proto: anytype) void {
+    const T = reflect.Struct(@TypeOf(ptr));
+    if (comptime hasStoredProto(T)) {
+        ptr._proto = proto;
+    } else if (comptime IS_DEBUG and @hasField(T, "_proto_canary")) {
+        ptr._proto_canary = proto;
+    }
+}
+
+fn hasStoredProto(comptime T: type) bool {
+    return @hasField(T, "_proto") and @FieldType(T, "_proto") != void;
+}
+
+// Generic contiguous chain from explicit values, for chains whose middles
+// can't be default-initialized by AutoPrototypeChain. Callers pass every
+// level's value in root-to-leaf order, with `undefined` for `_proto` and for
+// any field that must point at another chain member, patching the latter on
+// the result.
+pub fn chained(self: *Factory, values: anytype) !*ChainedLeaf(@TypeOf(values)) {
+    return chainedWithAllocator(self._slab.allocator(), values);
+}
+
+pub fn chainedWithAllocator(allocator: Allocator, values: anytype) !*ChainedLeaf(@TypeOf(values)) {
+    const fields = @typeInfo(@TypeOf(values)).@"struct".fields;
+    const types = comptime blk: {
+        var types: [fields.len]type = undefined;
+        for (fields, 0..) |f, i| {
+            types[i] = f.type;
+        }
+        break :blk types;
+    };
+    comptime {
+        for (types[1..], 0..) |T, i| {
+            assert(reflect.Proto(T).? == types[i]);
+        }
+    }
+
+    const chain = try PrototypeChain(&types).allocate(allocator);
+    inline for (0..types.len) |i| {
+        const ptr = chain.get(i);
+        ptr.* = values[i];
+        if (i > 0) {
+            setProto(ptr, chain.get(i - 1));
+        }
+    }
+    return chain.get(types.len - 1);
+}
+
+fn ChainedLeaf(comptime Values: type) type {
+    const fields = @typeInfo(Values).@"struct".fields;
+    return fields[fields.len - 1].type;
+}
+
 pub fn document(self: *Factory, child: anytype) !*@TypeOf(child) {
     const allocator = self._slab.allocator();
     return try AutoPrototypeChain(
@@ -361,11 +486,12 @@ pub fn svgElement(self: *Factory, tag_name: []const u8, child: anytype) !*@TypeO
     inline for (1..types.len - 1) |i| {
         const T = types[i];
         if (T == Element.Svg) {
-            chain.set(i, .{
-                ._proto = chain.get(i - 1),
+            const svg_ptr = chain.get(i);
+            svg_ptr.* = .{
                 ._tag_name = try String.init(self._arena, tag_name, .{}),
                 ._type = unionInit(Element.Svg.Type, chain.get(i + 1)),
-            });
+            };
+            setProto(svg_ptr, chain.get(i - 1));
         } else {
             chain.setMiddle(i, T.Type);
         }
@@ -375,29 +501,23 @@ pub fn svgElement(self: *Factory, tag_name: []const u8, child: anytype) !*@TypeO
 }
 
 fn svgPrototypeTypes(comptime Child: type) []const type {
-    comptime {
-        var types: []const type = &[_]type{Child};
-        var T = Child;
-
-        while (T != EventTarget) {
-            if (!@hasField(T, "_proto")) {
-                @compileError(@typeName(T) ++ " does not lead to EventTarget through _proto");
-            }
-            T = reflect.Struct(@FieldType(T, "_proto"));
-            types = &[_]type{T} ++ types;
-        }
-
-        if (types.len < 5 or types[3] != Element.Svg) {
-            @compileError(@typeName(Child) ++ " is not an SVG prototype chain");
-        }
-        return types;
+    const types = prototypeTypes(Child);
+    if (types.len < 5 or types[0] != EventTarget or types[3] != Element.Svg) {
+        @compileError(@typeName(Child) ++ " is not an SVG prototype chain");
     }
+    return types;
 }
 
 pub fn xhrEventTarget(_: *const Factory, allocator: Allocator, child: anytype) !*@TypeOf(child) {
     return try AutoPrototypeChain(
         &.{ EventTarget, XMLHttpRequestEventTarget, @TypeOf(child) },
     ).create(allocator, child);
+}
+
+pub fn taskSignal(self: *Factory, child: anytype) !*@TypeOf(child) {
+    return try AutoPrototypeChain(
+        &.{ EventTarget, AbortSignal, @TypeOf(child) },
+    ).create(self._slab.allocator(), child);
 }
 
 pub fn textTrackCue(self: *Factory, child: anytype) !*@TypeOf(child) {
@@ -414,18 +534,16 @@ pub fn destroy(self: *Factory, value: anytype) void {
 
     if (comptime IS_DEBUG) {
         // We should always destroy from the leaf down.
-        if (@hasDecl(S, "_prototype_root")) {
-            // A Event{._type == .generic} (or any other similar types)
-            // _should_ be destroyed directly. The _type = .generic is a pseudo
-            // child
-            if (S != Event or value._type != .generic) {
-                log.fatal(.bug, "factory.destroy.event", .{ .type = @typeName(S) });
+        if (comptime @hasDecl(S, "_prototype_root")) {
+            const is_leaf = if (comptime @hasField(S, "_type")) value._type == .generic else false;
+            if (!is_leaf) {
+                log.fatal(.bug, "factory.destroy.root", .{ .type = @typeName(S) });
                 unreachable;
             }
         }
     }
 
-    if (comptime @hasField(S, "_proto")) {
+    if (comptime reflect.Proto(S) != null) {
         self.destroyChain(value, 0, std.mem.Alignment.@"1");
     } else {
         self.destroyStandalone(value);
@@ -451,8 +569,8 @@ fn destroyChain(
     const new_size = current_size + @sizeOf(S);
     const new_align = std.mem.Alignment.max(old_align, std.mem.Alignment.of(S));
 
-    if (@hasField(S, "_proto")) {
-        self.destroyChain(value._proto, new_size, new_align);
+    if (comptime reflect.Proto(S) != null) {
+        self.destroyChain(protoOf(value), new_size, new_align);
     } else {
         // no proto so this is the head of the chain.
         // we use this as the ptr to the start of the chain.

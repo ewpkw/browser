@@ -24,15 +24,12 @@ const Page = @import("../Page.zig");
 const DOMPoint = @import("DOMPoint.zig");
 const Matrix = @import("DOMMatrixReadOnly.zig");
 
-const Allocator = std.mem.Allocator;
-
 const DOMPointReadOnly = @This();
 
 pub const _prototype_root = true;
 
 _type: Type,
 _rc: lp.RC,
-_arena: Allocator,
 
 _x: f64,
 _y: f64,
@@ -73,7 +70,10 @@ pub fn init(x_: ?f64, y_: ?f64, z_: ?f64, w_: ?f64, exec: *const js.Execution) !
 }
 
 pub fn deinit(self: *DOMPointReadOnly, page: *Page) void {
-    page.releaseArena(self._arena);
+    switch (self._type) {
+        .generic => page.factory.destroy(self),
+        .mutable => |point| page.factory.destroy(point),
+    }
 }
 
 pub fn acquireRef(self: *DOMPointReadOnly) void {
@@ -85,20 +85,18 @@ pub fn releaseRef(self: *DOMPointReadOnly, page: *Page) void {
 }
 
 pub fn createBare(x: f64, y: f64, z: f64, w: f64, page: *Page) !*DOMPointReadOnly {
-    const arena = try page.getArena(.tiny, "DOMPoint");
-    errdefer page.releaseArena(arena);
+    return page.factory.create(buildValue(x, y, z, w));
+}
 
-    const self = try arena.create(DOMPointReadOnly);
-    self.* = .{
+pub fn buildValue(x: f64, y: f64, z: f64, w: f64) DOMPointReadOnly {
+    return .{
         ._rc = .{},
-        ._arena = arena,
         ._type = .generic,
         ._x = x,
         ._y = y,
         ._z = z,
         ._w = w,
     };
-    return self;
 }
 
 pub fn fromPoint(other_: ?DOMPointInit, page: *Page) !*DOMPointReadOnly {

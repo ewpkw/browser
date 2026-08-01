@@ -185,12 +185,8 @@ pub fn getHeaders(self: *ScriptManagerBase) !http.Headers {
     return headers;
 }
 
-fn acquireArena(self: *ScriptManagerBase, size_or_bucket: anytype, debug: []const u8) !Allocator {
+fn acquireArena(self: *ScriptManagerBase, size_or_bucket: anytype, debug: []const u8) !*lp.Arena {
     return self.owner.session().getArena(size_or_bucket, debug);
-}
-
-fn releaseArena(self: *ScriptManagerBase, arena: Allocator) void {
-    self.owner.session().releaseArena(arena);
 }
 
 pub fn scriptList(self: *ScriptManagerBase, script: *const Script) *std.DoublyLinkedList {
@@ -238,8 +234,8 @@ pub fn preloadImport(self: *ScriptManagerBase, url: [:0]const u8, referrer: []co
     }
     errdefer _ = self.imported_modules.remove(url);
 
-    const arena = try self.acquireArena(.large, "SM.preloadImport");
-    errdefer self.releaseArena(arena);
+    const arena = try self.acquireArena(.small, "SM.preloadImport");
+    errdefer arena.release();
 
     const script = try arena.create(Script);
     script.* = .{
@@ -430,8 +426,8 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
         }
     }
 
-    const arena = try self.acquireArena(.large, "SM.getAsyncImport");
-    errdefer self.releaseArena(arena);
+    const arena = try self.acquireArena(.small, "SM.getAsyncImport");
+    errdefer arena.release();
 
     const script = try arena.create(Script);
     script.* = .{
@@ -614,7 +610,14 @@ pub const Script = struct {
     status: u16 = 0,
     source: Source,
     url: []const u8,
-    arena: Allocator,
+    arena: *lp.Arena,
+
+    // Where `source` lives, when it isn't `arena`. The double-arena lets us
+    // use a .small arena for the Script itself, and then a properly sized one
+    // for the body, when we know its size. This avoids eager-usage of our
+    // limited .large arena pool
+    source_arena: ?*lp.Arena = null,
+
     extra: Extra,
     node: std.DoublyLinkedList.Node,
     manager: *ScriptManagerBase,
@@ -691,7 +694,16 @@ pub const Script = struct {
     };
 
     pub fn deinit(self: *Script) void {
-        self.manager.releaseArena(self.arena);
+        if (self.source_arena) |source_arena| {
+            source_arena.release();
+        }
+        self.arena.release();
+    }
+
+    // The allocator `source` grows from. Falls back to the control arena when
+    // no header callback ran to size a dedicated one.
+    fn sourceAllocator(self: *Script) Allocator {
+        return (self.source_arena orelse self.arena).allocator();
     }
 
     pub fn startCallback(transfer: *HttpClient.Transfer) !void {
@@ -752,9 +764,19 @@ pub const Script = struct {
         }
 
         lp.assert(self.source.remote.capacity == 0, "ScriptManagerBase.Header buffer", .{ .capacity = self.source.remote.capacity });
+
+        const content_length = transfer.getContentLength();
+        if (self.source_arena == null) {
+            // A redirect re-runs this callback; keep the arena we already have.
+            self.source_arena = if (content_length) |cl|
+                try self.manager.acquireArena(cl, "SM.source")
+            else
+                try self.manager.acquireArena(.large, "SM.source");
+        }
+
         var buffer: std.ArrayList(u8) = .empty;
-        if (transfer.getContentLength()) |cl| {
-            try buffer.ensureTotalCapacity(self.arena, cl);
+        if (content_length) |cl| {
+            try buffer.ensureTotalCapacity(self.sourceAllocator(), cl);
         }
         self.source = .{ .remote = buffer };
         return .proceed;
@@ -769,7 +791,7 @@ pub const Script = struct {
     }
 
     fn _dataCallback(self: *Script, _: *HttpClient.Transfer, data: []const u8) !void {
-        try self.source.remote.appendSlice(self.arena, data);
+        try self.source.remote.appendSlice(self.sourceAllocator(), data);
     }
 
     pub fn doneCallback(ctx: *anyopaque) !void {
@@ -930,8 +952,6 @@ pub const Script = struct {
             return;
         }
 
-        defer frame._event_manager.clearIgnoreList();
-
         var try_catch: js.TryCatch = undefined;
         try_catch.init(local);
         defer try_catch.deinit();
@@ -960,6 +980,10 @@ pub const Script = struct {
             log.debug(.browser, "executed script", .{ .src = url, .success = success });
         }
 
+        if (!success and frame.js.env.isExecutionTerminating()) {
+            return;
+        }
+
         defer {
             local.runMacrotasks(); // also runs microtasks
             _ = frame.js.scheduler.run() catch |err| {
@@ -986,12 +1010,23 @@ pub const Script = struct {
             };
         }
 
-        self.executeCallback(comptime .wrap("error"));
+        // a classic script that throws is still "loaded". For a module, we can't
+        // currently tell the difference between loaded, but errors, and failed
+        // to load, so we stick with just error.
+        self.executeCallback(switch (fe.kind) {
+            .javascript => comptime .wrap("load"),
+            else => comptime .wrap("error"),
+        });
     }
 
     // Frame-only: fires load/error on the <script> element itself,
     // synchronously. Hint <link> events go through queueHintEvent instead.
     pub fn executeCallback(self: *const Script, typ: String) void {
+        if (self.source != .remote) {
+            // an inline script fires nothing
+            return;
+        }
+
         const fe = self.extra.frame;
         const frame = fe.frame;
         const Event = @import("webapi/Event.zig");
@@ -1003,7 +1038,7 @@ pub const Script = struct {
             });
             return;
         };
-        frame._event_manager.dispatchOpts(fe.script_element.asNode().asEventTarget(), event, .{ .apply_ignore = true }) catch |err| {
+        frame._event_manager.dispatch(fe.script_element.asNode().asEventTarget(), event) catch |err| {
             log.warn(.js, "script callback", .{
                 .url = self.url,
                 .type = typ,
@@ -1071,7 +1106,6 @@ pub const ImportedModule = struct {
 const testing = @import("../testing.zig");
 
 test "ScriptManagerBase: shutdownCallback fails a .loading module" {
-    defer testing.reset();
     const page = try testing.pageTest("mcp_nav.html", .{});
     defer page.close();
     const frame = page.frame().?;
@@ -1106,7 +1140,6 @@ test "ScriptManagerBase: shutdownCallback fails a .loading module" {
 }
 
 test "ScriptManagerBase: waitForImport stops when teardown is pending" {
-    defer testing.reset();
     const page = try testing.pageTest("mcp_nav.html", .{});
     defer page.close();
     const frame = page.frame().?;
@@ -1135,7 +1168,7 @@ test "ScriptManagerBase: waitForImport stops when teardown is pending" {
         .raw = try message_arena.dupe(u8, "{}"),
         .input = .{ .method = "Target.disposeBrowserContext" },
     } });
-    defer client.inbox.pop().?.deinit(client.arena_pool);
+    defer client.inbox.pop().?.deinit();
 
     try testing.expectError(error.SyncWaitInterrupted, sm.waitForImport(url));
 }

@@ -27,11 +27,13 @@ const HtmlElement = @import("../Html.zig");
 const String = lp.String;
 
 const Unknown = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 _tag_name: String,
 
 pub fn asElement(self: *Unknown) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Unknown) *Node {
     return self.asElement().asNode();

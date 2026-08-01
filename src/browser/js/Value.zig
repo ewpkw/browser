@@ -531,12 +531,10 @@ const CloneDelegate = struct {
             // closest cloneable supertype (mirrors TaggedOpaque.fromJS).
             var ptr = @intFromPtr(tao.value);
             for (prototype_chain[1..]) |proto| {
-                ptr += proto.offset;
-                const proto_ptr: **anyopaque = @ptrFromInt(ptr);
-                if (writeCloneable(ctx, proto.index, proto_ptr.*)) |result| {
+                ptr -= proto.offset;
+                if (writeCloneable(ctx, proto.index, @ptrFromInt(ptr))) |result| {
                     return result;
                 }
-                ptr = @intFromPtr(proto_ptr.*);
             }
         }
 
@@ -603,7 +601,7 @@ const CloneDelegate = struct {
             const handle = message orelse break :blk null;
             const str = js.String{ .local = local, .handle = handle };
             // the exception can outlive this call; dupe onto the context arena
-            break :blk str.toSliceWithAlloc(local.ctx.arena) catch null;
+            break :blk str.toSliceWithAlloc(local.ctx.arena.allocator()) catch null;
         };
         throwDataCloneException(local, msg);
     }

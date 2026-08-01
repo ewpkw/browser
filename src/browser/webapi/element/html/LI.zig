@@ -24,10 +24,12 @@ const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 
 const LI = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 
 pub fn asElement(self: *LI) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *LI) *Node {
     return self.asElement().asNode();

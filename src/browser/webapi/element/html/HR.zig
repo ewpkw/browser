@@ -22,10 +22,12 @@ const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 
 const HR = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 
 pub fn asElement(self: *HR) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *HR) *Node {
     return self.asElement().asNode();

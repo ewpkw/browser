@@ -469,7 +469,7 @@ pub const RequestWriter = struct {
                 try SafeString.writeObjectField(jws, hdr.name);
                 try jws.write(SafeString.wrap(hdr.value));
             }
-            if (try request.getCookieString(transfer.arena)) |cookies| {
+            if (try request.getCookieString(transfer.arena.allocator())) |cookies| {
                 try jws.objectField("Cookie");
                 try jws.write(cookies[0 .. cookies.len - 1]);
             }
@@ -652,8 +652,7 @@ test "cdp.network setExtraHTTPHeaders" {
 }
 
 test "cdp.network setExtraHTTPHeaders rejects non-printable User-Agent" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
+    testing.silenceLog(&.{.not_implemented});
 
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -673,6 +672,22 @@ test "cdp.network setExtraHTTPHeaders rejects non-printable User-Agent" {
     try testing.expectEqual("x-custom: hi", std.mem.span(bc.extra_headers.items[0]));
 }
 
+test "cdp.network setExtraHTTPHeaders accepts a Mozilla User-Agent" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "NID-UA2", .session_id = "NESI-UA2" });
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Network.setExtraHTTPHeaders",
+        .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } },
+    });
+
+    const bc = ctx.cdp().browser_context.?;
+    try testing.expectEqual(bc.extra_headers.items.len, 1);
+}
+
 test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -689,9 +704,25 @@ test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
     try testing.expectEqual(bc.extra_headers.items.len, 1);
 }
 
+test "cdp.network setExtraHTTPHeaders accepts a Mozilla User-Agent with colon in key" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "NID-UA4", .session_id = "NESI-UA4" });
+
+    // Even with a colon in the key, Mozilla UA should be accepted in this build.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Network.setExtraHTTPHeaders",
+        .params = .{ .headers = .{ .@"User-Agent:Mozilla/5.0 (X" = "Y)" } },
+    });
+
+    const bc = ctx.cdp().browser_context.?;
+    try testing.expectEqual(bc.extra_headers.items.len, 1);
+}
+
 test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
+    testing.silenceLog(&.{.not_implemented});
 
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -948,8 +979,7 @@ test "cdp.Network: configured CDP ignores setCacheDisabled" {
 }
 
 test "cdp.Network: setBlockedURLs blocks requests with inspector reason" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
 
     var ctx = try testing.context();
     defer ctx.deinit();

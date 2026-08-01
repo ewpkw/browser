@@ -183,9 +183,23 @@ test "cdp.Emulation: setUserAgentOverride with valid user agent" {
     try ctx.expectSentResult(null, .{ .id = 1 });
 }
 
+test "cdp.Emulation: setUserAgentOverride accepts Mozilla user agent" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-UA2" });
+
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Emulation.setUserAgentOverride",
+        .params = .{ .userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36" },
+    });
+
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
+}
+
 test "cdp.Emulation: setUserAgentOverride rejects non-printable characters" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
+    testing.silenceLog(&.{.not_implemented});
 
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -201,8 +215,7 @@ test "cdp.Emulation: setUserAgentOverride rejects non-printable characters" {
 }
 
 test "cdp.Emulation: setUserAgentOverride with optional params" {
-    const filter: testing.LogFilter = .init(&.{.not_implemented});
-    defer filter.deinit();
+    testing.silenceLog(&.{.not_implemented});
 
     var ctx = try testing.context();
     defer ctx.deinit();

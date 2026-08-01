@@ -42,6 +42,8 @@ const SharedWorkerGlobalScope = @import("SharedWorkerGlobalScope.zig");
 
 const SharedWorker = @This();
 
+pub const Proto = EventTarget;
+
 _proto: *EventTarget,
 _port: *MessagePort,
 _on_error: ?js.Function.Global = null,
@@ -137,7 +139,6 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: SharedWorker" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
     try testing.htmlRunner("shared_worker", .{ .timeout_ms = 8000 });
 }

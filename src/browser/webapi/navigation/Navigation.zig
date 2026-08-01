@@ -22,6 +22,7 @@ const URL = @import("../URL.zig");
 
 const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
+const Factory = @import("../../Factory.zig");
 
 const Event = @import("../Event.zig");
 const EventTarget = @import("../EventTarget.zig");
@@ -30,6 +31,8 @@ const log = lp.log;
 
 // https://developer.mozilla.org/en-US/docs/Web/API/Navigation
 const Navigation = @This();
+
+pub const Proto = EventTarget;
 
 const NavigationKind = @import("root.zig").NavigationKind;
 const NavigationActivation = @import("NavigationActivation.zig");
@@ -55,21 +58,12 @@ fn asEventTarget(self: *Navigation) *EventTarget {
 }
 
 pub fn onRemoveFrame(self: *Navigation) void {
-    self._proto = undefined;
     if (self._on_currententrychange) |cb| cb.release();
     self._on_currententrychange = null;
 
     for (self._entries.items) |entry| {
         if (entry._on_dispose) |cb| cb.release();
         entry._on_dispose = null;
-        entry._proto = undefined;
-    }
-}
-
-pub fn onNewFrame(self: *Navigation, frame: *Frame) !void {
-    self._proto = try frame._factory.standaloneEventTarget(self);
-    for (self._entries.items) |entry| {
-        entry._proto = try frame._factory.standaloneEventTarget(entry);
     }
 }
 
@@ -219,20 +213,23 @@ pub fn pushEntry(
     const id = self._next_entry_id;
     self._next_entry_id += 1;
 
-    const id_str = try std.fmt.allocPrint(arena, "{d}", .{id});
+    const id_str = try std.fmt.allocPrint(arena.allocator(), "{d}", .{id});
 
-    const entry = try arena.create(NavigationHistoryEntry);
-    entry.* = NavigationHistoryEntry{
-        ._proto = try frame._factory.standaloneEventTarget(entry),
-        ._id = id_str,
-        ._key = id_str,
-        ._url = url,
-        ._state = state,
-    };
+    const entry = try Factory.chainedWithAllocator(arena.allocator(), .{
+        EventTarget{ ._type = undefined },
+        NavigationHistoryEntry{
+            ._proto = undefined,
+            ._id = id_str,
+            ._key = id_str,
+            ._url = url,
+            ._state = state,
+        },
+    });
+    entry._proto._type = .{ .navigation_history_entry = entry };
 
     // we don't always have a current entry...
     const previous = if (self._entries.items.len > 0) self.getCurrentEntry() else null;
-    try self._entries.append(arena, entry);
+    try self._entries.append(arena.allocator(), entry);
     self._index = index;
 
     if (previous != null and should_dispatch) {
@@ -263,16 +260,19 @@ pub fn replaceEntry(
 
     const id = self._next_entry_id;
     self._next_entry_id += 1;
-    const id_str = try std.fmt.allocPrint(arena, "{d}", .{id});
+    const id_str = try std.fmt.allocPrint(arena.allocator(), "{d}", .{id});
 
-    const entry = try arena.create(NavigationHistoryEntry);
-    entry.* = NavigationHistoryEntry{
-        ._proto = try frame._factory.standaloneEventTarget(entry),
-        ._id = id_str,
-        ._key = previous._key,
-        ._url = url,
-        ._state = state,
-    };
+    const entry = try Factory.chainedWithAllocator(arena.allocator(), .{
+        EventTarget{ ._type = undefined },
+        NavigationHistoryEntry{
+            ._proto = undefined,
+            ._id = id_str,
+            ._key = previous._key,
+            ._url = url,
+            ._state = state,
+        },
+    });
+    entry._proto._type = .{ .navigation_history_entry = entry };
 
     const old_entry = self._entries.items[self._index];
     self._entries.items[self._index] = entry;
@@ -320,7 +320,7 @@ pub fn navigateInner(
     const committed = local.createPromiseResolver();
     const finished = local.createPromiseResolver();
 
-    var new_url = try URL.resolve(arena, frame.url, url, .{});
+    var new_url = try URL.resolve(arena.allocator(), frame.url, url, .{});
     const is_same_document = URL.eqlDocument(new_url, frame.url);
 
     // In case of navigation to the same document, we force an url duplication.
@@ -406,7 +406,7 @@ pub fn navigateInner(
 pub fn navigate(self: *Navigation, _url: [:0]const u8, _opts: ?NavigateOptions, frame: *Frame) !NavigationReturn {
     const arena = frame._session.arena;
     const opts = _opts orelse NavigateOptions{};
-    const json = if (opts.state) |state| state.toJson(arena) catch return error.DataClone else null;
+    const json = if (opts.state) |state| state.toJson(arena.allocator()) catch return error.DataClone else null;
 
     const kind: NavigationKind = if (opts.history) |history|
         if (std.mem.eql(u8, "replace", history)) .{ .replace = json } else .{ .push = json }
@@ -469,7 +469,7 @@ pub fn updateCurrentEntry(self: *Navigation, options: UpdateCurrentEntryOptions,
     const previous = self.getCurrentEntry();
     self.getCurrentEntry()._state = .{
         .source = .navigation,
-        .value = options.state.toJson(arena) catch return error.DataClone,
+        .value = options.state.toJson(arena.allocator()) catch return error.DataClone,
     };
 
     if (self._on_currententrychange) |cec| {

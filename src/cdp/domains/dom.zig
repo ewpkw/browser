@@ -31,6 +31,7 @@ const xpath = @import("../../browser/xpath/Evaluator.zig");
 const Input = @import("../../browser/webapi/element/html/Input.zig");
 const File = @import("../../browser/webapi/File.zig");
 const Blob = @import("../../browser/webapi/Blob.zig");
+const Factory = @import("../../browser/Factory.zig");
 const Page = @import("../../browser/Page.zig");
 
 const log = lp.log;
@@ -161,8 +162,8 @@ fn performSearch(cmd: *CDP.Command) !void {
 
     if (isXPathQuery(params.query)) {
         const arena = try frame.getArena(.medium, "DOM.performSearch");
-        defer frame.releaseArena(arena);
-        const nodes = try xpath.searchAll(arena, root, params.query, frame);
+        defer arena.release();
+        const nodes = try xpath.searchAll(arena.allocator(), root, params.query, frame);
         return finishSearch(cmd, bc, nodes);
     }
 
@@ -654,26 +655,27 @@ fn fileFromDiskPath(path: []const u8, page: *Page) !*File {
     // Mirror File.init: a Blob and File sharing one reference-counted arena,
     // but read the bytes straight off disk into it (single copy, no JS parts).
     const arena = try page.getArena(.large, "File");
-    errdefer page.releaseArena(arena);
+    errdefer arena.release();
 
-    const data = try std.Io.Dir.cwd().readFileAlloc(lp.io, path, arena, .limited(MAX_FILE_BYTES));
+    const data = try std.Io.Dir.cwd().readFileAlloc(lp.io, path, arena.allocator(), .limited(MAX_FILE_BYTES));
     const stat = try std.Io.Dir.cwd().statFile(lp.io, path, .{});
     const basename = std.fs.path.basename(path);
 
-    const blob = try arena.create(Blob);
-    const file = try arena.create(File);
-    blob.* = .{
-        ._rc = .{},
-        ._arena = arena,
-        ._type = .{ .file = file },
-        ._slice = data,
-        ._mime = mimeFromExtension(basename),
-    };
-    file.* = .{
-        ._proto = blob,
-        ._name = try arena.dupe(u8, basename),
-        ._last_modified = stat.mtime.toMilliseconds(),
-    };
+    const file = try Factory.chainedWithAllocator(arena.allocator(), .{
+        Blob{
+            ._rc = .{},
+            ._arena = arena,
+            ._type = undefined,
+            ._slice = data,
+            ._mime = mimeFromExtension(basename),
+        },
+        File{
+            ._proto = undefined,
+            ._name = try arena.dupe(u8, basename),
+            ._last_modified = stat.mtime.toMilliseconds(),
+        },
+    });
+    file._proto._type = .{ .file = file };
     return file;
 }
 

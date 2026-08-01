@@ -5,10 +5,12 @@ const HtmlElement = @import("../Html.zig");
 
 const TableCaption = @This();
 
+pub const Proto = HtmlElement;
+
 _proto: *HtmlElement,
 
 pub fn asElement(self: *TableCaption) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *TableCaption) *Node {
     return self.asElement().asNode();

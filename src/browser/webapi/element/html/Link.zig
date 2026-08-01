@@ -27,6 +27,8 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 const HtmlElement = @import("../Html.zig");
 
 const Link = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 // Cached CSSStyleSheet for an external `rel=stylesheet` once
 // `Frame.loadExternalStylesheet` has registered it. Re-fetches (href
@@ -36,10 +38,10 @@ _proto: *HtmlElement,
 _sheet: ?*@import("../../css/CSSStyleSheet.zig") = null,
 
 pub fn asElement(self: *Link) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asConstElement(self: *const Link) *const Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Link) *Node {
     return self.asElement().asNode();
@@ -295,8 +297,7 @@ test "WebApi: HTML.Link" {
 }
 
 test "WebApi: HTML.Link external stylesheet" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
     try testing.htmlRunner("css/external_stylesheet.html", .{ .load_external_stylesheets = true });
 }
 
@@ -305,7 +306,6 @@ test "WebApi: HTML.Link external stylesheet" {
 // request gate during the sync window). Otherwise the deferred-script queue
 // never drains and the document is stuck at readyState "loading".
 test "WebApi: HTML.Link deferred script then external stylesheet" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
     try testing.htmlRunner("css/deferred_script_then_stylesheet.html", .{ .load_external_stylesheets = true });
 }

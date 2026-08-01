@@ -22,6 +22,8 @@ const string = @import("../../string.zig");
 
 const Page = @import("../Page.zig");
 const Frame = @import("../Frame.zig");
+const Factory = @import("../Factory.zig");
+const reflect = @import("../reflect.zig");
 
 const js = @import("js.zig");
 const Local = @import("Local.zig");
@@ -547,15 +549,14 @@ fn errorLocal(comptime T: type, local: *const Local, info: anytype) Local {
     };
 }
 
-// Upcast a Node-descendant instance to *Node by walking the _proto chain.
+// Upcast a Node-descendant instance to *Node by walking the Proto chain.
 // Not every node type defines an asNode() helper (e.g. Comment, Text), but
 // inheritsOrIs guarantees Node is in the chain
 fn protoNode(comptime T: type, instance: *T) *@import("../webapi/Node.zig") {
     if (T == @import("../webapi/Node.zig")) {
         return instance;
     }
-    const Proto = @typeInfo(std.meta.fieldInfo(T, ._proto).type).pointer.child;
-    return protoNode(Proto, instance._proto);
+    return protoNode(reflect.Proto(T).?, Factory.protoOf(instance));
 }
 
 fn handleError(comptime T: type, comptime F: type, local: *const Local, err: anyerror, info: anytype) void {
@@ -578,6 +579,9 @@ fn handleError(comptime T: type, comptime F: type, local: *const Local, err: any
         // toString threw during argument conversion); throwing anything here
         // would replace the original exception the script expects to see.
         error.JsException => return,
+        // The termination exception is pending; throwing here would replace
+        // it with a catchable Error, letting the killed script keep running.
+        error.ExecutionTerminated => return,
         else => {},
     }
 
@@ -601,8 +605,27 @@ fn handleError(comptime T: type, comptime F: type, local: *const Local, err: any
         };
     };
 
+    if (comptime returnsPromise(F) and @TypeOf(info) == FunctionCallbackInfo) {
+        // An operation that returns a promise must not throw. It rejects.
+        const resolver = js.PromiseResolver.init(&err_local);
+        resolver.rejectValue(.{ .local = &err_local, .handle = js_err }) catch |reject_err| {
+            log.err(.bug, "handleError reject", .{ .err = reject_err });
+        };
+        info.getReturnValue().set(resolver.promise().toValue());
+        return;
+    }
+
     const js_exception = isolate.throwException(js_err);
     info.getReturnValue().setValueHandle(js_exception);
+}
+
+fn returnsPromise(comptime F: type) bool {
+    const R = @typeInfo(F).@"fn".return_type orelse return false;
+    const payload = switch (@typeInfo(R)) {
+        .error_union => |eu| eu.payload,
+        else => R,
+    };
+    return payload == js.Promise;
 }
 
 // Convert a Zig error to a DOMException. If the error is unknown, return null.

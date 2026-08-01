@@ -26,13 +26,15 @@ const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 
 const Anchor = @This();
+
+pub const Proto = HtmlElement;
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Anchor) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asConstElement(self: *const Anchor) *const Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Anchor) *Node {
     return self.asElement().asNode();

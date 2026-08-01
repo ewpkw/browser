@@ -23,6 +23,8 @@ const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
 
 const Meta = @This();
+
+pub const Proto = HtmlElement;
 // Because we have a JsApi.Meta, "Meta" can be ambiguous in some scopes.
 // Create a different alias we can use when in such ambiguous cases.
 const MetaElement = Meta;
@@ -30,7 +32,7 @@ const MetaElement = Meta;
 _proto: *HtmlElement,
 
 pub fn asElement(self: *Meta) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Meta) *Node {
     return self.asElement().asNode();

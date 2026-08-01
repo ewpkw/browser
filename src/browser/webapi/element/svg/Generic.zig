@@ -24,11 +24,13 @@ const Element = @import("../../Element.zig");
 const Svg = @import("../Svg.zig");
 
 const Generic = @This();
+
+pub const Proto = Svg;
 _proto: *Svg,
 _tag: Element.Tag,
 
 pub fn asElement(self: *Generic) *Element {
-    return self._proto._proto;
+    return self._proto.asElement();
 }
 pub fn asNode(self: *Generic) *Node {
     return self.asElement().asNode();
