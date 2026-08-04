@@ -22,7 +22,6 @@ const lp = @import("lightpanda");
 const js = @import("js.zig");
 
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const v8 = js.v8;
 
@@ -73,7 +72,7 @@ fn _toSlice(self: String, comptime null_terminate: bool, allocator: Allocator) !
     const l = v8.v8__String__Utf8Length(handle, isolate);
     const buf = try (if (comptime null_terminate) allocator.allocSentinel(u8, @intCast(l), 0) else allocator.alloc(u8, @intCast(l)));
     const n = v8.v8__String__WriteUtf8(handle, isolate, buf.ptr, buf.len, v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8);
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(n == l);
     }
 
@@ -95,31 +94,30 @@ pub fn toSSOWithAlloc(self: String, allocator: Allocator) !lp.String {
     if (l <= 12) {
         var content: [12]u8 = undefined;
         const n = v8.v8__String__WriteUtf8(handle, isolate, &content[0], content.len, v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8);
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             std.debug.assert(n == l);
         }
         // Weird that we do this _after_, but we have to..I've seen weird issues
         // in ReleaseMode where v8 won't write to content if it starts off zero
         // initiated
         @memset(content[l..], 0);
-        return .{ .len = @intCast(l), .payload = .{ .content = @bitCast(content) } };
+        return .{
+            .len = @intCast(l),
+            .prefix = @bitCast(content[0..4].*),
+            .suffix = .{ .buf = content[4..12].* },
+        };
     }
 
     const buf = try allocator.alloc(u8, l);
     const n = v8.v8__String__WriteUtf8(handle, isolate, buf.ptr, buf.len, v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8);
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(n == l);
     }
 
-    var prefix: [4]u8 = @splat(0);
-    @memcpy(&prefix, buf[0..4]);
-
     return .{
         .len = @intCast(l),
-        .payload = .{ .heap = .{
-            .prefix = @bitCast(prefix),
-            .ptr = @intFromPtr(buf.ptr),
-        } },
+        .prefix = @bitCast(buf[0..4].*),
+        .suffix = .{ .ptr = @intFromPtr(buf.ptr) },
     };
 }
 

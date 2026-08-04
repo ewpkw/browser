@@ -50,9 +50,6 @@ const MessagePort = @import("MessagePort.zig");
 const SharedWorkerGlobalScope = @import("SharedWorkerGlobalScope.zig");
 const DedicatedWorkerGlobalScope = @import("DedicatedWorkerGlobalScope.zig");
 
-const builtin = @import("builtin");
-const IS_DEBUG = builtin.mode == .Debug;
-
 const log = lp.log;
 const Allocator = std.mem.Allocator;
 
@@ -259,8 +256,8 @@ pub fn hasDirectListeners(self: *WorkerGlobalScope, target: *EventTarget, typ: [
 
 // Workers don't have their own Referer; per spec, dedicated worker requests
 // use the parent document's URL. Delegate to the owning frame.
-pub fn headersForRequest(self: *WorkerGlobalScope, headers: *HttpClient.Headers) !void {
-    return self._frame.headersForRequest(headers);
+pub fn headersForRequest(self: *WorkerGlobalScope, transfer: *HttpClient.Transfer) !void {
+    return self._frame.headersForRequest(transfer);
 }
 
 pub fn isSameOrigin(self: *const WorkerGlobalScope, url: [:0]const u8) bool {
@@ -273,7 +270,12 @@ pub fn isSameOrigin(self: *const WorkerGlobalScope, url: [:0]const u8) bool {
 }
 
 pub fn makeRequest(self: *WorkerGlobalScope, req: HttpClient.Request) !void {
-    return self._session.browser.http_client.request(req, &self._http_owner);
+    const transfer = try self._session.browser.http_client.newRequest(req, &self._http_owner);
+    {
+        errdefer transfer.deinit();
+        try self.headersForRequest(transfer);
+    }
+    return transfer.submit();
 }
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
@@ -365,7 +367,7 @@ pub fn structuredClone(_: *const WorkerGlobalScope, value: JS.Value) !JS.Value {
 }
 
 pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, rejection: JS.PromiseRejection) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.js, "unhandled rejection", .{
             .target = "worker",
             .value = rejection.reason(),
@@ -419,22 +421,27 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
 
     const http_client = &session.browser.http_client;
 
-    var headers = try http_client.newHeaders();
-    try self.headersForRequest(&headers);
-
-    var response = http_client.syncRequest(.{
+    const transfer = http_client.newRequest(.{
         .url = resolved_url,
         .method = .GET,
         .frame_id = self._frame_id,
         .document_frame_id = self._frame._frame_id,
         .loader_id = self._loader_id,
-        .headers = headers,
         .cookie_jar = &session.cookie_jar,
         .cookie_origin = self.url,
         .resource_type = .script,
         .notification = session.notification,
         .shutdown_callback = HttpClient.noopShutdown, // syncRequest installs its own
     }, &self._http_owner) catch |err| {
+        log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
+        return error.NetworkError;
+    };
+    {
+        errdefer transfer.deinit();
+        try self.headersForRequest(transfer);
+    }
+
+    var response = http_client.syncRequest(transfer) catch |err| {
         log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
         return error.NetworkError;
     };
@@ -503,7 +510,7 @@ pub fn reportError(self: *WorkerGlobalScope, err: JS.Value) !void {
     // We still dispatch so that addEventListener('error', ...) listeners fire.
     try self.dispatch(self.asEventTarget(), event, null, .{});
 
-    if (comptime builtin.is_test == false) {
+    if (comptime lp.IS_TEST == false) {
         if (!event._prevent_default) {
             log.warn(.js, "worker.reportError", .{
                 .message = error_event._message,

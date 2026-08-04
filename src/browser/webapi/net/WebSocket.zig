@@ -35,7 +35,6 @@ const MessageEvent = @import("../event/MessageEvent.zig");
 
 const log = lp.log;
 const Execution = js.Execution;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const WebSocket = @This();
 
@@ -57,7 +56,6 @@ _got_upgrade: bool = false,
 
 _conn: ?*http.Connection,
 _http_client: *HttpClient,
-_req_headers: http.Headers,
 
 _owner_node: std.DoublyLinkedList.Node = .{},
 
@@ -186,7 +184,6 @@ pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*
         ._arena = arena,
         ._proto = undefined,
         ._url = resolved_url,
-        ._req_headers = .{ .headers = null },
         ._http_client = http_client,
     });
 
@@ -201,7 +198,7 @@ pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*
     // the moment it's created. deactivate() releases this reference.
     self.acquireRef();
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.info(.websocket, "connecting", .{ .url = url });
     }
 
@@ -239,12 +236,13 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
     try conn.setWriteCallback(receivedDataCallback);
     try conn.setHeaderCallback(receivedHeaderCallback);
 
-    var headers = try http_client.newHeaders();
-    errdefer headers.deinit();
+    const allocator = arena.allocator();
+    for (http_client.baselineHeaders()) |hdr| {
+        try conn.addHeader(allocator, hdr.name, hdr.value);
+    }
 
     if (protocols.len > 0) {
-        const header = try std.fmt.allocPrintSentinel(arena.allocator(), "Sec-WebSocket-Protocol: {s}", .{try std.mem.join(arena.allocator(), ", ", protocols)}, 0);
-        try headers.add(header);
+        try conn.addHeader(allocator, "Sec-WebSocket-Protocol", try std.mem.join(allocator, ", ", protocols));
     }
 
     {
@@ -253,13 +251,12 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
         // protection on WS servers) reject upgrades that arrive without it.
         // Non-tuple origins (about:blank, data:) serialize to "null", like
         // Chrome sends for opaque origins.
-        const origin = (try URL.getOrigin(arena.allocator(), exec.url.*)) orelse "null";
-        const header = try std.fmt.allocPrintSentinel(arena.allocator(), "Origin: {s}", .{origin}, 0);
-        try headers.add(header);
+        const origin = (try URL.getOrigin(allocator, exec.url.*)) orelse "null";
+        try conn.addHeader(allocator, "Origin", origin);
     }
 
     {
-        var buf: std.Io.Writer.Allocating = .init(arena.allocator());
+        var buf: std.Io.Writer.Allocating = .init(allocator);
         try exec.session.cookie_jar.forRequest(resolved_url, &buf.writer, .{
             .is_http = true,
             .is_navigation = false,
@@ -272,13 +269,12 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
         }
     }
 
-    try conn.setHeaders(&headers);
+    try conn.commitHeaders();
 
     conn.transport = .{ .websocket = self };
     try http_client.trackConn(conn);
 
     self._conn = conn;
-    self._req_headers = headers;
 }
 
 fn isBlockedPort(url: [:0]const u8) bool {
@@ -455,14 +451,13 @@ fn deactivate(self: *WebSocket) void {
     self.releaseRef(self._exec.page);
 }
 
-// Unlink the connection from the http client and free the request headers.
-// Queued outgoing messages are kept: their arenas are released in deinit,
-// and bufferedAmount keeps reporting them, as the spec wants.
+// Unlink the connection from the http client. Queued outgoing messages are
+// kept: their arenas are released in deinit, and bufferedAmount keeps
+// reporting them, as the spec wants.
 fn releaseTransport(self: *WebSocket) void {
     const conn = self._conn orelse return;
     self._conn = null;
     self._http_client.removeConn(conn);
-    self._req_headers.deinit();
 }
 
 // Pump-side: record an event for delivery. Errors propagate to libcurl's
@@ -797,7 +792,7 @@ fn dispatchCloseEvent(self: *WebSocket, code: u16, reason: []const u8, was_clean
 }
 
 fn sendDataCallback(buffer: [*]u8, buf_count: usize, buf_len: usize, data: *anyopaque) callconv(.c) usize {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(buf_count == 1);
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));
@@ -851,7 +846,7 @@ fn _sendDataCallback(conn: *http.Connection, buf: []u8) !usize {
 fn writeContent(self: *WebSocket, conn: *http.Connection, buf: []u8, byte_msg: Message.Content, frame_type: http.WsFrameType) !usize {
     if (self._send_offset == 0) {
         // start of the message
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.websocket, "send start", .{ .url = self._url, .len = byte_msg.data.len });
         }
         try conn.wsStartFrame(frame_type, byte_msg.data.len);
@@ -866,7 +861,7 @@ fn writeContent(self: *WebSocket, conn: *http.Connection, buf: []u8, byte_msg: M
     if (self._send_offset >= byte_msg.data.len) {
         const removed = self._send_queue.orderedRemove(0);
         removed.deinit(self._exec.page);
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.websocket, "send complete", .{ .url = self._url, .len = byte_msg.data.len, .queue = self._send_queue.items.len });
         }
         self._send_offset = 0;
@@ -876,7 +871,7 @@ fn writeContent(self: *WebSocket, conn: *http.Connection, buf: []u8, byte_msg: M
 }
 
 fn receivedDataCallback(buffer: [*]const u8, buf_count: usize, buf_len: usize, data: *anyopaque) callconv(.c) usize {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(buf_count == 1);
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));
@@ -898,7 +893,7 @@ fn _receivedDataCallback(conn: *http.Connection, data: []const u8) !void {
     };
 
     if (meta.offset == 0) {
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.websocket, "incoming message", .{ .url = self._url, .len = meta.len, .bytes_left = meta.bytes_left, .type = meta.frame_type });
         }
         // Start of new frame. Pre-allocate buffer
@@ -944,7 +939,7 @@ fn _receivedDataCallback(conn: *http.Connection, data: []const u8) !void {
 // libcurl has no mechanism to signal that the connection is established. The
 // best option I could come up with was looking for an upgrade header response.
 fn receivedHeaderCallback(buffer: [*]const u8, header_count: usize, buf_len: usize, data: *anyopaque) callconv(.c) usize {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         std.debug.assert(header_count == 1);
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));

@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const HttpClient = @import("../network/HttpClient.zig");
 
@@ -31,7 +30,6 @@ const Element = @import("webapi/Element.zig");
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 const ScriptManager = @This();
 
@@ -99,10 +97,6 @@ pub fn tailHook(base: *ScriptManagerBase) void {
     }
 }
 
-fn getHeaders(self: *ScriptManager) !HttpClient.Headers {
-    return self.base.getHeaders();
-}
-
 // Returns true when a fetch was started: the link's load/error event fires
 // when the fetch settles. false (duplicate hint) = no event will fire.
 // element is null when the hint came from the prescan rather than a <link>.
@@ -132,7 +126,7 @@ pub fn preloadScript(self: *ScriptManager, element: ?*Element.Html, url: []const
     try self.preloaded_scripts.putNoClobber(self.base.allocator, owned_url, .{ .state = .{ .loading = script } });
     errdefer _ = self.preloaded_scripts.remove(owned_url);
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "script queue", .{ .url = owned_url, .ctx = "preload" });
     }
 
@@ -142,7 +136,6 @@ pub fn preloadScript(self: *ScriptManager, element: ?*Element.Html, url: []const
         .method = .GET,
         .frame_id = frame._frame_id,
         .loader_id = frame._loader_id,
-        .headers = try self.base.getHeaders(),
         .cookie_jar = &frame._session.cookie_jar,
         .cookie_origin = frame.url,
         .resource_type = .script,
@@ -270,7 +263,7 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
         break :blk .normal;
     };
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         var ls: js.Local.Scope = undefined;
         frame.js.localScope(&ls);
         defer ls.deinit();
@@ -296,7 +289,7 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
             preloaded = self.base.takeModuleHint(remote_url);
         }
         if (preloaded) |pre| {
-            if (comptime IS_DEBUG) {
+            if (comptime lp.IS_DEBUG) {
                 log.debug(.http, "script adopt", .{ .url = remote_url, .ctx = ctx, .state = if (pre.complete) "done" else "loading" });
             }
             pre.extra = frame_extra;
@@ -354,18 +347,22 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
                 script.status = pre.status;
                 script.complete = true;
             } else {
-                const response = try self.base.client.syncRequest(.{
+                const transfer = try self.base.client.newRequest(.{
                     .url = remote_url,
                     .method = .GET,
                     .frame_id = frame._frame_id,
                     .loader_id = frame._loader_id,
-                    .headers = try self.getHeaders(),
                     .cookie_jar = &frame._session.cookie_jar,
                     .cookie_origin = frame.url,
                     .resource_type = .script,
                     .notification = frame._session.notification,
                     .shutdown_callback = HttpClient.noopShutdown, // syncRequest installs its own
                 }, &frame._http_owner);
+                {
+                    errdefer transfer.deinit();
+                    try frame.headersForRequest(transfer);
+                }
+                const response = try self.base.client.syncRequest(transfer);
 
                 // Take the body's arena rather than releasing it: `source`
                 // has to outlive this call, up to script.deinit().
@@ -402,7 +399,6 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
         .method = .GET,
         .frame_id = frame._frame_id,
         .loader_id = frame._loader_id,
-        .headers = try self.getHeaders(),
         .cookie_jar = &frame._session.cookie_jar,
         .cookie_origin = frame.url,
         .resource_type = .script,
@@ -520,7 +516,7 @@ const PreloadedScript = struct {
             return Script.doneCallback(ctx);
         }
         script.complete = true;
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.http, "script fetch complete", .{ .req = script.url });
         }
 

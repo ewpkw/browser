@@ -99,7 +99,6 @@ pub const UL = @import("html/UL.zig");
 pub const Unknown = @import("html/Unknown.zig");
 
 const log = lp.log;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 const GlobalEventHandler = global_event_handlers.Handler;
 
 const HtmlElement = @This();
@@ -107,7 +106,7 @@ const HtmlElement = @This();
 pub const Proto = Element;
 
 _type: Type,
-_proto_canary: if (IS_DEBUG) *Element else void = undefined,
+_proto_canary: if (lp.IS_DEBUG) *Element else void = undefined,
 
 // Special constructor for custom elements (autonomous, `extends HTMLElement`).
 // Two paths:
@@ -542,7 +541,7 @@ fn setAttributeListener(
     listener_callback: ?js.Function.Global,
     frame: *Frame,
 ) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.event, "Html.setAttributeListener", .{
             .type = std.meta.activeTag(self._type),
             .listener_type = listener_type,
@@ -1489,30 +1488,36 @@ fn collectInnerText(self: *HtmlElement, state: *InnerTextState) std.Io.Writer.Er
     var it = el.asNode().childrenIterator();
     while (it.next()) |child| {
         switch (child._type) {
-            .element => |e| switch (e._type) {
-                .svg => {},
-                .html => |he| {
-                    const tag = e.getTag();
-                    switch (child_filter) {
-                        .none => {},
-                        .select => if (tag != .option and tag != .optgroup) continue,
-                        .optgroup => if (tag != .option) continue,
-                    }
-                    try handleChildElement(he, tag, state, &saw_cell, &saw_row);
-                },
+            .element => {
+                const e = child.subtype(Node.Element);
+                switch (e._type) {
+                    .svg => {},
+                    .html => |he| {
+                        const tag = e.getTag();
+                        switch (child_filter) {
+                            .none => {},
+                            .select => if (tag != .option and tag != .optgroup) continue,
+                            .optgroup => if (tag != .option) continue,
+                        }
+                        try handleChildElement(he, tag, state, &saw_cell, &saw_row);
+                    },
+                }
             },
-            .cdata => |c| switch (c._type) {
-                .text => {
-                    if (child_filter != .none) {
-                        // Text directly inside <select>/<optgroup> is skipped
-                        continue;
-                    }
-                    if (table_ctx and isAllAsciiWhitespace(c.getData().str())) {
-                        continue;
-                    }
-                    try writeText(c, state);
-                },
-                .comment, .cdata_section, .processing_instruction => {},
+            .cdata => {
+                const c = child.subtype(Node.CData);
+                switch (c._type) {
+                    .text => {
+                        if (child_filter != .none) {
+                            // Text directly inside <select>/<optgroup> is skipped
+                            continue;
+                        }
+                        if (table_ctx and isAllAsciiWhitespace(c.getData().str())) {
+                            continue;
+                        }
+                        try writeText(c, state);
+                    },
+                    .comment, .cdata_section, .processing_instruction => {},
+                }
             },
             else => {},
         }

@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const http = @import("../network/http.zig");
 const HttpClient = @import("../network/HttpClient.zig");
@@ -34,7 +33,6 @@ const Element = @import("webapi/Element.zig");
 const log = lp.log;
 const String = lp.String;
 const Allocator = std.mem.Allocator;
-const IS_DEBUG = builtin.mode == .Debug;
 
 const ScriptManagerBase = @This();
 
@@ -72,12 +70,6 @@ pub const Owner = union(enum) {
     pub fn jsContext(self: Owner) *js.Context {
         return switch (self) {
             inline else => |g| g.js,
-        };
-    }
-
-    pub fn addHeaders(self: Owner, headers: *HttpClient.Headers) !void {
-        return switch (self) {
-            inline else => |g| g.headersForRequest(headers),
         };
     }
 
@@ -179,12 +171,6 @@ fn clearList(list: *std.DoublyLinkedList) void {
     }
 }
 
-pub fn getHeaders(self: *ScriptManagerBase) !http.Headers {
-    var headers = try self.client.newHeaders();
-    try self.owner.addHeaders(&headers);
-    return headers;
-}
-
 fn acquireArena(self: *ScriptManagerBase, size_or_bucket: anytype, debug: []const u8) !*lp.Arena {
     return self.owner.session().getArena(size_or_bucket, debug);
 }
@@ -251,7 +237,7 @@ pub fn preloadImport(self: *ScriptManagerBase, url: [:0]const u8, referrer: []co
 
     gop.value_ptr.* = .{ .state = .{ .loading = script }, .hint = opts.hint };
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         var ls: js.Local.Scope = undefined;
         self.owner.jsContext().localScope(&ls);
         defer ls.deinit();
@@ -278,7 +264,6 @@ pub fn preloadImport(self: *ScriptManagerBase, url: [:0]const u8, referrer: []co
         .method = .GET,
         .frame_id = owner.frameId(),
         .loader_id = owner.loaderId(),
-        .headers = try self.getHeaders(),
         .cookie_jar = &session.cookie_jar,
         .cookie_origin = owner.url(),
         .resource_type = .script,
@@ -399,7 +384,7 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
                     // fetch is in flight, take the script and turn it into
                     // our normal getAsyncImport flow (e.g. what we do at the
                     // end of this file as-if imported_modules didn't have this script)
-                    if (comptime IS_DEBUG) {
+                    if (comptime lp.IS_DEBUG) {
                         log.debug(.http, "script adopt", .{ .url = url, .ctx = "dynamic module", .state = "loading" });
                     }
                     script.extra = .{ .import_async = .{ .callback = cb, .data = cb_data } };
@@ -411,7 +396,7 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
                     // ready_scripts flow. evaluate() runs it now, or — if an
                     // evaluation window is open — evaluate_pending runs it
                     // when that window closes.
-                    if (comptime IS_DEBUG) {
+                    if (comptime lp.IS_DEBUG) {
                         log.debug(.http, "script adopt", .{ .url = url, .ctx = "dynamic module", .state = "done" });
                     }
                     script.extra = .{ .import_async = .{ .callback = cb, .data = cb_data } };
@@ -443,7 +428,7 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
         } },
     };
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         var ls: js.Local.Scope = undefined;
         self.owner.jsContext().localScope(&ls);
         defer ls.deinit();
@@ -473,7 +458,6 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
         .method = .GET,
         .frame_id = owner.frameId(),
         .loader_id = owner.loaderId(),
-        .headers = try self.getHeaders(),
         .resource_type = .script,
         .cookie_jar = &session.cookie_jar,
         .cookie_origin = owner.url(),
@@ -724,7 +708,7 @@ pub const Script = struct {
             return .abort;
         }
 
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.http, "script header", .{
                 .req = transfer,
                 .status = transfer.responseStatus(),
@@ -797,7 +781,7 @@ pub const Script = struct {
     pub fn doneCallback(ctx: *anyopaque) !void {
         const self: *Script = @ptrCast(@alignCast(ctx));
         self.complete = true;
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.http, "script fetch complete", .{ .req = self.url });
         }
 
@@ -917,7 +901,6 @@ pub const Script = struct {
         log.info(.browser, "executing script", .{
             .src = url,
             .kind = fe.kind,
-            .cacheable = cacheable,
         });
 
         var ls: js.Local.Scope = undefined;
@@ -943,7 +926,6 @@ pub const Script = struct {
                     .err = err,
                     .src = url,
                     .kind = fe.kind,
-                    .cacheable = cacheable,
                 });
                 self.executeCallback(comptime .wrap("error"));
                 return;
@@ -976,7 +958,7 @@ pub const Script = struct {
             break :blk true;
         };
 
-        if (comptime IS_DEBUG) {
+        if (comptime lp.IS_DEBUG) {
             log.debug(.browser, "executed script", .{ .src = url, .success = success });
         }
 
@@ -1001,7 +983,6 @@ pub const Script = struct {
         log.warn(.js, "eval script", .{
             .url = url,
             .caught = caught,
-            .cacheable = cacheable,
         });
 
         if (try_catch.exceptionValue()) |exc| {

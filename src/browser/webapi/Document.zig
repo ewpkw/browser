@@ -46,7 +46,6 @@ pub const HTMLDocument = @import("HTMLDocument.zig");
 
 const log = lp.log;
 const String = lp.String;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Document = @This();
 
@@ -1299,7 +1298,7 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                                 }
                                 has_doctype = true;
                             },
-                            .cdata => |cd| switch (cd._type) {
+                            .cdata => switch (frag_child.subtype(Node.CData)._type) {
                                 .comment, .processing_instruction => {}, // Allowed
                                 .text, .cdata_section => return error.HierarchyError, // Not allowed in Document
                             },
@@ -1325,7 +1324,7 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                             }
                             has_doctype = true;
                         },
-                        .cdata => |cd| switch (cd._type) {
+                        .cdata => switch (child.subtype(Node.CData)._type) {
                             .comment, .processing_instruction => {}, // Allowed
                             .text, .cdata_section => return error.HierarchyError, // Not allowed in Document
                         },
@@ -1469,7 +1468,7 @@ pub fn injectBlank(self: *Document, frame: *Frame) error{InjectBlankError}!void 
 }
 
 fn _injectBlank(self: *Document, frame: *Frame) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         // should only be called on an empty document
         std.debug.assert(self.asNode()._first_child == null);
     }

@@ -39,7 +39,6 @@ const XMLHttpRequestUpload = @import("XMLHttpRequestUpload.zig");
 
 const log = lp.log;
 const Execution = js.Execution;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const XMLHttpRequest = @This();
 
@@ -235,7 +234,7 @@ pub fn overrideMimeType(self: *XMLHttpRequest, mime: []const u8) !void {
 }
 
 pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "XMLHttpRequest.send", .{ .url = self._url });
     }
     if (self._ready_state != .opened or self._send_flag) {
@@ -260,16 +259,9 @@ pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !v
     const exec = self._exec;
 
     const session = exec.session;
-    const http_client = &session.browser.http_client;
-    var headers = try http_client.newHeaders();
 
     // Only add cookies for same-origin or when withCredentials is true
     const cookie_support = self._with_credentials or exec.isSameOrigin(self._url);
-
-    try self._request_headers.populateHttpHeader(exec.call_arena, &headers);
-    if (cookie_support) {
-        try exec.headersForRequest(&headers);
-    }
 
     self.acquireRef();
     self._active_requests += 1;
@@ -279,7 +271,6 @@ pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !v
         .ctx = self,
         .url = self._url,
         .method = self._method,
-        .headers = headers,
         .frame_id = exec.frameId(),
         .loader_id = exec.loaderId(),
         .body = self._request_body,
@@ -300,11 +291,23 @@ pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !v
         return err;
     };
 
+    {
+        errdefer {
+            transfer.deinit();
+            self.releaseSelfRef();
+            self._send_flag = false;
+        }
+        try self._request_headers.populateRequestHeaders(transfer);
+        if (cookie_support) {
+            try exec.headersForRequest(transfer);
+        }
+    }
+
     // Held for abort() / open() / deinit; the error, shutdown and done
     // callbacks clear it.
     self._http_transfer = transfer;
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "request start", .{ .method = self._method, .url = self._url, .source = "xhr" });
     }
 
@@ -510,7 +513,7 @@ fn httpHeaderCallback(transfer: *Transfer, header: http.Header) !void {
 fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
     const self: *XMLHttpRequest = @ptrCast(@alignCast(transfer.req.ctx));
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "request header", .{
             .source = "xhr",
             .url = self._url,

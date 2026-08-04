@@ -33,7 +33,6 @@ const MessageEvent = @import("../event/MessageEvent.zig");
 const log = lp.log;
 const String = lp.String;
 const Execution = js.Execution;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 // https://html.spec.whatwg.org/multipage/server-sent-events.html
 const EventSource = @This();
@@ -113,7 +112,7 @@ pub fn init(url: []const u8, opts_: ?Opts, exec: *const Execution) !*EventSource
     // deactivate() releases it.
     self.acquireRef();
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "EventSource connecting", .{ .url = resolved });
     }
 
@@ -164,7 +163,6 @@ fn asEventTarget(self: *EventSource) *EventTarget {
 fn connect(self: *EventSource) !void {
     const exec = self._exec;
     const session = exec.session;
-    const http_client = &session.browser.http_client;
 
     self._skip_lf = false;
     self._bom_checked = false;
@@ -175,32 +173,13 @@ fn connect(self: *EventSource) !void {
     self._id_buf.clearRetainingCapacity();
     try self._id_buf.appendSlice(self._arena.allocator(), self._last_event_id.items);
 
-    var headers = try http_client.newHeaders();
-    try headers.add("Accept: text/event-stream");
-    try headers.add("Cache-Control: no-cache");
-    if (self._last_event_id.items.len > 0) {
-        // headers.add copies the value, so the local arena's lifetime is enough
-        const header = try std.fmt.allocPrintSentinel(exec.local_arena, "Last-Event-ID: {s}", .{self._last_event_id.items}, 0);
-        try headers.add(header);
-    }
-
     const same_origin = exec.isSameOrigin(self._url);
-    if (!same_origin) {
-        // EventSource is a CORS request: cross-origin fetches carry the
-        // document's origin ("null" for opaque origins, like Chrome).
-        const origin = exec.origin() orelse "null";
-        const header = try std.fmt.allocPrintSentinel(exec.local_arena, "Origin: {s}", .{origin}, 0);
-        try headers.add(header);
-    }
-    try exec.headersForRequest(&headers);
-
     const cookie_support = self._with_credentials or same_origin;
 
     const transfer = try exec.newRequest(.{
         .ctx = self,
         .url = self._url,
         .method = .GET,
-        .headers = headers,
         .frame_id = exec.frameId(),
         .loader_id = exec.loaderId(),
         .cookie_jar = if (cookie_support) &session.cookie_jar else null,
@@ -214,6 +193,21 @@ fn connect(self: *EventSource) !void {
         .error_callback = httpErrorCallback,
         .shutdown_callback = httpShutdownCallback,
     });
+
+    {
+        errdefer transfer.deinit();
+        try transfer.addHeader("Accept", "text/event-stream", .{});
+        try transfer.addHeader("Cache-Control", "no-cache", .{});
+        if (self._last_event_id.items.len > 0) {
+            try transfer.addHeader("Last-Event-ID", self._last_event_id.items, .{});
+        }
+        if (!same_origin) {
+            // EventSource is a CORS request: cross-origin fetches carry the
+            // document's origin ("null" for opaque origins, like Chrome).
+            try transfer.addHeader("Origin", exec.origin() orelse "null", .{});
+        }
+        try exec.headersForRequest(transfer);
+    }
 
     self._transfer = transfer;
 
@@ -319,7 +313,7 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
         break :blk mime.content_type == .text_event_stream;
     };
 
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.http, "request header", .{
             .source = "eventsource",
             .url = self._url,

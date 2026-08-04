@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const js = @import("../js/js.zig");
 const URL = @import("../URL.zig");
@@ -54,7 +53,6 @@ const Scheduler = @import("Scheduler.zig");
 const Notification = @import("../../Notification.zig");
 
 const log = lp.log;
-const IS_DEBUG = builtin.mode == .Debug;
 
 const Execution = js.Execution;
 
@@ -569,7 +567,7 @@ pub fn requestIdleCallback(self: *Window, cb: js.Function.Global, opts_: ?Reques
         .mode = .idle,
         .repeat = false,
         .params = &.{},
-        .low_priority = true,
+        .blocks_done = false,
         .name = "window.requestIdleCallback",
     });
 }
@@ -590,7 +588,7 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
 
     const target = self.asEventTarget();
     if (!frame._event_manager.hasDirectListeners(target, "error", self._on_error)) {
-        if (comptime builtin.is_test == false) {
+        if (comptime lp.IS_TEST == false) {
             log.warn(.js, "window.reportError", .{
                 .message = err.toStringSlice() catch "Unknown error",
             });
@@ -643,7 +641,7 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
         .context = "window.reportError",
     });
 
-    if (comptime builtin.is_test == false) {
+    if (comptime lp.IS_TEST == false) {
         if (!event._prevent_default) {
             log.warn(.js, "window.reportError", .{
                 .message = error_event._message,
@@ -860,7 +858,6 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
 
     try target_frame.js.scheduler.add(callback, PostMessageCallback.run, 0, .{
         .name = "postMessage",
-        .low_priority = false,
         .finalizer = PostMessageCallback.cancelled,
     });
 }
@@ -971,7 +968,7 @@ pub fn scrollTo(self: *Window, opts: ScrollToOpts, y: ?i32, frame: *Frame) !void
             }
         }.dispatch,
         10,
-        .{ .low_priority = true },
+        .{ .blocks_done = false },
     );
     // We dispatch scrollend event asynchronously after 20ms.
     try frame.js.scheduler.add(
@@ -997,7 +994,7 @@ pub fn scrollTo(self: *Window, opts: ScrollToOpts, y: ?i32, frame: *Frame) !void
             }
         }.dispatch,
         20,
-        .{ .low_priority = true },
+        .{ .blocks_done = false },
     );
 }
 
@@ -1025,7 +1022,7 @@ pub fn getWebDriver(_: *const Window) @import("WebDriver.zig") {
 }
 
 pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, rejection: js.PromiseRejection, frame: *Frame) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         log.debug(.js, "unhandled rejection", .{
             .target = "window",
             .value = rejection.reason(),

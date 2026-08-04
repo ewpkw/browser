@@ -30,7 +30,6 @@ pub const CDATASection = @import("cdata/CDATASection.zig");
 pub const ProcessingInstruction = @import("cdata/ProcessingInstruction.zig");
 
 const String = lp.String;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const CData = @This();
 
@@ -41,7 +40,7 @@ _data: String = .empty,
 // In debug, set so that we can check that we have a proper contiguous block
 // of memory for the entire chain (and thus, simple pointer arithmetics will
 // work to resolve the proto).
-_proto_canary: if (IS_DEBUG) *Node else void = undefined,
+_proto_canary: if (lp.IS_DEBUG) *Node else void = undefined,
 
 // The subtype's struct is not a payload here: it's the member laid out after
 // the CData in the factory chain (see Factory.cdataNode), reachable via
@@ -70,10 +69,11 @@ fn tagOf(comptime T: type) Type {
     @compileError(@typeName(T) ++ " is not a CData subtype");
 }
 
-pub fn subtype(self: *CData, comptime T: type) *T {
+// Takes a const cdata but returns a mutable subtype; see Node.subtype.
+pub fn subtype(self: *const CData, comptime T: type) *T {
     const offset = comptime Factory.chainOffsetOf(T, T) - Factory.chainOffsetOf(T, CData);
     const sub: *T = @ptrFromInt(@intFromPtr(self) + offset);
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         // the arithmetic rides on factory-chain contiguity; the stored
         // back-pointer doubles as its canary
         if (comptime T == CDATASection) {
@@ -328,7 +328,7 @@ pub fn format(self: *const CData, writer: *std.Io.Writer) !void {
         .text => writer.print("<text>{f}</text>", .{self._data}),
         .comment => writer.print("<!-- {f} -->", .{self._data}),
         .cdata_section => writer.print("<![CDATA[{f}]]>", .{self._data}),
-        .processing_instruction => writer.print("<?{s} {f}?>", .{ @constCast(self).subtype(ProcessingInstruction)._target, self._data }),
+        .processing_instruction => writer.print("<?{s} {f}?>", .{ self.subtype(ProcessingInstruction)._target, self._data }),
     };
 }
 
@@ -343,8 +343,8 @@ pub fn isEqualNode(self: *const CData, other: *const CData) bool {
 
     if (self._type == .processing_instruction) {
         @branchHint(.unlikely);
-        const self_target = @constCast(self).subtype(ProcessingInstruction)._target;
-        const other_target = @constCast(other).subtype(ProcessingInstruction)._target;
+        const self_target = self.subtype(ProcessingInstruction)._target;
+        const other_target = other.subtype(ProcessingInstruction)._target;
         if (std.mem.eql(u8, self_target, other_target) == false) {
             return false;
         }
