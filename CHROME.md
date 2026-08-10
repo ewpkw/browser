@@ -385,7 +385,7 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
 
 ---
 
-## 四、需要额外添加的 HTTP 头（1个文件）
+## 四、需要额外添加的 HTTP 头（2个文件）
 
 ### 4.1 在 Config.zig 中定义 Client Hint 常量
 
@@ -399,34 +399,43 @@ pub const sec_ch_ua_bitness: [:0]const u8 = "Sec-Ch-Ua-Bitness: \"64\"";
 pub const sec_ch_ua_wow64: [:0]const u8 = "Sec-Ch-Ua-WoW64: ?0";
 ```
 
-> 所有 Client Hint 值统一定义在 Config.zig，http.zig 通过引用这些常量来添加 header，避免字符串硬编码分散在多处。
+> 所有 Client Hint 值统一定义在 Config.zig，避免字符串硬编码分散在多处。
 
-### 4.2 在 http.zig Headers.init 中引用 Config 常量
+### 4.2 在 HttpClient.zig baselineHeaders 中添加 Client Hints
 
-**文件**: `src/network/http.zig` 第 114-136 行 `Headers.init` 函数
+**文件**: `src/network/HttpClient.zig` `baselineHeaders` 函数
+
+> **架构变更说明**：上游重构了 header 管理，删除了 `http.zig` 中的 `Headers` struct，改为在 `HttpClient.zig` 中通过 `baselineHeaders()` 返回默认 header 数组。Client Hints 现在在此处添加。
 
 将原来的：
 ```zig
-        return .{ .headers = updated_headers };
+pub fn baselineHeaders(self: *const Client) [3]http.Header {
+    return .{
+        .{ .name = "User-Agent", .value = self.getUserAgent() },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
+    };
+}
 ```
 
 替换为：
 ```zig
-        const with_platform = libcurl.curl_slist_append(updated_headers, Config.HttpHeaders.sec_ch_ua_platform);
-        if (with_platform == null) return error.OutOfMemory;
-        const with_mobile = libcurl.curl_slist_append(with_platform, Config.HttpHeaders.sec_ch_ua_mobile);
-        if (with_mobile == null) return error.OutOfMemory;
-        const with_arch = libcurl.curl_slist_append(with_mobile, Config.HttpHeaders.sec_ch_ua_arch);
-        if (with_arch == null) return error.OutOfMemory;
-        const with_bitness = libcurl.curl_slist_append(with_arch, Config.HttpHeaders.sec_ch_ua_bitness);
-        if (with_bitness == null) return error.OutOfMemory;
-        const with_wow64 = libcurl.curl_slist_append(with_bitness, Config.HttpHeaders.sec_ch_ua_wow64);
-        if (with_wow64 == null) return error.OutOfMemory;
-
-        return .{ .headers = with_wow64 };
+pub fn baselineHeaders(self: *const Client) [8]http.Header {
+    return .{
+        .{ .name = "User-Agent", .value = self.getUserAgent() },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
+        // Client Hints for Chrome fingerprint
+        .{ .name = "Sec-Ch-Ua-Platform", .value = "\"Windows\"" },
+        .{ .name = "Sec-Ch-Ua-Mobile", .value = "?0" },
+        .{ .name = "Sec-Ch-Ua-Arch", .value = "\"x86\"" },
+        .{ .name = "Sec-Ch-Ua-Bitness", .value = "\"64\"" },
+        .{ .name = "Sec-Ch-Ua-WoW64", .value = "?0" },
+    };
+}
 ```
 
-> **注意**：所有 header 值都引用 `Config.HttpHeaders` 中的常量，而非硬编码字符串。当 Chrome 版本升级时，只需修改 Config.zig 一处。
+> **注意**：数组大小从 `[3]` 扩展为 `[8]`。当 Chrome 版本升级时，修改对应值即可。
 
 ---
 
@@ -482,12 +491,12 @@ testing.expectEqual('151.0.7813.2', v.uaFullVersion);
 | # | 文件 | 修改类型 | 说明 |
 |---|------|---------|------|
 | 1 | `src/Config.zig` | 修改 | 默认 UA、brands、删除 validateUserAgent Mozilla 检测、添加 CH 常量 |
-| 2 | `src/network/http.zig` | 修改 | Headers.init 添加 Sec-Ch-Ua-* headers（引用 Config 常量） |
+| 2 | `src/network/HttpClient.zig` | 修改 | baselineHeaders 添加 5 个 Client Hints headers（[3]→[8]） |
 | 3 | `src/browser/webapi/Navigator.zig` | 修改 | appVersion、vendor、hardwareConcurrency、deviceMemory、maxTouchPoints、doNotTrack、language/languages、platform |
 | 4 | `src/browser/webapi/NavigatorUAData.zig` | 修改 | platform="Windows"、高熵值匹配 Chrome |
 | 5 | `src/browser/webapi/PluginArray.zig` | 修改 | length=5 (非零) |
-| 6 | `src/cdp/domains/emulation.zig` | 修改+删测试 | 删除 Mozilla 拒绝逻辑和对应测试 |
-| 7 | `src/cdp/domains/network.zig` | 删测试+改载荷 | 删除 Mozilla UA 拒绝测试，CRLF 测试替换载荷 |
+| 6 | `src/cdp/domains/emulation.zig` | 修改+反转测试 | 删除 Mozilla 拒绝逻辑；反转测试为"accepts Mozilla" |
+| 7 | `src/cdp/domains/network.zig` | 反转测试+改载荷 | 反转 Mozilla UA 拒绝测试为接受；CRLF 测试替换载荷 |
 | 8 | `src/help.zon` | 修改 | 更新帮助文本（user-agent + user-agent-suffix） |
 | 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新期望值 |
 | 10 | `src/testing.zig` | 修改 | 更新测试 UA 配置 |

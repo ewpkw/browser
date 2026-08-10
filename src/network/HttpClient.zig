@@ -380,13 +380,19 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 }
 
 // Headers _all_ requests include.
-pub fn baselineHeaders(self: *const Client) [3]http.Header {
+pub fn baselineHeaders(self: *const Client) [8]http.Header {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
         .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
+        // Client Hints for Chrome fingerprint
+        .{ .name = "Sec-Ch-Ua-Platform", .value = "\"Windows\"" },
+        .{ .name = "Sec-Ch-Ua-Mobile", .value = "?0" },
+        .{ .name = "Sec-Ch-Ua-Arch", .value = "\"x86\"" },
+        .{ .name = "Sec-Ch-Ua-Bitness", .value = "\"64\"" },
+        .{ .name = "Sec-Ch-Ua-WoW64", .value = "?0" },
     };
 }
 
