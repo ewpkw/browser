@@ -79,7 +79,7 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 };
 ```
 
-### 1.4 将 CDP 测试用例从「拒绝 Mozilla」反转为「接受 Mozilla」
+### 1.4 将测试用例从「拒绝 Mozilla」反转为「接受 Mozilla」
 
 **文件**: `src/cdp/domains/network.zig`
 
@@ -93,6 +93,13 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 将上游的 2 个 Mozilla 拒绝测试合并为 1 个正向测试：
 - 删除: `test "...ignores mozilla"` 和 `test "...ignores mozilla case insensitive"`
 - 新增: `test "cdp.Emulation: setUserAgentOverride accepts Mozilla user agent"`，期望 `user_agent_changed == true`
+
+**文件**: `src/Config.zig`
+
+将上游新增的 CLI 层 Mozilla 拒绝测试反转为正向验证：
+- `test "Config: parseArgs refuses a mozilla user-agent"` → 改为 `accepts a mozilla user-agent`，期望成功解析 Chrome UA
+- `test "Config: validateUserAgent"` → 删除 `error.Reserved` 断言，改为 `try validateUserAgent("mozilla/1.0")` 和 `try validateUserAgent("Mozilla/5.0")`
+- `userAgentValidator` 函数中的错误提示从 `"must be printable ASCII and can't contain Mozilla"` 改为 `"must be printable ASCII"`
 
 ### 1.5 更新 help.zon 中的说明
 
@@ -121,27 +128,29 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 
 ### 2.1 修改 brands 数据为 Chrome 品牌
 
-**文件**: `src/Config.zig` 第 666-668 行
+**文件**: `src/Config.zig` HttpHeaders.brands
 
 ```zig
 // 修改前
 pub const brands = [_]Brand{
-    .{ .brand = "Lightpanda", .version = "1" },
+    .{ .brand = "Lightpanda", .version = "1", .full_version = lp.build_config.version },
 };
 
 // 修改后（顺序、品牌名、版本号均与真实 Edge 151 一致）
 pub const brands = [_]Brand{
-    .{ .brand = "Not=A?Brand", .version = "99" },
-    .{ .brand = "Microsoft Edge", .version = "151" },
-    .{ .brand = "Chromium", .version = "151" },
+    .{ .brand = "Not=A?Brand", .version = "99", .full_version = "99" },
+    .{ .brand = "Microsoft Edge", .version = "151", .full_version = "151.0.7813.2" },
+    .{ .brand = "Chromium", .version = "151", .full_version = "151.0.7813.2" },
 };
 ```
 
 > 真实 Edge 151 的 Sec-Ch-Ua：`"Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"`
 > **注意**：品牌名是 `Not=A?Brand`（等号和问号），不是 `Not-A.Brand`。顺序也很重要。
+> `full_version` 字段用于 `Sec-Ch-Ua-Full-Version-List` header 和 `getHighEntropyValues().fullVersionList`。
 
 这会同时影响：
 - HTTP 头 `Sec-Ch-Ua` 的值（通过 `sec_ch_ua` 常量自动生成）
+- HTTP 头 `Sec-Ch-Ua-Full-Version-List` 的值（通过 `sec_ch_ua_full_version_list` 常量自动生成）
 - `navigator.userAgentData.brands` JS API 返回值（通过 `brandList()` 引用 `brands`）
 - `navigator.userAgentData.getHighEntropyValues()` 返回值
 
@@ -405,14 +414,15 @@ pub const sec_ch_ua_wow64: [:0]const u8 = "Sec-Ch-Ua-WoW64: ?0";
 
 **文件**: `src/network/HttpClient.zig` `baselineHeaders` 函数
 
-> **架构变更说明**：上游重构了 header 管理，删除了 `http.zig` 中的 `Headers` struct，改为在 `HttpClient.zig` 中通过 `baselineHeaders()` 返回默认 header 数组。Client Hints 现在在此处添加。
+> **架构变更说明**：上游重构了 header 管理，删除了 `http.zig` 中的 `Headers` struct，改为在 `HttpClient.zig` 中通过 `baselineHeaders()` 返回默认 header 数组。Client Hints 现在在此处添加。上游进一步引入了 `Transfer.RequestHeader` 类型（含 `.source` 字段）和 `Sec-Ch-Ua-Full-Version-List` header。
 
 将原来的：
 ```zig
-pub fn baselineHeaders(self: *const Client) [3]http.Header {
+pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
     };
 }
@@ -420,10 +430,13 @@ pub fn baselineHeaders(self: *const Client) [3]http.Header {
 
 替换为：
 ```zig
-pub fn baselineHeaders(self: *const Client) [8]http.Header {
+pub fn baselineHeaders(self: *const Client) [9]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
+        // Omitting Accept-Language triggers bot-protection on some CDNs
+        // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
         // Client Hints for Chrome fingerprint
         .{ .name = "Sec-Ch-Ua-Platform", .value = "\"Windows\"" },
@@ -435,7 +448,7 @@ pub fn baselineHeaders(self: *const Client) [8]http.Header {
 }
 ```
 
-> **注意**：数组大小从 `[3]` 扩展为 `[8]`。当 Chrome 版本升级时，修改对应值即可。
+> **注意**：数组大小从 `[4]` 扩展为 `[9]`。`Sec-Ch-Ua` 和 `Sec-Ch-Ua-Full-Version-List` 标记为 `.source = .fixed`，不可通过 CDP 覆盖。当 Chrome 版本升级时，修改对应值即可。
 
 ---
 
@@ -471,17 +484,18 @@ testing.expectEqual('Microsoft Edge', v.fullVersionList[1].brand);
 testing.expectEqual('151.0.7813.2', v.uaFullVersion);
 ```
 
-### 5.3 更新 testing.zig 中的测试配置
+### 5.3 testing.zig 中的测试配置
 
-**文件**: `src/testing.zig` 第 527 行
+**文件**: `src/testing.zig`
+
+上游重构后删除了 `user_agent_suffix` 字段，测试配置不再设置 UA 后缀。测试直接使用默认的 Chrome UA。
 
 ```zig
-// 修改前
+// 上游旧版
 .user_agent_suffix = "internal-tester",
 
-// 修改后 (保持测试可识别，但基于 Chrome UA)
-.user_agent_suffix = null,
-// 或者直接删除该字段使用默认 UA
+// 上游新版（字段已删除）
+// Config.init 不再接受 user_agent_suffix，直接使用默认 Chrome UA
 ```
 
 ---
@@ -490,16 +504,16 @@ testing.expectEqual('151.0.7813.2', v.uaFullVersion);
 
 | # | 文件 | 修改类型 | 说明 |
 |---|------|---------|------|
-| 1 | `src/Config.zig` | 修改 | 默认 UA、brands、删除 validateUserAgent Mozilla 检测、添加 CH 常量 |
-| 2 | `src/network/HttpClient.zig` | 修改 | baselineHeaders 添加 5 个 Client Hints headers（[3]→[8]） |
+| 1 | `src/Config.zig` | 修改+反转测试 | 默认 UA、brands（含 full_version）、删除 validateUserAgent Mozilla 检测、添加 CH 常量、反转 CLI UA 测试 |
+| 2 | `src/network/HttpClient.zig` | 修改 | baselineHeaders 添加 Sec-Ch-Ua-Full-Version-List + 5 个 Client Hints（[4]→[9]，Transfer.RequestHeader 类型） |
 | 3 | `src/browser/webapi/Navigator.zig` | 修改 | appVersion、vendor、hardwareConcurrency、deviceMemory、maxTouchPoints、doNotTrack、language/languages、platform |
-| 4 | `src/browser/webapi/NavigatorUAData.zig` | 修改 | platform="Windows"、高熵值匹配 Chrome |
+| 4 | `src/browser/webapi/NavigatorUAData.zig` | 修改 | platform="Windows"、高熵值匹配 Chrome（platformVersion、uaFullVersion） |
 | 5 | `src/browser/webapi/PluginArray.zig` | 修改 | length=5 (非零) |
 | 6 | `src/cdp/domains/emulation.zig` | 修改+反转测试 | 删除 Mozilla 拒绝逻辑；反转测试为"accepts Mozilla" |
 | 7 | `src/cdp/domains/network.zig` | 反转测试+改载荷 | 反转 Mozilla UA 拒绝测试为接受；CRLF 测试替换载荷 |
 | 8 | `src/help.zon` | 修改 | 更新帮助文本（user-agent + user-agent-suffix） |
-| 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新期望值 |
-| 10 | `src/testing.zig` | 修改 | 更新测试 UA 配置 |
+| 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新 brands 和 highEntropy 期望值为 Chrome 值 |
+| 10 | `src/testing.zig` | 修改 | 上游删除了 user_agent_suffix 字段，使用默认 Chrome UA |
 
 ---
 
