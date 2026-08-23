@@ -6,7 +6,6 @@ const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
-const ShadowRoot = @import("../../ShadowRoot.zig");
 const slotting = @import("../slotting.zig");
 
 const Slot = @This();
@@ -31,14 +30,6 @@ pub fn asConstElement(self: *const Slot) *const Element {
 
 pub fn asNode(self: *Slot) *Node {
     return self.asElement().asNode();
-}
-
-pub fn getName(self: *const Slot) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("name")) orelse "";
-}
-
-pub fn setName(self: *Slot, name: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("name"), .wrap(name), frame);
 }
 
 const AssignedNodesOptions = struct {
@@ -76,7 +67,7 @@ fn CollectionType(comptime elements: bool) type {
 
 // DOM spec "find flattened slottables"
 fn collectFlattened(self: *Slot, comptime elements: bool, coll: CollectionType(elements), frame: *Frame) error{OutOfMemory}!void {
-    if (self.asNode().getRootNode(.{}).is(ShadowRoot) == null) {
+    if (self.asNode().containingShadowRoot() == null) {
         return;
     }
 
@@ -101,7 +92,7 @@ fn appendFlattened(comptime elements: bool, coll: CollectionType(elements), node
     if (node.is(Slot)) |nested| {
         // a slottable (or fallback child) that is itself a slot in a shadow
         // tree flattens to its own flattened slottables
-        if (nested.asNode().getRootNode(.{}).is(ShadowRoot) != null) {
+        if (nested.asNode().containingShadowRoot() != null) {
             return nested.collectFlattened(elements, coll, frame);
         }
     }
@@ -153,10 +144,13 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
         try self._manually_assigned.append(frame.arena, node);
     }
 
-    const root = self.asNode().getRootNode(.{});
-    if (root.is(ShadowRoot) != null) {
-        slotting.assignSlottablesForTree(root, frame);
+    if (self.asNode().containingShadowRoot()) |shadow_root| {
+        slotting.assignSlottablesForTree(shadow_root.asNode(), frame);
     }
+}
+
+pub fn getName(self: *const Slot) []const u8 {
+    return self.asConstElement().getAttributeSafe(comptime .wrap("name")) orelse "";
 }
 
 pub const JsApi = struct {
@@ -168,7 +162,9 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const name = bridge.accessor(Slot.getName, Slot.setName, .{ .ce_reactions = true });
+    const reflect = Element.Reflect(Slot);
+
+    pub const name = reflect.string("name");
     pub const assignedNodes = bridge.function(Slot.assignedNodes, .{});
     pub const assignedElements = bridge.function(Slot.assignedElements, .{});
     pub const assign = bridge.function(Slot.assign, .{});

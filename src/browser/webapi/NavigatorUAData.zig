@@ -77,7 +77,7 @@ fn brandList() []const Brand {
         const src = &Config.HttpHeaders.brands;
         var arr: [src.len]Brand = undefined;
         for (src, 0..) |b, i| {
-            arr[i] = .{ .brand = b.brand, .version = b.version };
+            arr[i] = .{ .brand = b.brand, .version = b.full_version };
         }
         const final = arr;
         break :blk final;

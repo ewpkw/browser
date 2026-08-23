@@ -559,7 +559,9 @@ test "tests:beforeAll" {
 }
 
 test "tests:afterAll" {
-    test_app.network.stop();
+    if (test_cdp_server) |server| {
+        server.shutdown();
+    }
     if (test_cdp_server_thread) |thread| {
         thread.join();
     }
@@ -604,7 +606,7 @@ fn serveCDP(wg: *lp.WaitGroup) !void {
     };
     wg.finish();
 
-    test_app.network.run();
+    test_cdp_server.?.run();
 }
 
 // /serve-count/ counters; only ever touched from the test HTTP server thread.
@@ -676,6 +678,31 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
             .status = .found,
             .extra_headers = &.{
                 .{ .name = "Location", .value = "/redirect-target" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect-cross-origin-x-hop")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "http://localhost:9582/echo-x-hop" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/echo-x-hop")) {
+        var it = req.iterateHeaders();
+        var value: []const u8 = "NONE";
+        while (it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "x-hop")) {
+                value = header.value;
+                break;
+            }
+        }
+        return req.respond(value, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
             },
         });
     }
@@ -996,6 +1023,23 @@ fn testHTTPHandler(req: *std.http.Server.Request) !void {
         else
             "";
         return req.respond(body, .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/echo_headers")) {
+        // Echo every request header back as "name: value" lines, so tests
+        // can assert on the headers a request actually sent.
+        var buf: [8192]u8 = undefined;
+        var pos: usize = 0;
+        var it = req.iterateHeaders();
+        while (it.next()) |header| {
+            const line = try std.fmt.bufPrint(buf[pos..], "{s}: {s}\n", .{ header.name, header.value });
+            pos += line.len;
+        }
+        return req.respond(buf[0..pos], .{
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
             },

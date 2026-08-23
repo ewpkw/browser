@@ -132,16 +132,13 @@ fn setExtraHTTPHeaders(cmd: *CDP.Command) !void {
         const key = header.key_ptr.*;
         const value = header.value_ptr.*;
 
-        if (std.mem.indexOfAny(u8, key, "\r\n") != null or std.mem.indexOfAny(u8, value, "\r\n") != null) {
-            log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header name/value must not contain CR or LF" });
+        if (Mime.isHttpToken(key) == false) {
+            log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header name must be a non-empty HTTP token" });
             continue;
         }
 
-        // A colon in the name would smuggle a different header name onto the
-        // wire once the pair is joined ("User-Agent:Mozilla/5.0 (X" + "Y)"),
-        // bypassing the User-Agent validation below.
-        if (std.mem.indexOfScalar(u8, key, ':') != null) {
-            log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header name must not contain a colon" });
+        if (Mime.isHttpHeaderValue(value) == false) {
+            log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header value must be Latin-1 text without CR, LF or NUL" });
             continue;
         }
 
@@ -219,14 +216,14 @@ fn clearBrowserCache(cmd: *CDP.Command) !void {
     // Chrome accepts that and clears the jar; reject only on truly malformed JSON.
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const network = bc.cdp.browser.http_client.network;
-    if (network.cache) |*c| try c.clear();
+    try network.cache.clear();
     return cmd.sendResult(null, .{});
 }
 
 fn canClearBrowserCache(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const network = bc.cdp.browser.http_client.network;
-    return cmd.sendResult(.{ .result = network.cache != null }, .{});
+    return cmd.sendResult(.{ .result = network.cache.active() != null }, .{});
 }
 
 fn clearBrowserCookies(cmd: *CDP.Command) !void {
@@ -369,11 +366,11 @@ pub fn httpRequestStart(arena: Allocator, bc: *CDP.BrowserContext, msg: *const N
     const frame_id = req.document_frame_id orelse req.frame_id;
     const frame = bc.session.findFrameByFrameId(frame_id) orelse return;
 
-    // Modify request with extra CDP headers. Use setHeader (replace by name)
-    // so a caller-supplied header overrides a built-in default of the same
-    // name (e.g. User-Agent) instead of producing a duplicate.
+    // Modify request with extra CDP headers: the .cdp layer overrides both
+    // built-in defaults and script-set headers of the same name (Chrome
+    // behavior), but never a .fixed header.
     for (bc.extra_headers.items) |extra| {
-        try transfer.setHeader(extra.name, extra.value, .{});
+        try transfer.setHeader(extra.name, extra.value, .{ .source = .cdp });
     }
 
     // We're missing a bunch of fields, but, for now, this eems like enough
@@ -385,6 +382,10 @@ pub fn httpRequestStart(arena: Allocator, bc: *CDP.BrowserContext, msg: *const N
         .documentURL = frame.url,
         .request = RequestWriter.init(arena, transfer),
         .initiator = .{ .type = "other" },
+        .redirectResponse = if (msg.redirect_response)
+            ResponseWriter.init(arena, transfer)
+        else
+            null,
         .redirectHasExtraInfo = false, // TODO change after adding Network.requestWillBeSentExtraInfo
         .hasUserGesture = false,
         .timestamp = lp.datetime.timestamp(.boot),
@@ -536,11 +537,15 @@ const ResponseWriter = struct {
 
     fn _jsonStringify(self: *const ResponseWriter, jws: anytype) !void {
         const transfer = self.transfer;
+        const response_url = if (transfer.res.header) |header|
+            std.mem.span(header.url)
+        else
+            transfer.req.url;
 
         try jws.beginObject();
         {
             try jws.objectField("url");
-            try jws.write(transfer.req.url);
+            try jws.write(response_url);
         }
 
         if (transfer.responseStatus()) |status| {
@@ -580,7 +585,7 @@ const ResponseWriter = struct {
             try jws.objectField("encodedDataLength");
             try jws.write(transfer._content_length);
             try jws.objectField("securityState");
-            try jws.write(securityState(transfer.req.url));
+            try jws.write(securityState(response_url));
         }
 
         {
@@ -783,6 +788,30 @@ test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF" {
         .method = "Network.setExtraHTTPHeaders",
         .params = .{ .headers = .{
             .@"x-custom" = "bar\r\nUser-Agent: CustomBot/1.0",
+            .@"x-keep" = "ok",
+        } },
+    });
+
+    try testing.expectEqual(bc.extra_headers.items.len, 1);
+    try testing.expectEqual("x-keep", bc.extra_headers.items[0].name);
+    try testing.expectEqual("ok", bc.extra_headers.items[0].value);
+}
+
+test "cdp.network setExtraHTTPHeaders rejects a name that isn't an HTTP token" {
+    testing.silenceLog(&.{.cdp});
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "NID-UA6", .session_id = "NESI-UA6" });
+
+    // A space — or any other non-token byte — in the name would land
+    // malformed on the wire.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Network.setExtraHTTPHeaders",
+        .params = .{ .headers = .{
+            .@"X Custom" = "bar",
             .@"x-keep" = "ok",
         } },
     });
@@ -997,7 +1026,7 @@ test "cdp.Network: setCacheDisabled" {
         .params = .{ .cacheDisabled = true },
     });
     try ctx.expectSentResult(null, .{ .id = 1 });
-    try testing.expect(client.cache == null);
+    try testing.expectEqual(null, client.cache.active());
 }
 
 test "cdp.Network: configured CDP ignores setCacheDisabled" {
@@ -1008,7 +1037,7 @@ test "cdp.Network: configured CDP ignores setCacheDisabled" {
     var cache: Cache = undefined;
     const client = &ctx.cdp().browser.http_client;
     client.cache = &cache;
-    defer client.cache = null;
+    defer client.cache = &testing.base.test_app.network.cache;
 
     try ctx.processMessage(.{
         .id = 1,
@@ -1167,6 +1196,123 @@ test "cdp.Network: POST body exposed as postData" {
         .params = .{ .requestId = "REQ-4294967295" },
     });
     try ctx.expectSentError(-31998, "RequestNotFound", .{ .id = 3 });
+}
+
+test "cdp.Network: redirect hop precedes Fetch pause and carries redirectResponse" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-REDIRECT", .session_id = "SID-REDIRECT" });
+    const page = try bc.session.createPage();
+    const client = &bc.cdp.browser.http_client;
+
+    try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Fetch.enable" });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+
+    const CallbackContext = struct {
+        body: [64]u8 = undefined,
+        body_len: usize = 0,
+        done: bool = false,
+        err: ?anyerror = null,
+
+        fn dataCallback(transfer: *Transfer, data: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(transfer.req.ctx));
+            @memcpy(self.body[self.body_len..][0..data.len], data);
+            self.body_len += data.len;
+        }
+
+        fn doneCallback(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.done = true;
+        }
+
+        fn errorCallback(raw: *anyopaque, err: anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.err = err;
+        }
+    };
+    var callback_context: CallbackContext = .{};
+
+    const start_url = "http://127.0.0.1:9582/redirect-cross-origin-x-hop";
+    const target_url = "http://localhost:9582/echo-x-hop";
+    var request_id: [14]u8 = undefined;
+    _ = std.fmt.bufPrint(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+
+    try client.request(.{
+        .frame_id = page.frame_id,
+        .loader_id = 7,
+        .method = .GET,
+        .url = start_url,
+        .cookie_jar = null,
+        .cookie_origin = start_url,
+        .resource_type = .script,
+        .notification = bc.session.notification,
+        .ctx = &callback_context,
+        .data_callback = CallbackContext.dataCallback,
+        .done_callback = CallbackContext.doneCallback,
+        .error_callback = CallbackContext.errorCallback,
+        .shutdown_callback = HttpClient.noopShutdown,
+    }, null);
+
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = &request_id,
+        .loaderId = &id.toLoaderId(7),
+        .type = "Script",
+        .request = .{ .url = start_url },
+    }, .{ .index = 2, .session_id = "SID-REDIRECT" });
+    try ctx.expectSentEvent("Fetch.requestPaused", .{
+        .requestId = "INT-0000000001",
+        .networkId = &request_id,
+        .request = .{ .url = start_url },
+    }, .{ .index = 3, .session_id = "SID-REDIRECT" });
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Fetch.continueRequest",
+        .params = .{
+            .requestId = "INT-0000000001",
+            .headers = &[_]HttpClient.Header{.{ .name = "x-hop", .value = "127.0.0.1:9582" }},
+        },
+    });
+    try ctx.expectSentResult(null, .{ .id = 3, .index = 4 });
+
+    // Playwright requires requestWillBeSent first so it can create the new
+    // redirected Request before pairing the fresh Fetch pause with it.
+    try ctx.expectSentEvent("Network.requestWillBeSent", .{
+        .requestId = &request_id,
+        .loaderId = &id.toLoaderId(7),
+        .type = "Script",
+        .request = .{ .url = target_url },
+        .redirectResponse = .{
+            .url = start_url,
+            .status = 302,
+        },
+    }, .{ .index = 5, .session_id = "SID-REDIRECT" });
+    try ctx.expectSentEvent("Fetch.requestPaused", .{
+        .requestId = "INT-0000000002",
+        .networkId = &request_id,
+        .request = .{ .url = target_url },
+    }, .{ .index = 6, .session_id = "SID-REDIRECT" });
+
+    try ctx.processMessage(.{
+        .id = 4,
+        .method = "Fetch.continueRequest",
+        .params = .{
+            .requestId = "INT-0000000002",
+            .headers = &[_]HttpClient.Header{.{ .name = "x-hop", .value = "localhost:9582" }},
+        },
+    });
+    try ctx.expectSentResult(null, .{ .id = 4, .index = 7 });
+
+    for (0..50) |_| {
+        if (callback_context.done or callback_context.err != null) break;
+        _ = try client.tick(20);
+    }
+    try testing.expectEqual(null, callback_context.err);
+    try testing.expect(callback_context.done);
+    try testing.expectEqualSlices(u8, "localhost:9582", callback_context.body[0..callback_context.body_len]);
 }
 
 test "cdp.Network: worker requests emit network events" {
