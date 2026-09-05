@@ -290,6 +290,8 @@ pub fn getLanguages(_: *const Navigator) [3][]const u8 {
 
 > **重要**：返回类型从 `[2][]const u8` 变为 `[3][]const u8`，需要同步修改。
 
+> **上游同步联动**：上游新增的 `src/browser/webapi/WorkerNavigator.zig`（WorkerNavigator，来自 #3288）里 `getLanguages` 直接 `return Navigator.getLanguages(...)` 委托，返回类型也写死为 `[2][]const u8`。我们改了 `Navigator.getLanguages` 后，此文件第 49 行必须同步改为 `[3][]const u8`，否则 `snapshot_creator` 编译报 `expected type '[2][]const u8', found '[3][]const u8'`。这是本分支改动引起的必要联动（无法绕开该官方文件，即便改我们自己的签名为 slice 也仍要同步它）。
+
 ### 3.8 修改 navigator.plugins.length 返回非零值
 
 **文件**: `src/browser/webapi/PluginArray.zig` 第 64 行
@@ -529,6 +531,7 @@ test_config = try Config.init(test_allocator, "test", .{
 | 8 | `src/help.zon` | 修改 | 更新帮助文本（user-agent + user-agent-suffix） |
 | 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新 brands 和 highEntropy 期望值为 Chrome 值 |
 | 10 | `src/testing.zig` | 修改 | 删除上游 `user_agent_suffix = "internal-tester"`，使用默认 Chrome UA |
+| 11 | `src/browser/webapi/WorkerNavigator.zig` | 上游同步联动 | 上游新增文件，`getLanguages` 委托 `Navigator.getLanguages`，返回类型 `[2]`→`[3]` 对齐本分支（否则 snapshot_creator 编译失败） |
 
 ---
 
@@ -606,9 +609,9 @@ rustc --version
 
 ```bash
 make download-v8
-# 或手动下载 v0.5.2 版本
-curl -fL -o .lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a \
-  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a
+# 或手动下载 v0.5.4 版本
+curl -fL -o .lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a \
+  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a
 ```
 
 #### 8.1.5 环境变量
@@ -672,7 +675,7 @@ echo "==> [5/6] 编译 release 版本..."
 export LIGHTPANDA_DISABLE_TELEMETRY=1
 # make build  # 默认针对编译机 CPU 优化（AMD EPYC 9T25），可能不兼容 Intel
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译，确保指令集兼容
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
 
 echo "==> [6/6] 安装到 ~/.local/bin..."
 mkdir -p "$HOME/.local/bin"
@@ -699,7 +702,7 @@ make download-v8
 # 编译 release 版本（含 V8 snapshot）
 # make build  # 默认针对编译机 CPU 优化，可能不兼容其他 CPU
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
 
 # 安装到 ~/.local/bin（确保 ~/.local/bin 在 PATH 中）
 mkdir -p ~/.local/bin
@@ -720,7 +723,7 @@ lightpanda serve --host 0.0.0.0 --port 9222
 ```bash
 # make build    # 默认针对编译机 CPU 优化
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
 make clean    # 完全清理（保留 V8 缓存）
 ```
 
@@ -734,7 +737,7 @@ make clean    # 完全清理（保留 V8 缓存）
 - 可执行文件：`./zig-out/bin/lightpanda`（编译输出）
 - 安装位置：`~/.local/bin/lightpanda`（安装后）
 - V8 snapshot：`src/snapshot.bin`
-- V8 缓存：`.lp-cache/prebuilt-v8/v0.5.2/`
+- V8 缓存：`.lp-cache/prebuilt-v8/v0.5.4/`
 
 ### 8.5 常见问题
 
@@ -746,10 +749,36 @@ cargo --version
 zig version  # 必须 0.16.0
 
 # V8 下载失败 → 手动下载后放入缓存
-mkdir -p .lp-cache/prebuilt-v8/v0.5.2/
-curl -fL -o .lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a \
-  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a
+mkdir -p .lp-cache/prebuilt-v8/v0.5.4/
+curl -fL -o .lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a \
+  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a
 ```
+
+### 8.6 大陆网络下离线抓取 build.zig.zon 依赖（同步上游后必做）
+
+上游每次同步都可能 bump `build.zig.zon` 里的依赖版本；本机直连 GitHub 的 HTTPS 抓取会超时（`HttpConnectionClosing` / `Timeout`），而 **SSH 到 GitHub 可用**。注意：即使传了 `-Dprebuilt_v8_path`，`.v8` 依赖 tarball（Zig/C 绑定源码）仍必须解析，预编译 `.a` 无法替代它。
+
+按依赖类型分别处理（原理：镜像/SSH 取回的字节与原 GitHub 一致 → `zig fetch` 算出的 hash 与 `build.zig.zon` 精确匹配 → 落全局缓存 `~/.cache/zig/p/`，`build.zig.zon` 一行都不用改）：
+
+```bash
+# 1) tarball 类依赖（如 v8、curl）——走 GitHub HTTP 镜像 ghfast.top
+zig fetch "https://ghfast.top/https://github.com/lightpanda-io/zig-v8-fork/archive/<commit>.tar.gz"
+zig fetch "https://ghfast.top/https://github.com/curl/curl/releases/download/<tag>/<file>.tar.gz"
+
+# 2) git+https 类依赖（如 zenai、isocline）——用 GIT_CONFIG 临时把 https 改写成 SSH，不动全局 git 配置
+GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0="url.git@github.com:.insteadOf" \
+  GIT_CONFIG_VALUE_0="https://github.com/" \
+  zig fetch "git+https://github.com/lightpanda-io/zenai.git#<commit>"
+
+# 3) 预编译 V8 .a（裸二进制，非 zig 包）——走镜像，见 8.1.4 / 8.5
+
+# 全部抓完后验证：应 EXIT=0 且无输出，代表完全离线可解析
+zig build --fetch
+```
+
+> 校验方法：`zig fetch` 输出的 hash 必须与 `build.zig.zon` 中对应依赖的 `.hash` 完全一致，否则说明字节不同（镜像失效或被篡改）。
+> 备选镜像：`https://gh-proxy.com/`（与 `ghfast.top` 等效，可互换）。
 
 ---
 
@@ -837,7 +866,7 @@ git merge main
 
 # 5. 编译验证（确认合并无误）
 # make build && make test  # 默认针对编译机 CPU
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
 
 cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda
 ~/.local/bin/lightpanda version
@@ -873,7 +902,7 @@ git push origin chrome
 # 1. 编译
 # make build  # 默认针对编译机 CPU 优化
 # 针对 Intel Skylake-SP (Xeon Platinum) 编译
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.2/libc_v8_14.9.207.35_linux_x86_64.a"
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
 
 # 2. 运行测试
 make test

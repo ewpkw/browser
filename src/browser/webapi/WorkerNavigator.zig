@@ -46,7 +46,7 @@ pub fn getUserAgent(_: *const WorkerNavigator, exec: *const Execution) []const u
     return Navigator.getUserAgent(&Navigator.init, exec);
 }
 
-pub fn getLanguages(_: *const WorkerNavigator) [2][]const u8 {
+pub fn getLanguages(_: *const WorkerNavigator) [3][]const u8 {
     return Navigator.getLanguages(&Navigator.init);
 }
 
