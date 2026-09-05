@@ -59,7 +59,7 @@ pub fn validateUserAgent(ua: []const u8) !void {
 
 ### 1.3 修改 CDP Emulation.setUserAgentOverride 中的 Mozilla 拒绝逻辑
 
-**文件**: `src/cdp/domains/emulation.zig` 第 157-164 行
+**文件**: `src/server/cdp/domains/emulation.zig` 第 157-164 行
 
 ```zig
 // 修改前
@@ -81,14 +81,14 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 
 ### 1.4 将测试用例从「拒绝 Mozilla」反转为「接受 Mozilla」
 
-**文件**: `src/cdp/domains/network.zig`
+**文件**: `src/server/cdp/domains/network.zig`
 
 将上游的 Mozilla 拒绝测试反转为正向验证（本分支的核心意义就是允许 Mozilla UA）：
 - `test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent"` → 改为 `accepts a Mozilla User-Agent`，期望 `extra_headers.items.len == 1`
 - `test "...rejects a Mozilla User-Agent smuggled via a colon in the key"` → 改为 `accepts a Mozilla User-Agent with colon in key`，期望 `extra_headers.items.len == 1`
 - `test "...rejects a header that smuggles CRLF"` → **保留测试但替换载荷**，将 `Mozilla/5.0` 改为 `CustomBot/1.0`（该测试核心是 CRLF 注入防护，与 Mozilla 无关）
 
-**文件**: `src/cdp/domains/emulation.zig`
+**文件**: `src/server/cdp/domains/emulation.zig`
 
 将上游的 2 个 Mozilla 拒绝测试合并为 1 个正向测试：
 - 删除: `test "...ignores mozilla"` 和 `test "...ignores mozilla case insensitive"`
@@ -488,14 +488,29 @@ testing.expectEqual('151.0.7813.2', v.uaFullVersion);
 
 **文件**: `src/testing.zig`
 
-上游重构后删除了 `user_agent_suffix` 字段，测试配置不再设置 UA 后缀。测试直接使用默认的 Chrome UA。
+上游测试配置中使用了 `user_agent_suffix = "internal-tester"`（会在默认 UA 后追加后缀），本分支必须移除此字段以确保测试使用纯 Chrome UA：
 
 ```zig
-// 上游旧版
-.user_agent_suffix = "internal-tester",
+// 上游版本
+test_config = try Config.init(test_allocator, "test", .{
+    .serve = .{
+        .insecure_disable_tls_host_verification = true,
+        .user_agent_suffix = "internal-tester",   // ← 必须删除
+        .ws_max_concurrent = 50,
+        .load_resources = .{ .worker = true, .iframe = true },
+        .watchdog_ms = 0,
+    },
+});
 
-// 上游新版（字段已删除）
-// Config.init 不再接受 user_agent_suffix，直接使用默认 Chrome UA
+// 本分支版本（移除 user_agent_suffix）
+test_config = try Config.init(test_allocator, "test", .{
+    .serve = .{
+        .insecure_disable_tls_host_verification = true,
+        .ws_max_concurrent = 50,
+        .load_resources = .{ .worker = true, .iframe = true },
+        .watchdog_ms = 0,
+    },
+});
 ```
 
 ---
@@ -509,11 +524,11 @@ testing.expectEqual('151.0.7813.2', v.uaFullVersion);
 | 3 | `src/browser/webapi/Navigator.zig` | 修改 | appVersion、vendor、hardwareConcurrency、deviceMemory、maxTouchPoints、doNotTrack、language/languages、platform |
 | 4 | `src/browser/webapi/NavigatorUAData.zig` | 修改 | platform="Windows"、高熵值匹配 Chrome（platformVersion、uaFullVersion） |
 | 5 | `src/browser/webapi/PluginArray.zig` | 修改 | length=5 (非零) |
-| 6 | `src/cdp/domains/emulation.zig` | 修改+反转测试 | 删除 Mozilla 拒绝逻辑；反转测试为"accepts Mozilla" |
-| 7 | `src/cdp/domains/network.zig` | 反转测试+改载荷 | 反转 Mozilla UA 拒绝测试为接受；CRLF 测试替换载荷 |
+| 6 | `src/server/cdp/domains/emulation.zig` | 修改+反转测试 | 删除 Mozilla 拒绝逻辑；反转测试为"accepts Mozilla" |
+| 7 | `src/server/cdp/domains/network.zig` | 反转测试+改载荷 | 反转 Mozilla UA 拒绝测试为接受；CRLF 测试替换载荷 |
 | 8 | `src/help.zon` | 修改 | 更新帮助文本（user-agent + user-agent-suffix） |
 | 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新 brands 和 highEntropy 期望值为 Chrome 值 |
-| 10 | `src/testing.zig` | 修改 | 上游删除了 user_agent_suffix 字段，使用默认 Chrome UA |
+| 10 | `src/testing.zig` | 修改 | 删除上游 `user_agent_suffix = "internal-tester"`，使用默认 Chrome UA |
 
 ---
 
@@ -817,8 +832,8 @@ git merge main
 #    - src/network/http.zig  (Headers.init)
 #    - src/browser/webapi/Navigator.zig
 #    - src/browser/webapi/NavigatorUAData.zig
-#    - src/cdp/domains/emulation.zig
-#    - src/cdp/domains/network.zig
+#    - src/server/cdp/domains/emulation.zig
+#    - src/server/cdp/domains/network.zig
 
 # 5. 编译验证（确认合并无误）
 # make build && make test  # 默认针对编译机 CPU
