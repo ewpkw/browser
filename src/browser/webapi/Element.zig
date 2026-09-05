@@ -79,6 +79,7 @@ pub const PseudoElement = enum {
 
 pub const ClassListLookup = std.AutoHashMapUnmanaged(*Element, *collections.DOMTokenList);
 pub const RelListLookup = std.AutoHashMapUnmanaged(*Element, *collections.DOMTokenList);
+pub const PartListLookup = std.AutoHashMapUnmanaged(*Element, *collections.DOMTokenList);
 pub const ShadowRootLookup = std.AutoHashMapUnmanaged(*Element, *ShadowRoot);
 pub const NamespaceUriLookup = std.AutoHashMapUnmanaged(*Element, []const u8);
 
@@ -735,7 +736,7 @@ pub fn hasDisabledConcept(self: *const Element) bool {
     };
 }
 
-pub fn isDisabled(self: *Element) bool {
+pub fn isDisabled(self: *const Element) bool {
     if (!self.hasDisabledConcept()) {
         return false;
     }
@@ -749,7 +750,7 @@ pub fn isDisabled(self: *Element) bool {
     // <optgroup disabled>. It does NOT inherit from <select disabled> or
     // an ancestor <fieldset disabled>.
     if (self.getTag() == .option) {
-        if (self.asNode()._parent) |parent_node| {
+        if (self.asConstNode()._parent) |parent_node| {
             if (parent_node.is(Element)) |parent_el| {
                 if (parent_el.getTag() == .optgroup and
                     parent_el.getAttributeSafe(comptime .wrap("disabled")) != null)
@@ -761,7 +762,7 @@ pub fn isDisabled(self: *Element) bool {
         return false;
     }
 
-    const element_node = self.asNode();
+    const element_node = self.asConstNode();
     var current: ?*Node = element_node._parent;
     while (current) |node| {
         current = node._parent;
@@ -1026,6 +1027,17 @@ pub fn setClassList(self: *Element, value: String, frame: *Frame) !void {
     try class_list.setValue(value, frame);
 }
 
+pub fn getPartList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
+    const gop = try frame._element_part_lists.getOrPut(frame.arena, self);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
+            ._element = self,
+            ._attribute_name = comptime .wrap("part"),
+        });
+    }
+    return gop.value_ptr.*;
+}
+
 pub fn getRelList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
     const gop = try frame._element_rel_lists.getOrPut(frame.arena, self);
     if (!gop.found_existing) {
@@ -1128,7 +1140,7 @@ pub fn focus(self: *Element, frame: *Frame) !void {
 
     // Per HTML spec §6.4.4, an element must be "being rendered" (not
     // display:none on self or any ancestor) to be focusable.
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return;
     }
 
@@ -1329,8 +1341,8 @@ pub fn hasPointerEventsNone(self: *Element, cache: ?*PointerEventsCache, frame: 
     return self.ownerFrame(frame)._style_manager.hasPointerEventsNone(self, cache);
 }
 
-pub fn checkVisibilityCached(self: *Element, cache: ?*VisibilityCache, frame: *Frame) bool {
-    return !self.ownerFrame(frame)._style_manager.isHidden(self, cache, .{});
+pub fn checkVisibilityCached(self: *Element, cache: ?*VisibilityCache, frame: *Frame, comptime access: StyleManager.InlineAccess) bool {
+    return !self.ownerFrame(frame)._style_manager.isHidden(self, cache, .{}, access);
 }
 
 // The element's own display:none only, no ancestor walk. For a child or
@@ -1338,7 +1350,7 @@ pub fn checkVisibilityCached(self: *Element, cache: ?*VisibilityCache, frame: *F
 // answer: they share the visible ancestor chain — and the owner frame, which
 // the caller resolves once rather than per element.
 fn isVisibleSelf(self: *Element, style_manager: *StyleManager) bool {
-    return !style_manager.hasDisplayNone(self);
+    return !style_manager.hasDisplayNone(self, .materialize);
 }
 
 const CheckVisibilityOpts = struct {
@@ -1352,7 +1364,7 @@ pub fn checkVisibility(self: *Element, opts_: ?CheckVisibilityOpts, frame: *Fram
     return !self.ownerFrame(frame)._style_manager.isHidden(self, null, .{
         .check_opacity = opts.checkOpacity or opts.opacityProperty,
         .check_visibility = opts.visibilityProperty or opts.checkVisibilityCSS,
-    });
+    }, .materialize);
 }
 
 pub const Axis = enum {
@@ -1398,17 +1410,35 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
 // width / height treshold is reached. If the size isn't explicit, we fallback
 // to the content size.
 pub fn getClientWidth(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame)) {
-        return 0.0;
-    }
-    return self.boxAxis(frame, .width);
+    return self.clientAxis(frame, .width);
 }
 
 pub fn getClientHeight(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame)) {
+    return self.clientAxis(frame, .height);
+}
+
+fn clientAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return 0.0;
     }
-    return self.boxAxis(frame, .height);
+    return self.viewportAxis(frame, axis) orelse self.boxAxis(frame, axis);
+}
+
+fn viewportAxis(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
+    const tag = self.getTag();
+    if (tag != .html and tag != .body) {
+        return null;
+    }
+    const doc = self.asNode().ownerDocument(frame) orelse frame.document;
+    if ((tag == .body) != doc.isQuirksMode()) {
+        return null;
+    }
+    // In quicks mode, the root element (the body) reports the viewport for
+    // clientWidth and clientHeight rather than its own MASSIVE box. This
+    // fixes jstracker's uiContourMap which attempts to tile the clientHeight
+    // of the body. (https://github.com/lightpanda-io/browser/issues/3251)
+    const viewport = frame._page.getViewport();
+    return @floatFromInt(if (axis == .width) viewport.width else viewport.height);
 }
 
 // Caller must have made sure self is visible.
@@ -1436,7 +1466,7 @@ pub fn getBoundingClientRect(self: *Element, frame: *Frame) !*DOMRect {
 // getBoundingClientRect, getClientRects, and IntersectionObserver. A DOMRect is
 // only materialized at the JS boundary.
 pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return .{};
     }
     return self.boundingClientRectValuesForVisible(frame);
@@ -1453,7 +1483,7 @@ pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect
 }
 
 pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return &.{};
     }
     const rects = try frame.local_arena.alloc(*DOMRect, 1);
@@ -1505,7 +1535,7 @@ pub fn setScrollLeft(self: *Element, value: i32, frame: *Frame) !void {
 }
 
 pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return 0.0;
     }
 
@@ -1522,7 +1552,7 @@ pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
 }
 
 pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return 0.0;
     }
 
@@ -1581,30 +1611,38 @@ fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
     return total;
 }
 
+// Unlike clientHeight, the root's offsetHeight is its box (the document
+// extent), so it stays on the synthetic root default.
 pub fn getOffsetHeight(self: *Element, frame: *Frame) f64 {
-    return self.getClientHeight(frame);
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+        return 0.0;
+    }
+    return self.boxAxis(frame, .height);
 }
 
 pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
-    return self.getClientWidth(frame);
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+        return 0.0;
+    }
+    return self.boxAxis(frame, .width);
 }
 
 pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return 0.0;
     }
     return calculateDocumentPosition(self.asNode());
 }
 
 pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame)) {
+    if (!self.checkVisibilityCached(null, frame, .materialize)) {
         return 0.0;
     }
     return self.horizontalPosition(frame);
 }
 
 pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
-    if (!self.asNode().isConnected() or !self.checkVisibilityCached(null, frame)) {
+    if (!self.asNode().isConnected() or !self.checkVisibilityCached(null, frame, .materialize)) {
         return null;
     }
 
@@ -1839,7 +1877,7 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) 
     // Positions come from the faux-layout document position (top = preorder
     // depth-scaled y), the same source getBoundingClientRect uses.
     const y = calculateDocumentPosition(self.asNode());
-    frame.window.scrollTo(.{ .x = 0 }, @intFromFloat(@max(0, y)), frame) catch {};
+    frame.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), frame) catch {};
 }
 
 const ScrollToOpts = union(enum) {
@@ -2405,6 +2443,7 @@ pub const JsApi = struct {
     pub const dir = bridge.accessor(Element.getDir, Element.setDir, .{ .ce_reactions = true });
     pub const className = bridge.accessor(Element.getClassName, Element.setClassName, .{ .ce_reactions = true });
     pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{ .ce_reactions = true });
+    pub const part = bridge.accessor(Element.getPartList, null, .{});
     pub const dataset = bridge.accessor(Element.getDataset, null, .{});
     pub const style = bridge.accessor(Element.getOrCreateStyle, Element.setStyle, .{});
     pub const attributes = bridge.accessor(Element.getAttributeNamedNodeMap, null, .{});

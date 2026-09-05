@@ -32,7 +32,6 @@ const ScriptRuntime = lp.Runtime;
 const Candidate = zenai.provider.Candidate;
 
 const App = @import("../App.zig");
-const CDPNode = @import("../cdp/Node.zig");
 const Conversation = @import("Conversation.zig");
 const Terminal = @import("Terminal.zig");
 const SlashCommand = @import("SlashCommand.zig");
@@ -149,10 +148,7 @@ model_base_url: ?[:0]const u8,
 /// `model_completion_arena`; invalidated on `/provider` switch.
 model_completions: ?ModelCompletions,
 model_completion_arena: std.heap.ArenaAllocator,
-notification: *lp.Notification,
-browser: lp.Browser,
-session: *lp.Session,
-node_registry: CDPNode.Registry,
+ts: lp.ToolSession,
 terminal: Terminal,
 save_buffer: Recorder,
 save_path: ?[]u8,
@@ -184,7 +180,7 @@ stream_enabled: bool,
 /// by `endStreamedText`, which also emits the closing newline.
 stream_active: bool = false,
 /// True when any assistant text streamed during the current turn, so `runTurn`
-/// skips the buffered `printAssistant` that would double-print it.
+/// skips the buffered `printMarkdown` that would double-print it.
 streamed_text: bool = false,
 available_providers: []const []const u8,
 /// Cached reachability of each `local_providers` entry, so the per-keystroke
@@ -308,9 +304,6 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
         std.debug.print("\n", .{});
     }
 
-    const notification: *lp.Notification = try .init(allocator);
-    errdefer notification.deinit();
-
     const self = try allocator.create(Agent);
     errdefer allocator.destroy(self);
 
@@ -328,10 +321,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
         .model_base_url = opts.base_url,
         .model_completions = null,
         .model_completion_arena = .init(allocator),
-        .notification = notification,
-        .browser = undefined,
-        .session = undefined,
-        .node_registry = .init(allocator),
+        .ts = undefined,
         .terminal = .init(allocator, history_paths, verbosity, will_repl),
         .save_buffer = .init(allocator),
         .save_path = null,
@@ -345,16 +335,14 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
         .one_shot_attachments = if (opts.attach.items.len == 0) null else opts.attach.items,
         .available_providers = available_providers,
     };
-    errdefer self.node_registry.deinit();
     errdefer self.terminal.deinit();
     errdefer self.conversation.deinit();
     self.terminal.installLogSink();
     errdefer self.terminal.uninstallLogSink();
 
-    try self.browser.init(app, .{}, null);
-    errdefer self.browser.deinit();
-
-    try self.startSession();
+    try self.ts.init(app);
+    errdefer self.ts.deinit();
+    self.installCancelHook();
 
     self.ai_client = if (self.credential) |*c| try zenai.provider.Client.init(lp.io, allocator, c.provider, c.keySlice(), .{ .base_url = opts.base_url, .retry_policy = .long_running, .bill_to = hfBillTo(c.provider), .environ = lp.environ(), .account_id = c.accountId() }) else null;
     errdefer if (self.ai_client) |c| c.deinit(allocator);
@@ -381,9 +369,7 @@ pub fn deinit(self: *Agent) void {
     self.terminal.deinit();
     self.conversation.deinit();
     self.model_completion_arena.deinit();
-    self.node_registry.deinit();
-    self.browser.deinit();
-    self.notification.deinit();
+    self.ts.deinit();
     if (self.ai_client) |ai_client| ai_client.deinit(self.allocator);
     if (self.credential) |*c| c.deinit(self.allocator);
     self.allocator.free(self.model);
@@ -395,15 +381,13 @@ pub fn deinit(self: *Agent) void {
 /// isocline idle hook; returns the delay in ms before the next invocation.
 fn idlePump(arg: ?*anyopaque) callconv(.c) c_long {
     const self: *Agent = @ptrCast(@alignCast(arg.?));
-    return self.session.idleSlice();
+    return self.ts.session.idleSlice();
 }
 
-/// Create a fresh browser session and wire its cancel hook back to this agent
-/// so Ctrl-C aborts in-flight page work. Startup and `/reset`.
-fn startSession(self: *Agent) !void {
-    self.session = try self.browser.newSession(self.notification);
-    self.session.cancel_hook = .{ .context = @ptrCast(self), .check = checkCancel };
-    try self.session.enableConsoleCapture();
+/// Wire the session's cancel hook back to this agent so Ctrl-C aborts
+/// in-flight page work. Startup and `/reset`.
+fn installCancelHook(self: *Agent) void {
+    self.ts.session.cancel_hook = .{ .context = @ptrCast(self), .check = checkCancel };
 }
 
 // Compile-time constant; projected once per process to avoid rebuilding per call.
@@ -435,7 +419,7 @@ pub fn requestCancel(self: *Agent) void {
             runtime.terminate();
         }
     }
-    self.browser.env.terminate();
+    self.ts.browser.env.terminate();
 }
 
 /// Lives in main's stack so it can be registered with the sighandler before the
@@ -477,7 +461,7 @@ fn drainCancellation(self: *Agent, baseline: usize) error{UserCancelled} {
 fn resetAfterCancel(self: *Agent, baseline: usize) void {
     self.endStreamedText();
     self.conversation.rollback(baseline);
-    self.browser.env.cancelTerminate();
+    self.ts.browser.env.cancelTerminate();
     self.cancel_requested.store(false, .release);
     self.http_interrupt.reset();
 }
@@ -587,7 +571,7 @@ fn runTurn(self: *Agent, input: TurnInput) bool {
             // turn-wide flag: the stream accumulator reconstructs `t` from the
             // same deltas it emitted, and the synthesis fallback also streams, so
             // `streamed_text` implies `t` was already shown in full.
-            if (!self.streamed_text) self.terminal.printAssistant(t);
+            if (!self.streamed_text) self.terminal.printMarkdown(t);
         } else if (self.last_turn_refused)
             self.terminal.printInfo("(model declined to respond — safety refusal)", .{})
         else
@@ -612,7 +596,7 @@ fn runRepl(self: *Agent) void {
         // Slash commands and idle Ctrl-C set the cancel flag without clearing
         // V8's terminate state; drain both before the next turn.
         if (self.cancel_requested.swap(false, .acq_rel)) {
-            self.browser.env.cancelTerminate();
+            self.ts.browser.env.cancelTerminate();
         }
 
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
@@ -630,7 +614,7 @@ fn runRepl(self: *Agent) void {
             // `line` keeps the `$LP_*` placeholder so the secret never reaches
             // the recorder; only the evaluated copy is expanded.
             const script = browser_tools.substituteEnvVars(aa, line) catch line;
-            const result = browser_tools.evalScript(aa, self.session, &self.node_registry, script) catch |err| {
+            const result = browser_tools.evalScript(aa, self.ts.session, &self.ts.registry, script) catch |err| {
                 self.terminal.printError("{s}", .{switch (err) {
                     error.OutOfMemory => "out of memory",
                     error.FrameNotLoaded => "no page loaded — run /goto <url> first (Esc exits JS mode)",
@@ -640,12 +624,12 @@ fn runRepl(self: *Agent) void {
             };
             // Surface console output: slash commands (and thus /consoleLogs)
             // are unreachable in JS mode, so a console must echo logs itself.
-            const logs = std.mem.trimEnd(u8, self.session.drainConsoleMessages(), "\n");
-            if (logs.len > 0) self.printData(logs);
+            const logs = std.mem.trimEnd(u8, self.ts.session.drainConsoleMessages(), "\n");
+            if (logs.len > 0) self.printData(.consoleLogs, logs);
             if (result.is_error) {
                 self.terminal.printError("{s}", .{result.text});
             } else {
-                self.printData(result.text);
+                self.printData(.evaluate, result.text);
                 self.recordSaveRaw(line);
             }
             continue :repl;
@@ -769,9 +753,11 @@ fn handleStream(self: *Agent, rest: []const u8) void {
 fn handleSearchEngine(self: *Agent, rest: []const u8) void {
     self.setEnumOption("searchEngine", &browser_tools.search_engine, rest);
     const selected = std.meta.stringToEnum(browser_tools.SearchEngine, rest) orelse return;
-    const env_var = browser_tools.searchEnvVar(selected) orelse return;
-    if (std.c.getenv(env_var) == null) {
-        self.terminal.printWarning("{s} is not set; the search tool will fail until you export it", .{env_var});
+    const key = browser_tools.searchKeyStatus(selected) orelse return;
+    switch (key.state) {
+        .set => {},
+        .keyless => self.terminal.printInfo("{s} is not set; using the keyless endpoint (rate-limited per client IP)", .{key.env_var}),
+        .missing => self.terminal.printWarning("{s} is not set; the search tool will fail until you export it", .{key.env_var}),
     }
 }
 
@@ -805,7 +791,7 @@ fn clearConversation(self: *Agent) void {
     if (self.save_path) |p| self.allocator.free(p);
     self.save_path = null;
     self.total_usage = .{};
-    self.node_registry.reset();
+    self.ts.registry.reset();
 }
 
 /// Forget the conversation while leaving the browser session live — loaded page
@@ -818,10 +804,11 @@ fn handleClear(self: *Agent) void {
 /// Full clean slate: everything `/clear` drops, plus a fresh browser session,
 /// so the loaded page, cookies, storage, and history are gone too.
 fn handleReset(self: *Agent) void {
-    self.startSession() catch |err| {
+    self.ts.restartSession() catch |err| {
         self.terminal.printError("reset failed: {s}", .{@errorName(err)});
         return;
     };
+    self.installCancelHook();
     self.clearConversation();
     self.terminal.printInfo("Reset conversation and browser session. Page, cookies, and storage cleared.", .{});
 }
@@ -1454,7 +1441,7 @@ fn printSlashHelp(self: *Agent, arena: std.mem.Allocator, target: []const u8) vo
                 .{},
             ),
             .searchEngine => self.terminal.printInfo(
-                "/searchEngine " ++ Config.tagHint(browser_tools.SearchEngine) ++ " — set the web search engine behind the search tool (currently: {s}); saved to {s}. 'auto' tries Brave, Tavily, then Exa (when their API keys are set) and falls back to the DuckDuckGo scrape; an explicit engine is used alone. Bare /searchEngine prints the engine.",
+                "/searchEngine " ++ Config.tagHint(browser_tools.SearchEngine) ++ " — set the web search engine behind the search tool (currently: {s}); saved to {s}. 'auto' " ++ browser_tools.search_cascade_prose ++ "; an explicit engine is used alone. Bare /searchEngine prints the engine.",
                 .{ @tagName(browser_tools.search_engine), settings.remembered_path },
             ),
         }
@@ -1486,7 +1473,8 @@ fn runCommand(self: *Agent, arena: std.mem.Allocator, cmd: Command) browser_tool
         .tool_call => |t| t,
         else => return .{ .text = "internal: command has no tool mapping", .is_error = true },
     };
-    return browser_tools.call(arena, self.session, &self.node_registry, tc.name(), tc.args) catch |err| .{
+    // The terminal can't show an image, but the conversation can.
+    return browser_tools.call(arena, self.ts.session, &self.ts.registry, tc.name(), tc.args, .{ .inline_image = self.ai_client != null }) catch |err| .{
         .text = switch (err) {
             error.OutOfMemory => "out of memory",
             error.FrameNotLoaded => "no page loaded — run /goto <url> first",
@@ -1507,17 +1495,19 @@ fn printCommandResult(self: *Agent, cmd: Command, result: browser_tools.ToolResu
         else => return,
     };
     if (cmd.producesData() and !result.is_error) {
-        self.printData(result.text);
+        self.printData(tc.tool, result.text);
         return;
     }
     self.terminal.printToolOutcome(tc.name(), result.text, result.is_error);
 }
 
-/// Re-indent JSON for the terminal; MCP keeps renderJson's compact form.
-fn printData(self: *Agent, text: []const u8) void {
+/// Only `markdown` is rendered as markdown; the rest is JSON (re-indented
+/// here, MCP keeps renderJson's compact form) or verbatim text.
+fn printData(self: *Agent, tool: browser_tools.Tool, text: []const u8) void {
+    if (tool == .markdown) return self.terminal.printMarkdown(text);
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
-    self.terminal.printAssistant(Terminal.reindentJson(arena.allocator(), text) orelse text);
+    self.terminal.printPlain(Terminal.reindentJson(arena.allocator(), text) orelse text);
 }
 
 /// Tracks whether a `/load`-run script emitted any `console.*` output, deciding
@@ -1546,7 +1536,7 @@ fn runScript(self: *Agent, path: []const u8) bool {
         return false;
     };
 
-    const runtime = ScriptRuntime.init(self.allocator, self.browser.app, self.session, &self.node_registry) catch |err| {
+    const runtime = ScriptRuntime.init(self.allocator, self.ts.browser.app, self.ts.session, &self.ts.registry) catch |err| {
         self.terminal.printError("Failed to initialize script runtime: {s}", .{@errorName(err)});
         return false;
     };
@@ -1559,7 +1549,7 @@ fn runScript(self: *Agent, path: []const u8) bool {
         self.active_script_runtime = null;
         self.script_runtime_mutex.unlock(lp.io);
         runtime.cancelTerminate();
-        self.browser.env.cancelTerminate();
+        self.ts.browser.env.cancelTerminate();
         self.cancel_requested.store(false, .release);
     }
 
@@ -1618,6 +1608,7 @@ fn recordSlashToolCall(
         .id = try ma.dupe(u8, tool_calls[0].id),
         .name = try ma.dupe(u8, tool_calls[0].name),
         .content = content,
+        .parts = if (result.image) |image| try imageParts(ma, content, &image) else null,
         .is_error = result.is_error,
     };
 
@@ -1920,14 +1911,30 @@ fn handleToolCall(ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []co
     self.terminal.spinner.setTool(tool_name, args_str);
     defer self.terminal.spinner.setThinking();
 
-    const outcome: zenai.provider.Client.ToolHandler.Result = if (browser_tools.call(allocator, self.session, &self.node_registry, tool_name, arguments)) |result|
-        .{ .content = capToolOutput(allocator, tool_name, result.text), .is_error = result.is_error }
-    else |err|
-        .{ .content = std.fmt.allocPrint(allocator, "Error: {s}", .{browser_tools.errorMessage(err)}) catch "Error: tool execution failed", .is_error = true };
+    const outcome = self.toolOutcome(allocator, tool_name, arguments) catch |err| zenai.provider.Client.ToolHandler.Result{
+        .content = std.fmt.allocPrint(allocator, "Error: {s}", .{browser_tools.errorMessage(err)}) catch "Error: tool execution failed",
+        .is_error = true,
+    };
 
     self.terminal.agentToolDone(tool_name, args_str, !outcome.is_error);
     if (self.terminal.verbosity == .high) self.terminal.printToolOutcome(tool_name, outcome.content, outcome.is_error);
     return outcome;
+}
+
+/// The text plus the rendered PNG, for backends that can show the model an image.
+fn toolOutcome(self: *Agent, allocator: std.mem.Allocator, tool_name: []const u8, arguments: ?std.json.Value) browser_tools.ToolError!zenai.provider.Client.ToolHandler.Result {
+    const result = try browser_tools.call(allocator, self.ts.session, &self.ts.registry, tool_name, arguments, .{ .inline_image = true });
+    const content = capToolOutput(allocator, tool_name, result.text);
+    return .{
+        .content = content,
+        .is_error = result.is_error,
+        .parts = if (result.image) |image| try imageParts(allocator, content, &image) else null,
+    };
+}
+
+fn imageParts(arena: std.mem.Allocator, text: []const u8, image: *const lp.screenshot.Prepared) browser_tools.ToolError![]const zenai.provider.ContentPart {
+    const data = image.base64Alloc(arena) catch return error.InternalError;
+    return try arena.dupe(zenai.provider.ContentPart, &.{ .{ .text = text }, .{ .image = .{ .data = data, .mime_type = "image/png" } } });
 }
 
 /// One-shot for `--list-models`: resolve provider+key, fetch chat-capable model
@@ -2042,6 +2049,8 @@ test {
     _ = save;
     _ = settings;
     _ = picker;
+    _ = Conversation;
+    _ = Terminal;
 }
 
 test "savePrompt: save instructions followed by the rendered script skill" {

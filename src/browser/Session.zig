@@ -20,6 +20,7 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const App = @import("../App.zig");
+const Config = @import("../Config.zig");
 
 const History = @import("webapi/History.zig");
 const storage = @import("webapi/storage/storage.zig");
@@ -85,20 +86,15 @@ _nav_cursor: usize = 0,
 // `commitPendingPage`).
 _tool_frame_override: ?u32 = null,
 
+// A popup the last tool action opened (target=_blank). Tools act on it, as
+// a user whose click opened a tab would, until it goes away.
+_followed_popup: ?u32 = null,
+
 // Loader IDs are scoped to the Session: each new BrowserContext gets a
 // fresh counter. Frame IDs (`frame_id_gen`) live on `Browser` instead so
 // CDP target IDs stay unique across BrowserContext lifecycle on a single
 // connection (see `Browser.frame_id_gen` and issue #2472).
 loader_id_gen: u32 = 0,
-
-// configuration (or CDP command) to disable iframe loading
-subframe_loading_enabled: bool = true,
-
-// configuration (or CDP command) to disable Web Worker loading. When false,
-// `new Worker(url)` returns a Worker object whose script is never fetched
-// and never evaluated. Set from the `--disable-workers` CLI flag at
-// session init; the LP.configureLoading CDP method can flip it per-session.
-worker_loading_enabled: bool = true,
 
 // Console.* capture for the `consoleLogs` tool, capped at `max_console_bytes`.
 // Opt-in via `enableConsoleCapture`: plain CDP `serve` never drains it, so
@@ -106,14 +102,8 @@ worker_loading_enabled: bool = true,
 _console_messages: std.Io.Writer.Allocating,
 _console_capture: bool = false,
 
-// Opt-in fetch of external <link rel=stylesheet> resources. Defaults to
-// false to preserve the current rendering-free fast path: drivers that
-// don't need accurate visibility checks pay nothing. Set from the
-// `--enable-external-stylesheets` CLI flag at session init; the
-// LP.configureLoading CDP method can flip it per-session. When true,
-// `Link.linkAddedCallback` routes to `Frame.loadExternalStylesheet`
-// (synchronous fetch + parse + register on `document.styleSheets`).
-load_external_stylesheets: bool = false,
+// configured external resources (images, stylesheet, worker, iframe) to load
+load_resources: Config.LoadResources,
 
 /// Caller-supplied cancellation probe. `Runner._wait` polls it between
 /// ticks; once `check` returns true the wait returns `error.Cancelled`.
@@ -175,11 +165,8 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
         .browser = browser,
         .notification = notification,
         .cookie_jar = storage.Cookie.Jar.init(allocator, notification),
-        // CLI defaults; LP.configureLoading can flip these per-session.
-        .subframe_loading_enabled = !browser.app.config.disableSubframes(),
-        .worker_loading_enabled = !browser.app.config.disableWorkers(),
         ._console_messages = .init(allocator),
-        .load_external_stylesheets = browser.app.config.enableExternalStylesheets(),
+        .load_resources = browser.app.config.loadResources(),
     };
     errdefer self._console_messages.deinit();
 }
@@ -193,7 +180,14 @@ pub fn deinit(self: *Session) void {
 
     self.cookie_jar.deinit();
 
-    self.browser.env.memoryPressureNotification(.critical);
+    {
+        // Every context is disposed; this GC must not arm a termination.
+        const env = &self.browser.env;
+        const was_tearing_down = env.tearing_down;
+        env.tearing_down = true;
+        defer env.tearing_down = was_tearing_down;
+        env.memoryPressureNotification(.critical);
+    }
 
     self.storage_shed.deinit(self.browser.app.allocator);
     self.idb.deinit();
@@ -412,7 +406,14 @@ pub fn getPinnedArena(self: *Session, size_or_bucket: anytype, debug: []const u8
     return self.arena_pool.acquirePinned(&self.browser.arena_account, size_or_bucket, debug);
 }
 
-// The live page for a top-level browsing context, by its root frame id.
+pub fn stopLoading(self: *Session, frame_id: u32) void {
+    const live = self.livePage(frame_id) orelse return;
+    if (self.replacementOf(live)) |pending| {
+        pending.frame.stopLoading();
+    }
+    live.frame.stopLoading();
+}
+
 pub fn livePage(self: *Session, frame_id: u32) ?*Page {
     for (self.pages.items) |page| {
         if (page.frame._frame_id == frame_id) {
@@ -474,6 +475,12 @@ pub fn currentFrame(self: *Session) ?*Frame {
         // No pages[0] fallthrough: the override targets one specific page.
         return self.findFrameByFrameId(frame_id);
     }
+    if (self._followed_popup) |frame_id| {
+        if (self.findFrameByFrameId(frame_id)) |frame| {
+            return frame;
+        }
+        self._followed_popup = null;
+    }
     if (self.pages.items.len == 0) {
         return null;
     }
@@ -487,6 +494,11 @@ pub fn currentFrame(self: *Session) ?*Frame {
 /// See `_tool_frame_override`. Pass null to clear.
 pub fn setToolFrameOverride(self: *Session, frame_id: ?u32) void {
     self._tool_frame_override = frame_id;
+}
+
+/// See `_followed_popup`.
+pub fn followPopup(self: *Session, frame_id: u32) void {
+    self._followed_popup = frame_id;
 }
 
 // Multi-page aware: frame ids are globally unique (monotonic on `Browser`).

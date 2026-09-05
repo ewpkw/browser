@@ -6,7 +6,20 @@ pub const Version = enum {
     @"2025-06-18",
     @"2025-11-25",
 
-    pub const default: Version = .@"2024-11-05";
+    pub const latest: Version = .@"2025-11-25";
+
+    /// The client's version when we support it, else the newest we do.
+    pub fn negotiate(params: ?std.json.Value) Version {
+        const obj = switch (params orelse return .latest) {
+            .object => |o| o,
+            else => return .latest,
+        };
+        const requested = switch (obj.get("protocolVersion") orelse return .latest) {
+            .string => |s| s,
+            else => return .latest,
+        };
+        return std.meta.stringToEnum(Version, requested) orelse .latest;
+    }
 };
 
 pub const Request = struct {
@@ -100,15 +113,30 @@ pub const ToolsCapability = struct {
     listChanged: ?bool = null,
 };
 
+/// Advisory hints for clients (e.g. auto-approving read-only calls).
+/// Defaults are the spec's: assume the worst when unset.
+pub const ToolAnnotations = struct {
+    readOnlyHint: bool = false,
+    destructiveHint: bool = true,
+    idempotentHint: bool = false,
+    openWorldHint: bool = true,
+};
+
 pub const Tool = struct {
     name: []const u8,
+    title: ?[]const u8 = null,
     description: ?[]const u8 = null,
     inputSchema: []const u8,
+    annotations: ?ToolAnnotations = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.title) |t| {
+            try jw.objectField("title");
+            try jw.write(t);
+        }
         if (self.description) |d| {
             try jw.objectField("description");
             try jw.write(d);
@@ -117,6 +145,10 @@ pub const Tool = struct {
         _ = try jw.beginWriteRaw();
         try jw.writer.writeAll(self.inputSchema);
         jw.endWriteRaw();
+        if (self.annotations) |a| {
+            try jw.objectField("annotations");
+            try jw.write(a);
+        }
         try jw.endObject();
     }
 };
@@ -142,9 +174,19 @@ pub fn TextContent(comptime T: type) type {
     };
 }
 
-pub fn CallToolResult(comptime T: type) type {
+/// `T` serializes as the base64 payload.
+pub fn ImageContent(comptime T: type) type {
     return struct {
-        content: []const TextContent(T),
+        type: []const u8 = "image",
+        data: T,
+        mimeType: []const u8,
+    };
+}
+
+/// `Content` is the content array: a slice or tuple of `TextContent`/`ImageContent`.
+pub fn CallToolResult(comptime Content: type) type {
+    return struct {
+        content: Content,
         isError: bool = false,
     };
 }
@@ -301,4 +343,20 @@ test "MCP.protocol - Tool serialization" {
     try std.json.Stringify.value(t, .{}, &aw.writer);
 
     try testing.expectString("{\"name\":\"test\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"foo\":{\"type\":\"string\"}}}}", aw.written());
+}
+
+test "MCP.protocol - Tool serialization with title and annotations" {
+    const t = Tool{
+        .name = "test",
+        .title = "Test",
+        .inputSchema = "{}",
+        .annotations = .{ .readOnlyHint = true, .destructiveHint = false },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    defer aw.deinit();
+
+    try std.json.Stringify.value(t, .{}, &aw.writer);
+
+    try testing.expectString("{\"name\":\"test\",\"title\":\"Test\",\"inputSchema\":{},\"annotations\":{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":false,\"openWorldHint\":true}}", aw.written());
 }

@@ -20,7 +20,6 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const App = @import("../App.zig");
-const CDP = @import("../cdp/CDP.zig");
 const Watchdog = @import("../Watchdog.zig");
 const Notification = @import("../Notification.zig");
 const HttpClient = @import("../network/HttpClient.zig");
@@ -67,6 +66,9 @@ permissions: std.StringHashMapUnmanaged(PermissionState) = .empty,
 // Runtime viewport override
 viewport_override: ?Viewport = null,
 
+// Screenshot renderer (fonts, glyph cache); created on the first screenshot.
+renderer: ?*lp.screenshot.Renderer = null,
+
 // Runtime geolocation override
 geolocation_override: ?Geolocation.Override = null,
 
@@ -109,7 +111,7 @@ pub fn nextFrameId(self: *Browser) u32 {
     return id;
 }
 
-pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp: ?*CDP) !void {
+pub fn init(self: *Browser, app: *App, opts: InitOpts) !void {
     const allocator = app.allocator;
 
     var env = try js.Env.init(app, opts.env);
@@ -128,7 +130,7 @@ pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp: ?*CDP) !void {
         .watchdog_entry = undefined,
     };
     self.env.protectHeapLimit();
-    try self.http_client.init(app, cdp);
+    try self.http_client.init(app);
 
     self.watchdog_entry = .{
         .env = &self.env,
@@ -154,6 +156,7 @@ pub fn deinit(self: *Browser) void {
     self.fc_identity_pool.deinit(allocator);
     self.page_pool.deinit(allocator);
     self.http_client.deinit();
+    if (self.renderer) |r| r.deinit();
     self.clearPermissions();
     self.permissions.deinit(allocator);
     self.selector_cache.deinit();

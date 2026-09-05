@@ -394,11 +394,7 @@ pub fn insertAdjacentHTML(
 
 pub fn click(self: *HtmlElement, frame: *Frame) !void {
     switch (self._type) {
-        inline .button, .input, .textarea, .select => |tag| {
-            if (self.subtype(Subtype(tag)).getDisabled()) {
-                return;
-            }
-        },
+        .button, .input, .textarea, .select, .option, .optgroup => if (self.asElement().isDisabled()) return,
         else => {},
     }
 
@@ -409,12 +405,11 @@ pub fn click(self: *HtmlElement, frame: *Frame) !void {
     flags.click_in_progress = true;
     defer flags.click_in_progress = false;
 
-    const event = (try @import("../event/MouseEvent.zig").init("click", .{
+    const event = (try @import("../event/PointerEvent.zig").init("click", .{
         .bubbles = true,
         .cancelable = true,
         .composed = true,
-        .clientX = 0,
-        .clientY = 0,
+        .pointerId = -1,
     }, frame)).asEvent();
 
     // Keep the event alive past dispatch (which runs handlers/microtasks) so we
@@ -469,6 +464,30 @@ pub fn getTranslate(self: *HtmlElement) bool {
 
 pub fn setTranslate(self: *HtmlElement, translate: bool, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("translate"), .wrap(if (translate) "yes" else "no"), frame);
+}
+
+// The draggable IDL attribute reflects the enumerated content attribute:
+// "true" => true, "false" => false, anything else (or no attribute) is the
+// auto state, which defaults to true only for <img> and <a> with an href.
+// https://html.spec.whatwg.org/multipage/dnd.html#the-draggable-attribute
+pub fn getDraggable(self: *HtmlElement) bool {
+    if (self.asElement().getAttributeSafe(comptime .wrap("draggable"))) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "true")) {
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(value, "false")) {
+            return false;
+        }
+    }
+    return switch (self._type) {
+        .img => true,
+        .anchor => self.asElement().getAttributeSafe(comptime .wrap("href")) != null,
+        else => false,
+    };
+}
+
+pub fn setDraggable(self: *HtmlElement, draggable: bool, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("draggable"), .wrap(if (draggable) "true" else "false"), frame);
 }
 
 // accessKeyLabel: the UA-assigned shortcut for a valid (single character)
@@ -588,6 +607,28 @@ pub fn setTitle(self: *HtmlElement, value: []const u8, frame: *Frame) !void {
 //
 // "contenteditable" is 15 bytes — past the comptime SSO limit — so the
 // String wrap runs at runtime, mirroring the pattern in interactive.zig.
+/// Reflects the attribute only; `isContentEditable` stays false regardless.
+pub fn getContentEditable(self: *HtmlElement) []const u8 {
+    const raw = self.asElement().getAttributeSafe(.wrap("contenteditable")) orelse return "inherit";
+    if (raw.len == 0 or std.ascii.eqlIgnoreCase(raw, "true")) return "true";
+    if (std.ascii.eqlIgnoreCase(raw, "false")) return "false";
+    if (std.ascii.eqlIgnoreCase(raw, "plaintext-only")) return "plaintext-only";
+    return "inherit";
+}
+
+pub fn setContentEditable(self: *HtmlElement, value: []const u8, frame: *Frame) !void {
+    const el = self.asElement();
+    if (std.ascii.eqlIgnoreCase(value, "inherit")) {
+        return el.removeAttribute(.wrap("contenteditable"), frame);
+    }
+    inline for (.{ "true", "false", "plaintext-only" }) |keyword| {
+        if (std.ascii.eqlIgnoreCase(value, keyword)) {
+            return el.setAttributeSafe(.wrap("contenteditable"), .wrap(keyword), frame);
+        }
+    }
+    return error.SyntaxError;
+}
+
 pub fn getIsContentEditable(self: *HtmlElement) bool {
     var current: ?*Element = self.asElement();
     while (current) |el| : (current = el.parentElement()) {
@@ -1589,7 +1630,7 @@ fn handleChildElement(
     // is hidden through its parent. If you can el.innerText on an element, the
     // visibility of el.parent doesn't matter. So we only care about visibility
     // on the element itself and then on each child. This is much simpler too.
-    if (state.frame._style_manager.hasDisplayNone(he.asElement())) {
+    if (state.frame._style_manager.hasDisplayNone(he.asElement(), .materialize)) {
         return;
     }
 
@@ -1808,6 +1849,7 @@ pub const JsApi = struct {
     pub const accessKey = bridge.accessor(HtmlElement.getAccessKey, HtmlElement.setAccessKey, .{ .ce_reactions = true });
     pub const autofocus = bridge.accessor(HtmlElement.getAutofocus, HtmlElement.setAutofocus, .{ .ce_reactions = true });
     pub const dir = reflect.enumerated("dir", &.{ "ltr", "rtl", "auto" }, .{});
+    pub const draggable = bridge.accessor(HtmlElement.getDraggable, HtmlElement.setDraggable, .{ .ce_reactions = true });
     pub const hidden = bridge.accessor(HtmlElement.getHidden, HtmlElement.setHidden, .{ .ce_reactions = true });
     pub const translate = bridge.accessor(HtmlElement.getTranslate, HtmlElement.setTranslate, .{ .ce_reactions = true });
     pub const accessKeyLabel = bridge.accessor(HtmlElement.getAccessKeyLabel, null, .{});
@@ -1815,6 +1857,7 @@ pub const JsApi = struct {
     pub const showPopover = bridge.function(HtmlElement.showPopover, .{});
     pub const hidePopover = bridge.function(HtmlElement.hidePopover, .{});
     pub const togglePopover = bridge.function(HtmlElement.togglePopover, .{});
+    pub const contentEditable = bridge.accessor(HtmlElement.getContentEditable, HtmlElement.setContentEditable, .{ .ce_reactions = true });
     pub const isContentEditable = bridge.accessor(HtmlElement.getIsContentEditable, null, .{});
     pub const lang = bridge.accessor(HtmlElement.getLang, HtmlElement.setLang, .{ .ce_reactions = true });
     pub const nonce = bridge.accessor(HtmlElement.getNonce, HtmlElement.setNonce, .{ .ce_reactions = true });

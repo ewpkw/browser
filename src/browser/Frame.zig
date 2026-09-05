@@ -43,6 +43,7 @@ const EventTarget = @import("webapi/EventTarget.zig");
 const Element = @import("webapi/Element.zig");
 const HtmlElement = @import("webapi/element/Html.zig");
 const Window = @import("webapi/Window.zig");
+const Cookie = @import("webapi/storage/Cookie.zig");
 const Location = @import("webapi/Location.zig");
 const Document = @import("webapi/Document.zig");
 const ShadowRoot = @import("webapi/ShadowRoot.zig");
@@ -79,6 +80,7 @@ const GlobalEventHandlersLookup = @import("webapi/global_event_handlers.zig").Lo
 
 pub const parse = @import("frame/parse.zig");
 pub const preload = @import("frame/preload.zig");
+pub const resource_load = @import("frame/resource_load.zig");
 pub const observers = @import("frame/observers.zig");
 pub const user_input = @import("frame/user_input.zig");
 pub const node_factory = @import("frame/node_factory.zig");
@@ -144,6 +146,7 @@ _element_computed_styles: Element.ComputedStyleLookup = .empty,
 _element_datasets: Element.DatasetLookup = .empty,
 _element_class_lists: Element.ClassListLookup = .empty,
 _element_rel_lists: Element.RelListLookup = .empty,
+_element_part_lists: Element.PartListLookup = .empty,
 _element_token_lists: Element.TokenListLookup = .empty,
 _element_shadow_roots: Element.ShadowRootLookup = .empty,
 _node_owner_documents: Node.OwnerDocumentLookup = .empty,
@@ -274,6 +277,12 @@ _notified_network_almost_idle: IdleNotification = .init,
 // next tick.
 _queued_navigation: ?*QueuedNavigation = null,
 
+// Is there a <meta http-equiv=refresh> we need to fire on "load"?
+// Exactly which we need to fire can change, so rather than keeping it in sync
+// it's easier to scan for it on "load", but this is hint to avoid that scan
+// for the very common case where we're sure there isn't any.
+_maybe_meta_refresh: bool = false,
+
 // The URL of the current frame
 url: [:0]const u8 = "about:blank",
 
@@ -401,7 +410,6 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         ._http_owner = undefined,
     };
     self._queued_events = &self._queued_events_1;
-    self._http_owner = .init(&page.blob_urls, &self.origin);
 
     var screen: *Screen = undefined;
     var visual_viewport: *VisualViewport = undefined;
@@ -423,7 +431,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         ._proto = undefined,
         ._document = self.document,
         ._location = undefined,
-        ._performance = .init(),
+        ._performance = .init(factory, arena),
         ._screen = screen,
         ._visual_viewport = visual_viewport,
         ._cross_origin_wrapper = undefined,
@@ -439,6 +447,19 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     }
     self.window._cross_origin_wrapper = .{ .window = self.window };
 
+    self._http_owner = .{
+        .blob_urls = &page.blob_urls,
+        .origin = &self.origin,
+        .url = &self.url,
+        .parent = if (parent) |p| &p._http_owner else null,
+        .frame_id = frame_id,
+        .document_frame_id = frame_id,
+        .loader_id = self._loader_id,
+        .cookie_jar = &session.cookie_jar,
+        .notification = session.notification,
+        .performance = &self.window._performance,
+    };
+
     self._style_manager = try StyleManager.init(self);
     errdefer self._style_manager.deinit();
 
@@ -453,6 +474,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .local_arena = self.local_arena,
     });
     errdefer browser.env.destroyContext(self.js);
+    self.window._performance._scheduler = &self.js.scheduler;
 
     const location = try Location.init("about:blank", self);
     // We're holding a reference in Zig-side.
@@ -500,7 +522,9 @@ pub fn deinit(self: *Frame) void {
     // Unregister CookieStore from session notifications before the JS
     // context (and thus the scheduler) is destroyed, otherwise a late
     // mutation could schedule a callback that never runs.
-    if (self.window._cookie_store) |cs| cs.detach();
+    if (self.window._cookie_store) |cs| {
+        cs.detach();
+    }
 
     const page = self._page;
 
@@ -553,6 +577,8 @@ pub fn deinit(self: *Frame) void {
         browser.reportJsHeap();
     }
 
+    // fired the last moment the js context is still alive
+    page.session.notification.dispatch(.frame_destroyed, self);
     browser.env.destroyContext(self.js);
 
     // Must be after context is destroyed. A finalizer can reach into the *Worker
@@ -591,10 +617,15 @@ fn referrerSource(self: *const Frame) [:0]const u8 {
     var frame = self;
     while (std.mem.startsWith(u8, frame.url, "about:")) {
         // about:blank and about:srcdoc documents aren't valid referrer sources,
-        // use the parents
+        // use the parents.
         frame = frame.parent orelse return frame.url;
     }
     return frame.url;
+}
+
+// RFC 6265bis "site for cookies" for SameSite checks on requests this frame does.
+pub fn siteForCookies(self: *const Frame) Cookie.SiteForCookies {
+    return self._http_owner.siteForCookies();
 }
 
 pub fn getTitle(self: *Frame) !?[]const u8 {
@@ -820,18 +851,16 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     const transfer = try http_client.newRequest(.{
         .ctx = self,
         .url = self.url,
-        .frame_id = self._frame_id,
-        .loader_id = self._loader_id,
         .method = opts.method,
         .body = opts.body,
         // don't cache top-level pages, most cases won't revisit this, and, if they
         // do, they probably don't want the cached version.
         .skip_cache = self.parent == null,
         .throttle = self.parent == null,
-        .cookie_jar = &session.cookie_jar,
-        .cookie_origin = opts.initiator_url orelse self.url,
+        .origin = self.origin,
         .resource_type = .document,
-        .notification = self._session.notification,
+        .request_mode = .navigate,
+        .credentials_mode = .include,
         .header_callback = frameHeaderDoneCallback,
         .data_callback = frameDataCallback,
         .done_callback = frameDoneCallback,
@@ -1027,9 +1056,13 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
             nav_opts.referer = try referrer.compute(arena.allocator(), originator.referrer_policy, referrer_source, resolved_url);
             nav_opts.referrer_policy = originator.referrer_policy;
         }
-        if (nav_opts.initiator_url == null) {
-            nav_opts.initiator_url = try arena.dupeZ(u8, referrer_source);
-        }
+    }
+    // A subframe navigation's SameSite initiator is the frame's whole ancestor
+    // chain, not the document that triggered the navigation; the request gets
+    // that from its owner. Only a top-level navigation's initiator is another
+    // document.
+    if (nav_opts.initiator_url == null and target.parent == null and std.mem.startsWith(u8, referrer_source, "http")) {
+        nav_opts.initiator_url = .{ .url = try arena.dupeZ(u8, referrer_source) };
     }
     if (nav_opts.initiator_origin == null) {
         if (originator.origin) |o| {
@@ -1093,14 +1126,12 @@ pub fn makeRequest(self: *Frame, req: HttpClient.Request) !void {
         errdefer transfer.deinit();
         try self.headersForRequest(transfer);
     }
-    return transfer.submit();
+    transfer.submit() catch {};
 }
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
 pub fn newRequest(self: *Frame, req: HttpClient.Request) !*HttpClient.Transfer {
-    var r = req;
-    r.document_frame_id = self._frame_id;
-    return self._session.browser.http_client.newRequest(r, &self._http_owner);
+    return self._session.browser.http_client.newRequest(req, &self._http_owner);
 }
 
 // Synchronously abort every transfer and WebSocket owned by this frame
@@ -1111,6 +1142,32 @@ pub fn abortTransfers(self: *Frame) void {
     }
     const http_client = &self._session.browser.http_client;
     http_client.abortOwner(&self._http_owner);
+}
+
+pub fn stopLoading(self: *Frame) void {
+    var i: usize = 0;
+    while (i < self.child_frames.items.len) : (i += 1) {
+        // Each frame will cancel its requests, which can fire JS callbacks
+        // which can destroy/change frames. Hence `while` instead of `for`.
+        self.child_frames.items[i].stopLoading();
+    }
+
+    if (self._queued_navigation) |qn| {
+        const queued = self._page.queued_navigation;
+        if (std.mem.indexOfScalar(*Frame, queued.items, self)) |idx| {
+            _ = queued.swapRemove(idx);
+        }
+        qn.arena.release();
+        self._queued_navigation = null;
+    }
+
+    const http_client = &self._session.browser.http_client;
+    if (http_client.findTransfer(self._req_id)) |transfer| {
+        // the main navigation is still transfering, force it to finish now,
+        // with whatever it has
+        _ = transfer.finishEarly();
+    }
+    http_client.cancelRequests(&self._http_owner);
 }
 
 pub fn documentIsLoaded(self: *Frame) void {
@@ -1198,7 +1255,7 @@ pub fn iframeCompletedLoading(self: *Frame, iframe: *IFrame, delays_load: bool) 
     }
 }
 
-fn pendingLoadCompleted(self: *Frame) void {
+pub fn pendingLoadCompleted(self: *Frame) void {
     const pending_loads = self._pending_loads;
     if (pending_loads == 1) {
         self._pending_loads = 0;
@@ -1230,6 +1287,11 @@ pub fn documentIsComplete(self: *Frame) void {
         error.JsException => {}, // already logged
         else => log.err(.frame, "document is complete", .{ .err = err, .type = self._type, .url = self.url }),
     };
+
+    if (self._maybe_meta_refresh) {
+        self._maybe_meta_refresh = false;
+        self.metaRefreshOnLoad();
+    }
 
     if (self.parent == null) {
         self._session.browser.reportJsHeap();
@@ -1285,6 +1347,28 @@ fn notifyParentLoadComplete(self: *Frame) void {
 
     self._parent_notified = true;
     parent.iframeCompletedLoading(self.iframe.?, self._delays_parent_load);
+}
+
+fn metaRefreshOnLoad(self: *Frame) void {
+    const root = self.document.getDocumentElement() orelse return;
+    var tw = TreeWalker.Full.init(root.asNode(), .{});
+    while (tw.next()) |node| {
+        const meta = node.is(Element.Html.Meta) orelse continue;
+        const target = meta.refreshTarget() orelse continue;
+        return self.metaRefresh(target) catch |err| {
+            log.err(.frame, "meta refresh", .{ .err = err, .type = self._type, .url = self.url });
+        };
+    }
+}
+
+pub fn metaRefresh(self: *Frame, target: []const u8) !void {
+    if (self.isGoingAway()) {
+        return;
+    }
+    return self.scheduleNavigation(target, .{
+        .reason = .script,
+        .kind = .{ .replace = null },
+    }, .{ .script = self });
 }
 
 fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.HeaderResult {
@@ -1771,7 +1855,8 @@ fn frameErrorCallback(ctx: *anyopaque, err: anyerror) void {
     var self: *Frame = @ptrCast(@alignCast(ctx));
 
     self._last_navigate_error = err;
-    log.err(.frame, "navigate failed", .{ .err = err, .type = self._type, .url = self.url });
+    const level: log.Level = if (err == error.TransferCanceled) .info else .err;
+    log.log(.frame, level, "navigate failed", .{ .err = err, .type = self._type, .url = self.url });
 
     // A navigation that fails before any response headers arrive never
     // reaches the frame_navigated dispatch in frameHeaderCallback, so the
@@ -1809,12 +1894,17 @@ fn frameErrorCallback(ctx: *anyopaque, err: anyerror) void {
         return;
     };
 }
+
 pub fn isGoingAway(self: *const Frame) bool {
+    return self.js.env.terminatePending() or self.hasQueuedNavigation();
+}
+
+fn hasQueuedNavigation(self: *const Frame) bool {
     if (self._queued_navigation != null) {
         return true;
     }
     const parent = self.parent orelse return false;
-    return parent.isGoingAway();
+    return parent.hasQueuedNavigation();
 }
 
 pub fn scriptAddedCallback(self: *Frame, comptime from_parser: bool, script: *Element.Html.Script) !void {
@@ -1849,8 +1939,8 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
     if (iframe._executed) {
         return;
     }
-    if (!self._session.subframe_loading_enabled) {
-        // configured not to load frames
+    if (self._session.load_resources.iframe == false) {
+        log.warnDisabledIFrame();
         iframe._executed = true;
         return;
     }
@@ -1937,17 +2027,12 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
     self.child_frames_sorted = false;
 
     // Iframe's initial src request carries the parent's URL as Referer
-    // (subject to the parent's Referrer-Policy) and as the SameSite
-    // initiator. When this frame is itself an about: document, the nearest
-    // ancestor's URL is the referrer source. Parent frame outlives this
-    // navigate() call, so the slice is safe; navigate dupes what it keeps.
+    // (subject to the parent's Referrer-Policy).
     const referrer_source = self.referrerSource();
-    const parent_url: ?[:0]const u8 = if (std.mem.startsWith(u8, referrer_source, "http")) referrer_source else null;
     new_frame.navigate(url, .{
         .reason = .initialFrameNavigation,
         .referer = try referrer.compute(self.call_arena, self.referrer_policy, referrer_source, url),
         .referrer_policy = self.referrer_policy,
-        .initiator_url = parent_url,
         .initiator_origin = self.origin,
     }) catch |err| {
         // extra defensive..maybe navigate added a new frame, and the index it
@@ -2141,10 +2226,14 @@ pub fn removeElementId(self: *Frame, element: *Element, id: []const u8) void {
 
 pub fn removeElementIdWithMaps(self: *Frame, id_maps: ElementIdMaps, id: []const u8) void {
     if (id_maps.lookup.remove(id)) {
-        const owned_id = self.dupeString(id) catch return;
-        id_maps.removed_ids.put(self.arena, owned_id, {}) catch |err| {
+        const gop = id_maps.removed_ids.getOrPut(self.arena, id) catch |err| {
             log.warn(.frame, "removeElementIdWithMaps", .{ .err = err });
+            return;
         };
+        if (gop.found_existing == false) {
+            gop.key_ptr.* = self.dupeString(id) catch return;
+            gop.value_ptr.* = {};
+        }
     }
 }
 
@@ -2263,9 +2352,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
 
     const session = self._session;
 
-    // this feature is disabled by default, and can be turned on via a command
-    // line flag or via an CDP command
-    if (session.load_external_stylesheets == false) {
+    if (session.load_resources.stylesheet == false) {
         return self.queueLoad(Factory.protoOf(link));
     }
 
@@ -2297,12 +2384,10 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     const transfer = http_client.newRequest(.{
         .url = resolved,
         .method = .GET,
-        .frame_id = self._frame_id,
-        .loader_id = self._loader_id,
-        .cookie_jar = &session.cookie_jar,
-        .cookie_origin = self.url,
+        .origin = self.origin,
+        .request_mode = .no_cors,
+        .credentials_mode = .same_origin,
         .resource_type = .stylesheet,
-        .notification = session.notification,
         .shutdown_callback = HttpClient.noopShutdown, // syncRequest installs its own
     }, &self._http_owner) catch |err| {
         log.warn(.http, "external stylesheet fetch", .{ .err = err, .url = resolved });
@@ -2326,7 +2411,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     sm.is_evaluating = true;
     defer sm.endEvaluationWindow(was_evaluating);
 
-    var response = http_client.syncRequest(transfer) catch |err| {
+    var response = transfer.submitSync() catch |err| {
         log.warn(.http, "external stylesheet fetch", .{ .err = err, .url = resolved });
         return self.fireElementEvent(element, comptime .wrap("error"));
     };
@@ -3145,6 +3230,12 @@ fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "iframe", .type = frame._type, .url = frame.url });
             return err;
         };
+    } else if (node.is(Element.Html.Meta)) |meta| {
+        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        meta.processRefresh(frame) catch |err| {
+            log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "meta", .type = frame._type, .url = frame.url });
+            return err;
+        };
     } else if (node.is(Element.Html.Link)) |link| {
         const frame = if (comptime from_parser) self else node.ownerFrame(self);
         link.linkAddedCallback(frame) catch |err| {
@@ -3310,11 +3401,14 @@ pub const NavigateOpts = struct {
     // can recompute the header. null (e.g. a CDP-supplied referrer) leaves
     // the Referer untouched across redirects.
     referrer_policy: ?referrer.Policy = null,
-    // The URL of the document that initiated this navigation, used as the
-    // "site for cookies" when computing SameSite. Distinct from `referer`
+    // The "site for cookies" of the document that initiated a top-level
+    // navigation, used when computing SameSite. Distinct from `referer`
     // because a Referrer-Policy can suppress the Referer header without
-    // affecting SameSite (which always considers the real initiator).
-    initiator_url: ?[:0]const u8 = null,
+    // affecting SameSite (which always considers the real initiator). null
+    // leaves it to the navigated frame's owner: its own site for a top-level
+    // navigation (browser-initiated, treated as same-site), its ancestor
+    // chain's for a subframe.
+    initiator_url: ?Cookie.SiteForCookies = null,
     initiator_origin: ?[]const u8 = null,
     force: bool = false,
     kind: NavigationKind = .{ .push = null },
@@ -3352,21 +3446,25 @@ pub const QueuedNavigation = struct {
     navigation_type: NavigationType,
 };
 
+pub const TargetFrame = union(enum) {
+    frame: *Frame,
+    blank,
+};
+
 /// Resolves a target attribute value (e.g., "_self", "_parent", "_top", or frame name)
-/// to the appropriateFrame to navigate.
-/// Returns null if the target is "_blank" (which would open a new window/tab).
+/// to the Frame to navigate.
 /// Note: Callers should handle empty target separately (for owner document resolution).
-pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
+pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) TargetFrame {
     if (std.ascii.eqlIgnoreCase(target_name, "_self")) {
-        return self;
+        return .{ .frame = self };
     }
 
     if (std.ascii.eqlIgnoreCase(target_name, "_blank")) {
-        return null;
+        return .blank;
     }
 
     if (std.ascii.eqlIgnoreCase(target_name, "_parent")) {
-        return self.parent orelse self;
+        return .{ .frame = self.parent orelse self };
     }
 
     if (std.ascii.eqlIgnoreCase(target_name, "_top")) {
@@ -3374,13 +3472,13 @@ pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
         while (frame.parent) |f| {
             frame = f;
         }
-        return frame;
+        return .{ .frame = frame };
     }
 
     // Named frame lookup: search current frame's descendants first, then from root
     // This follows the HTML spec's "implementation-defined" search order.
     if (findFrameByName(self, target_name)) |f| {
-        return f;
+        return .{ .frame = f };
     }
 
     // If not found in descendants, search from root (catches siblings and ancestors' descendants)
@@ -3390,13 +3488,33 @@ pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
     }
     if (root != self) {
         if (findFrameByName(root, target_name)) |f| {
-            return f;
+            return .{ .frame = f };
         }
     }
 
     // If no frame found with that name, navigate in current frame
     // (this matches browser behavior - unknown targets act like _self)
-    return self;
+    return .{ .frame = self };
+}
+
+/// Per spec the opener is withheld unless the element has rel=opener.
+pub fn openBlankTarget(self: *Frame, element: *Element, url: []const u8) !*Frame {
+    return self.openPopup(.{
+        .url = url,
+        .name = "",
+        .opener = if (hasRelToken(element, "opener")) self.window else null,
+    });
+}
+
+fn hasRelToken(element: *Element, token: []const u8) bool {
+    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return false;
+    var it = std.mem.tokenizeAny(u8, rel, &std.ascii.whitespace);
+    while (it.next()) |t| {
+        if (std.ascii.eqlIgnoreCase(t, token)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn findFrameByName(frame: *Frame, name: []const u8) ?*Frame {
@@ -3459,14 +3577,11 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         break :blk form_element.getAttributeSafe(comptime .wrap("target"));
     };
 
-    const target_frame = blk: {
+    const target: TargetFrame = blk: {
         const target_name = target_name_ orelse {
-            break :blk form_element.ownerFrame(self);
+            break :blk .{ .frame = form_element.ownerFrame(self) };
         };
-        break :blk self.resolveTargetFrame(target_name) orelse {
-            log.warn(.not_implemented, "target", .{ .type = self._type, .url = self.url, .target = target_name });
-            return;
-        };
+        break :blk self.resolveTargetFrame(target_name);
     };
 
     if (submit_opts.fire_event) {
@@ -3627,6 +3742,12 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         action = try URL.concatQueryString(arena.allocator(), action, buf.written());
     }
 
+    // Opened only once the submission goes ahead, so an aborted one leaves
+    // no stray window.
+    const target_frame = switch (target) {
+        .frame => |f| f,
+        .blank => try form_element.ownerFrame(self).openBlankTarget(form_element, ""),
+    };
     return self.scheduleNavigationWithArena(arena, action, opts, .{ .form = target_frame });
 }
 
@@ -3722,6 +3843,84 @@ test "Page: isSameOrigin" {
     try testing.expectEqual(false, frame.isSameOrigin("//origin.com/foo"));
 }
 
+test "Frame: static immediate meta refresh navigates" {
+    const page = try testing.pageTest("fixtures/meta_refresh.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    try testing.expect(std.mem.endsWith(u8, frame.url, "/fixtures/meta_refresh_target.html"));
+    // the rest of the page, including scripts after the meta, still ran
+    try testing.expectString("ran=1", (try frame.getTitle()).?);
+}
+
+test "Frame: meta refresh in a detached tree is ignored" {
+    // a <template> child and a clone are both created with a full set of
+    // attributes, but neither is ever in the document
+    const page = try testing.pageTest("fixtures/meta_refresh_ignored.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    try testing.expect(std.mem.endsWith(u8, frame.url, "/fixtures/meta_refresh_ignored.html"));
+}
+
+test "Frame: dynamic immediate meta refresh waits for the load event" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "https://example.com/source";
+    _ = try appendMetaRefresh(frame, "0; /target");
+
+    // still loading, so the navigation is held
+    try testing.expectEqual(null, frame._queued_navigation);
+    try testing.expect(frame._maybe_meta_refresh);
+
+    frame.documentIsComplete();
+    try testing.expectString("https://example.com/target", frame._queued_navigation.?.url);
+}
+
+test "Frame: meta refresh added after the load event navigates" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "https://example.com/source";
+    frame.documentIsComplete();
+
+    _ = try appendMetaRefresh(frame, "0; /target");
+    try testing.expectString("https://example.com/target", frame._queued_navigation.?.url);
+}
+
+test "Frame: meta refresh edited into something inert before the load event" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "https://example.com/source";
+
+    const first = try appendMetaRefresh(frame, "0; /first");
+    _ = try appendMetaRefresh(frame, "0; /second");
+
+    // no longer an immediate refresh, so the next one in the document wins
+    try first.setAttribute(comptime .wrap("content"), comptime .wrap("10; /first"), frame);
+
+    frame.documentIsComplete();
+    try testing.expectString("https://example.com/second", frame._queued_navigation.?.url);
+}
+
+fn appendMetaRefresh(frame: *Frame, content: []const u8) !*Element {
+    const head = blk: {
+        if (frame.document.getDocumentElement()) |html| {
+            break :blk html.asNode().firstChild().?.as(Element);
+        }
+        const html = try frame.document.createElement("html", null, frame);
+        _ = try frame.document.asNode().appendChild(html.asNode(), frame);
+        const head = try frame.document.createElement("head", null, frame);
+        _ = try html.asNode().appendChild(head.asNode(), frame);
+        break :blk head;
+    };
+
+    const meta = try frame.document.createElement("meta", null, frame);
+    try meta.setAttribute(comptime .wrap("http-equiv"), comptime .wrap("refresh"), frame);
+    try meta.setAttribute(comptime .wrap("content"), .wrap(content), frame);
+    _ = try head.asNode().appendChild(meta.asNode(), frame);
+    return meta;
+}
+
 test "Frame: httpMetadata after navigation" {
     testing.expectLog(&.{.http});
 
@@ -3754,4 +3953,56 @@ test "Frame: 401" {
     defer buf.deinit();
     try @import("dump.zig").root(frame.document, .{}, &buf.writer, frame);
     try testing.expectEqual("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre>No</pre></body></html>", buf.written());
+}
+
+test "Frame: scriptAddedCallback does not run a module when termination is pending" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    // An inline module: classic scripts are already refused by js.Script.run,
+    // modules go through Module.evaluate which has no gate of its own.
+    const element = try frame.document.createElement("script", null, frame);
+    try element.setAttribute(comptime .wrap("type"), comptime .wrap("module"), frame);
+    try element.asNode().setTextContent("globalThis.__terminated_inline_ran = true", frame);
+
+    // Parsing is over, so the inline module is evaluated on insertion rather
+    // than queued behind the static scripts.
+    frame._script_manager.base.static_scripts_done = true;
+
+    // The sticky terminate is set but V8's own state was consumed by the
+    // JSEntry unwind of whatever the terminate landed in.
+    const env = frame.js.env;
+    env.terminate();
+    JS.v8.v8__Isolate__CancelTerminateExecution(env.isolate.handle);
+
+    try frame.scriptAddedCallback(false, element.as(HtmlElement.Script));
+    env.cancelTerminate();
+
+    var ls: JS.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    try testing.expectEqual(false, (try ls.local.exec("globalThis.__terminated_inline_ran === true", null)).toBool());
+}
+
+test "Frame: iframeAddedCallback does not create a frame when termination is pending" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const session = frame._session;
+    const subframe_loading_enabled = session.load_resources.iframe;
+    session.load_resources.iframe = true;
+    defer session.load_resources.iframe = subframe_loading_enabled;
+
+    const element = try frame.document.createElement("iframe", null, frame);
+    const iframe = element.as(HtmlElement.IFrame);
+
+    const env = frame.js.env;
+    const contexts_before = env.contexts.items.len;
+    env.terminate();
+    JS.v8.v8__Isolate__CancelTerminateExecution(env.isolate.handle);
+    defer env.cancelTerminate();
+
+    try frame.iframeAddedCallback(iframe);
+    try testing.expectEqual(contexts_before, env.contexts.items.len);
+    try testing.expectEqual(false, iframe._executed);
 }

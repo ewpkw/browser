@@ -49,21 +49,15 @@ pub const Owner = union(enum) {
         };
     }
 
-    pub fn frameId(self: Owner) u32 {
-        return switch (self) {
-            inline else => |g| g._frame_id,
-        };
-    }
-
-    pub fn loaderId(self: Owner) u32 {
-        return switch (self) {
-            inline else => |g| g._loader_id,
-        };
-    }
-
     pub fn session(self: Owner) *Session {
         return switch (self) {
             inline else => |g| g._session,
+        };
+    }
+
+    pub fn origin(self: Owner) ?[]const u8 {
+        return switch (self) {
+            inline else => |g| g.origin,
         };
     }
 
@@ -257,17 +251,14 @@ pub fn preloadImport(self: *ScriptManagerBase, url: [:0]const u8, referrer: []co
     self.async_scripts.append(&script.node);
 
     const owner = self.owner;
-    const session = owner.session();
     owner.makeRequest(.{
         .ctx = script,
         .url = url,
         .method = .GET,
-        .frame_id = owner.frameId(),
-        .loader_id = owner.loaderId(),
-        .cookie_jar = &session.cookie_jar,
-        .cookie_origin = owner.url(),
+        .origin = owner.origin(),
+        .request_mode = .cors,
+        .credentials_mode = .same_origin,
         .resource_type = .script,
-        .notification = session.notification,
         .start_callback = if (log.enabled(.http, .debug)) Script.startCallback else null,
         .header_callback = Script.headerCallback,
         .data_callback = Script.dataCallback,
@@ -450,18 +441,15 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
     defer self.endEvaluationWindow(was_evaluating);
 
     const owner = self.owner;
-    const session = self.owner.session();
     self.async_scripts.append(&script.node);
     owner.makeRequest(.{
         .ctx = script,
         .url = url,
         .method = .GET,
-        .frame_id = owner.frameId(),
-        .loader_id = owner.loaderId(),
         .resource_type = .script,
-        .cookie_jar = &session.cookie_jar,
-        .cookie_origin = owner.url(),
-        .notification = session.notification,
+        .origin = owner.origin(),
+        .request_mode = .cors,
+        .credentials_mode = .same_origin,
         .start_callback = if (log.enabled(.http, .debug)) Script.startCallback else null,
         .header_callback = Script.headerCallback,
         .data_callback = Script.dataCallback,
@@ -1085,6 +1073,7 @@ pub const ImportedModule = struct {
 };
 
 const testing = @import("../testing.zig");
+const Inbox = @import("../Inbox.zig");
 
 test "ScriptManagerBase: shutdownCallback fails a .loading module" {
     const page = try testing.pageTest("mcp_nav.html", .{});
@@ -1120,6 +1109,58 @@ test "ScriptManagerBase: shutdownCallback fails a .loading module" {
     try testing.expectError(error.Failed, sm.waitForImport(url));
 }
 
+test "ScriptManagerBase: import whose submit fails synchronously releases its arena once" {
+    const page = try testing.pageTest("mcp_nav.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+
+    const sm = &frame._script_manager.base;
+    const client = sm.client;
+    client.test_fail_submit = error.TestSubmitFailure;
+    defer client.test_fail_submit = null;
+
+    // Script.errorCallback logs the fetch error.
+    testing.expectLog(&.{.http});
+
+    const url: [:0]const u8 = "http://127.0.0.1:9582/fails-at-submit.js";
+    try sm.preloadImport(url, frame.url, .{});
+
+    // The failure is delivered through the entry, same as an async one.
+    try testing.expect(sm.async_scripts.first == null);
+    try testing.expect(sm.imported_modules.getPtr(url).?.state == .err);
+    try testing.expectError(error.Failed, sm.waitForImport(url));
+}
+
+test "ScriptManagerBase: dynamic import whose submit fails synchronously rejects once" {
+    const page = try testing.pageTest("mcp_nav.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+
+    const sm = &frame._script_manager.base;
+    const client = sm.client;
+    client.test_fail_submit = error.TestSubmitFailure;
+    defer client.test_fail_submit = null;
+
+    // Script.errorCallback logs the fetch error.
+    testing.expectLog(&.{.http});
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    try ls.local.eval(
+        \\globalThis.__dyn = 'pending';
+        \\import('http://127.0.0.1:9582/fails-at-submit.js').then(
+        \\  () => { globalThis.__dyn = 'resolved'; },
+        \\  (e) => { globalThis.__dyn = String(e); },
+        \\);
+    , frame.url); // the resource name is the import's base url
+    ls.local.runMicrotasks();
+
+    try testing.expect(sm.async_scripts.first == null);
+    try testing.expectEqual(true, (try ls.local.exec("globalThis.__dyn === 'TestSubmitFailure'", null)).toBool());
+}
+
 test "ScriptManagerBase: waitForImport stops when teardown is pending" {
     const page = try testing.pageTest("mcp_nav.html", .{});
     defer page.close();
@@ -1144,12 +1185,61 @@ test "ScriptManagerBase: waitForImport stops when teardown is pending" {
     try sm.imported_modules.put(sm.allocator, url, .{ .state = .{ .loading = script } });
     sm.async_scripts.append(&script.node);
 
+    var inbox: Inbox = .{};
+    defer inbox.deinit();
+    client.test_inbox = &inbox;
+    defer client.test_inbox = null;
+
     const message_arena = try client.arena_pool.acquire(.tiny, "test teardown message");
-    client.inbox.push(message_arena, .{ .cdp = .{
+    inbox.push(message_arena, .{ .cdp = .{
         .raw = try message_arena.dupe(u8, "{}"),
         .input = .{ .method = "Target.disposeBrowserContext" },
     } });
-    defer client.inbox.pop().?.deinit();
 
     try testing.expectError(error.SyncWaitInterrupted, sm.waitForImport(url));
+}
+
+test "ScriptManagerBase: evaluate drops a ready async module when termination is pending" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const sm = &frame._script_manager.base;
+    const element = try frame.document.createElement("script", null, frame);
+
+    // A fetched <script type=module async> sitting in ready_scripts:
+    // doneCallback moved it there and this tick's drain is about to evaluate
+    // it. Classic scripts are already refused by js.Script.run; modules go
+    // through Module.evaluate, which has no gate of its own.
+    const arena = try sm.acquireArena(.small, "test.terminated_async");
+    const script = try arena.create(Script);
+    script.* = .{
+        .arena = arena,
+        .url = "http://127.0.0.1:9582/late-async.js",
+        .node = .{},
+        .manager = sm,
+        .complete = true,
+        .status = 200,
+        .source = .{ .@"inline" = "globalThis.__late_async_ran = true" },
+        .extra = .{ .frame = .{
+            .kind = .module,
+            .mode = .async,
+            .frame = frame,
+            .script_element = element.as(Element.Html.Script),
+        } },
+    };
+    sm.ready_scripts.append(&script.node);
+
+    // The sticky terminate is set but V8's own state was consumed by the
+    // JSEntry unwind of whatever the terminate landed in.
+    const env = frame.js.env;
+    env.terminate();
+    js.v8.v8__Isolate__CancelTerminateExecution(env.isolate.handle);
+
+    sm.evaluate();
+    env.cancelTerminate();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    try testing.expectEqual(false, (try ls.local.exec("globalThis.__late_async_ran === true", null)).toBool());
 }
