@@ -372,25 +372,43 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 
 ## 五、编译方案
 
-### 5.1 新服务器环境搭建
+### 5.1 新服务器环境搭建（完整清单）
+
+#### 5.1.1 系统依赖包（Ubuntu 22.04+ / Debian 12+）
 
 ```bash
-# 1) 系统依赖（Ubuntu 22.04+ / Debian 12+）
 apt-get update && apt-get install -y --no-install-recommends \
-    xz-utils ca-certificates pkg-config libglib2.0-dev clang make curl git
+    xz-utils ca-certificates pkg-config \
+    libglib2.0-dev clang make curl git
+```
 
-# 2) Zig 0.16.0
+#### 5.1.2 Zig 编译器（v0.16.0）
+
+```bash
 ZIG_VERSION="0.16.0"
 curl -LO https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz
 tar xf zig-x86_64-linux-${ZIG_VERSION}.tar.xz
+rm -rf /usr/local/lib/zig-x86_64-linux-${ZIG_VERSION}
 mv zig-x86_64-linux-${ZIG_VERSION} /usr/local/lib
 ln -sf /usr/local/lib/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
+rm zig-x86_64-linux-${ZIG_VERSION}.tar.xz
+zig version  # 应输出 0.16.0
+```
 
-# 3) Rust 工具链（rsproxy.cn 国内镜像）
+#### 5.1.3 Rust 工具链（使用国内镜像）
+
+```bash
+# 设置镜像环境变量（写入 ~/.bashrc）
+echo 'export RUSTUP_DIST_SERVER="https://rsproxy.cn"' >> ~/.bashrc
+echo 'export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"' >> ~/.bashrc
 export RUSTUP_DIST_SERVER="https://rsproxy.cn"
 export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+
+# 安装
 curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y
 source $HOME/.cargo/env
+
+# 配置 crates.io 镜像
 mkdir -p ~/.cargo
 cat > ~/.cargo/config.toml << 'CARGO_EOF'
 [source.crates-io]
@@ -405,90 +423,298 @@ index = "https://rsproxy.cn/crates.io-index"
 git-fetch-with-cli = true
 CARGO_EOF
 
-# 4) 环境变量（写入 ~/.bashrc 持久化）
-echo 'export PATH="/usr/local/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"' >> ~/.bashrc
-echo 'export LIGHTPANDA_DISABLE_TELEMETRY=1' >> ~/.bashrc
-source ~/.bashrc
+rustc --version
 ```
 
-### 5.2 下载 V8 预编译库
+#### 5.1.4 V8 引擎预编译库（127 MB）
 
 ```bash
 make download-v8
-# 当前版本对应缓存路径：.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a
-# 版本号来自 .github/actions/install/action.yml 里的 `zig-v8` 和 `v8` 默认值，
-# 同步上游后要重新核对这两个值是否变了，若变了缓存目录名/文件名也要跟着变。
+# 或手动下载 v0.5.4 版本（缓存路径带 tag 版本号，不能省掉这一层目录，
+# 详见 Makefile 里 V8_CACHE 的定义；同步上游后要重新核对
+# .github/actions/install/action.yml 里 zig-v8 / v8 两个默认值是否变了）
+curl -fL -o .lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a \
+  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a
 ```
 
-### 5.3 编译 / 部署
+#### 5.1.5 环境变量
 
 ```bash
-# 编译机是 AMD EPYC 9T25（Zen 5），默认编译产出的指令集不兼容 Intel Xeon
-# （Skylake-SP）等较老 CPU，运行时会 SIGILL。生产部署固定用下面这条：
+# PATH（写入 ~/.bashrc 持久化）
+echo 'export PATH="/usr/local/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"' >> ~/.bashrc
+echo 'export LIGHTPANDA_DISABLE_TELEMETRY=1' >> ~/.bashrc
+source ~/.bashrc
+
+# Agent 模式（按需）
+# export GOOGLE_API_KEY="your-key"
+# export GEMINI_API_KEY="your-key"
+```
+
+#### 5.1.6 一键初始化脚本
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+PROJECT_DIR="${1:-$(pwd)}"
+echo "==> [1/6] 安装系统依赖..."
+apt-get update -qq && apt-get install -y --no-install-recommends \
+    xz-utils ca-certificates pkg-config libglib2.0-dev clang make curl git
+
+echo "==> [2/6] 安装 Zig 0.16.0..."
+cd /tmp
+curl -fsSLO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+tar xf zig-x86_64-linux-0.16.0.tar.xz
+rm -rf /usr/local/lib/zig-x86_64-linux-0.16.0
+mv zig-x86_64-linux-0.16.0 /usr/local/lib
+ln -sf /usr/local/lib/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
+rm zig-x86_64-linux-0.16.0.tar.xz
+zig version
+
+echo "==> [3/6] 安装 Rust（国内镜像）..."
+export RUSTUP_DIST_SERVER="https://rsproxy.cn"
+export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y
+export PATH="$HOME/.cargo/bin:$PATH"
+mkdir -p ~/.cargo
+cat > ~/.cargo/config.toml << 'CARGO_EOF'
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+[net]
+git-fetch-with-cli = true
+CARGO_EOF
+
+echo "==> [4/6] 下载 V8 预编译库..."
+cd "$PROJECT_DIR"
+make download-v8
+
+echo "==> [5/6] 编译 release 版本..."
+export LIGHTPANDA_DISABLE_TELEMETRY=1
+# make build  # 默认针对编译机 CPU 优化（AMD EPYC 9T25），可能不兼容 Intel
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译，确保指令集兼容
 make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
 
-# 如需兼容更老的 CPU，改用 -Dcpu=baseline（任何 x86_64 都能跑，性能损失约 5-10%）
+echo "==> [6/6] 安装到 ~/.local/bin..."
+mkdir -p "$HOME/.local/bin"
+cp -f zig-out/bin/lightpanda "$HOME/.local/bin/lightpanda"
 
-# 安装（部署机自行执行，本仓库工作流不代为操作）
-mkdir -p ~/.local/bin
-cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda
+echo ""
+echo "✅ 完成！"
+echo "   命令: lightpanda"
+echo "   启动服务: lightpanda serve --host 0.0.0.0 --port 9222"
 ```
 
-### 5.4 大陆网络下离线抓取依赖（同步上游后如 `build.zig.zon` 有变动才需要）
+**用法**：
+```bash
+# 在项目根目录执行
+chmod +x init.sh && sudo ./init.sh /path/to/browser
+```
 
-上游每次同步都可能 bump `build.zig.zon` 里的依赖版本；本机直连 GitHub 的 HTTPS 抓取会超时，而 SSH 到 GitHub 可用。注意：即使传了 `-Dprebuilt_v8_path`，`.v8` 依赖 tarball（Zig/C 绑定源码）仍必须解析，预编译 `.a` 无法替代它。
+### 5.2 首次编译
 
 ```bash
-# 1) tarball 类依赖（如 v8、curl）——走 GitHub HTTP 镜像
+# 下载 V8 预编译库（127 MB）
+make download-v8
+
+# 编译 release 版本（含 V8 snapshot）
+# make build  # 默认针对编译机 CPU 优化，可能不兼容其他 CPU
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
+
+# 安装到 ~/.local/bin（确保 ~/.local/bin 在 PATH 中）
+mkdir -p ~/.local/bin
+cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda
+
+# 编译 debug 版本
+make build-dev
+
+# 启动服务
+lightpanda serve --host 0.0.0.0 --port 9222
+```
+
+> 本节不包含 `make test`：本分支不维护测试代码（见第三节），测试用例因生产改动而失败属于预期，不作为验收步骤。
+
+### 5.3 增量编译
+
+```bash
+# make build    # 默认针对编译机 CPU 优化
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
+make clean    # 完全清理（保留 V8 缓存）
+```
+
+> **CPU 指令集说明**：编译机为 AMD EPYC 9T25（Zen 5），默认编译会启用 Zen 5 特有指令（如 AVX-512 VNNI/VBMI），这些指令在 Intel Xeon Platinum（Skylake-SP）上不存在，导致运行时 `SIGILL`（非法指令）崩溃。使用 `-Dcpu=skylake_avx512` 确保只生成 Skylake-SP 支持的指令集（AVX-512 F/DQ/CD/BW/VL）。如需兼容更老的 CPU，改用 `-Dcpu=baseline`（任何 x86_64 都能跑，性能损失约 5-10%）。
+
+### 5.4 编译产物
+
+- 可执行文件：`./zig-out/bin/lightpanda`（编译输出）
+- 安装位置：`~/.local/bin/lightpanda`（安装后）
+- V8 snapshot：`src/snapshot.bin`
+- V8 缓存：`.lp-cache/prebuilt-v8/v0.5.4/`
+
+### 5.5 常见问题
+
+```bash
+# html5ever 编译失败 → 检查 Rust
+cargo --version
+
+# Zig 版本不对
+zig version  # 必须 0.16.0
+
+# V8 下载失败 → 手动下载后放入缓存
+mkdir -p .lp-cache/prebuilt-v8/v0.5.4/
+curl -fL -o .lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a \
+  https://github.com/lightpanda-io/zig-v8-fork/releases/download/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a
+```
+
+### 5.6 大陆网络下离线抓取 build.zig.zon 依赖（同步上游后必做）
+
+上游每次同步都可能 bump `build.zig.zon` 里的依赖版本；本机直连 GitHub 的 HTTPS 抓取会超时（`HttpConnectionClosing` / `Timeout`），而 **SSH 到 GitHub 可用**。注意：即使传了 `-Dprebuilt_v8_path`，`.v8` 依赖 tarball（Zig/C 绑定源码）仍必须解析，预编译 `.a` 无法替代它。
+
+按依赖类型分别处理（原理：镜像/SSH 取回的字节与原 GitHub 一致 → `zig fetch` 算出的 hash 与 `build.zig.zon` 精确匹配 → 落全局缓存 `~/.cache/zig/p/`，`build.zig.zon` 一行都不用改）：
+
+```bash
+# 1) tarball 类依赖（如 v8、curl）——走 GitHub HTTP 镜像 ghfast.top
 zig fetch "https://ghfast.top/https://github.com/lightpanda-io/zig-v8-fork/archive/<commit>.tar.gz"
 zig fetch "https://ghfast.top/https://github.com/curl/curl/releases/download/<tag>/<file>.tar.gz"
 
-# 2) git+https 类依赖（如 zenai、isocline）——用 GIT_CONFIG 临时把 https 改写成 SSH
+# 2) git+https 类依赖（如 zenai、isocline）——用 GIT_CONFIG 临时把 https 改写成 SSH，不动全局 git 配置
 GIT_CONFIG_COUNT=1 \
   GIT_CONFIG_KEY_0="url.git@github.com:.insteadOf" \
   GIT_CONFIG_VALUE_0="https://github.com/" \
   zig fetch "git+https://github.com/lightpanda-io/zenai.git#<commit>"
 
-# 3) 全部抓完后验证：应 EXIT=0 且无输出，代表完全离线可解析
+# 3) 预编译 V8 .a（裸二进制，非 zig 包）——走镜像，见 5.1.4 / 5.5
+
+# 全部抓完后验证：应 EXIT=0 且无输出，代表完全离线可解析
 zig build --fetch
 ```
 
-> `zig fetch` 输出的 hash 必须与 `build.zig.zon` 中对应依赖的 `.hash` 完全一致，否则说明字节不同（镜像失效或被篡改）。备选镜像：`https://gh-proxy.com/`。
+> 校验方法：`zig fetch` 输出的 hash 必须与 `build.zig.zon` 中对应依赖的 `.hash` 完全一致，否则说明字节不同（镜像失效或被篡改）。
+> 备选镜像：`https://gh-proxy.com/`（与 `ghfast.top` 等效，可互换）。
 
 ---
 
-## 六、Git 分支管理与上游同步
+## 六、Git 分支管理与上游同步方案
 
-### 6.1 仓库结构
+### 6.1 仓库来源
+
+当前仓库直接克隆自 `lightpanda-io/browser`（官方上游），所有自定义修改在本地 `chrome` 分支上维护。
 
 ```
 官方上游  ──→  lightpanda-io/browser（只读，只拉不推）
                                 │
                                 ▼
-                        本机 main 分支（跟踪上游，保持纯净）
+                        你本机的 main 分支（跟踪上游，保持纯净）
                                 │
-                                ├── chrome 分支 ─── 本文档列出的 8 个文件的改动
+                                ├── chrome 分支 ─── 本文档「一、」列出的 8 个生产文件的改动（不碰测试代码）
 ```
 
-远程：`upstream` = `git@github.com:lightpanda-io/browser.git`，`origin` = 自己的备份仓库。
-
-### 6.2 同步流程
+### 6.2 初始化远程（仅首次）
 
 ```bash
-git checkout main
-git fetch upstream
-git merge upstream/main
+# 当前 origin 指向上游
+# 将 origin 重命名为 upstream（指向官方仓库）
+git remote rename origin upstream
 
-git checkout chrome
-git merge main        # 或 git merge upstream/main
-# 解决冲突：冲突只会出现在本文档「一、修改文件总览」列出的 8 个文件里
-# （测试文件、测试代码块本分支不改动，不会成为冲突点，也不需要关心）
+# 添加自己的远程仓库（你 fork 后的备份）
+git remote add origin https://github.com/ewpkw/browser.git
 
-# 编译验证（只验证生产代码，不要求 make test 全绿）
-make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
+# 验证
+git remote -v
+# 应看到:
+# origin    https://github.com/ewpkw/browser.git (fetch)
+# origin    https://github.com/ewpkw/browser.git (push)
+# upstream  https://github.com/lightpanda-io/browser.git (fetch)
+# upstream  https://github.com/lightpanda-io/browser.git (push)
 ```
 
-### 6.3 如何快速核对当前全部分歧
+### 6.3 创建自定义分支（一次性）
+
+```bash
+# 切到 main，创建 chrome 分支（一次性的，后续同步用 merge）
+git checkout main
+git checkout -b chrome
+
+# 将所有修改 commit 到 chrome 分支
+git add -A
+git commit -m "feat(chrome): 伪装成 Chrome/Edge 浏览器
+
+- 默认 UA 改为 Edge 151
+- Sec-Ch-Ua brands 改为 Not=A?Brand / Microsoft Edge / Chromium
+- 删除 Mozilla UA 校验
+- navigator 属性全部对齐真实浏览器
+- 添加 Sec-Ch-Ua-Platform / Architecture / Bitness / WoW64 等 Client Hint
+- PluginArray.length 改为 5"
+
+# 推送到自己的远程仓库（可选备份）
+git push origin chrome
+```
+
+### 6.4 日常同步上游流程
+
+```bash
+# 1. 切到 main，拉取上游最新代码
+git checkout main
+git fetch upstream
+
+# 2. 更新 main 到最新上游
+git merge upstream/main
+# 此时 main 就是上游的最新代码
+
+# 3. 切回 chrome 分支，将上游更新合并进来
+git checkout chrome
+git merge main
+# 或者用 rebase（更清洁但需 force push）：
+# git rebase main
+
+# 4. 解决冲突（如有）
+#    冲突只会出现在本文档「一、修改文件总览」列出的 8 个文件里，不会涉及任何测试文件
+#    （测试代码本分支不改动，永远与上游一致，因此天然不会冲突，也不需要关心）：
+#    - src/Config.zig              (UA 默认值、brands、sec_ch_ua_* 常量、validateUserAgent、userAgentValidator 提示文案)
+#    - src/help.zon                (--user-agent / --user-agent-suffix 帮助文本)
+#    - src/network/HttpClient.zig  (baselineHeaders: Sec-Ch-Ua 系 header 不能标 .source=.fixed，见 2.3)
+#    - src/browser/webapi/Navigator.zig
+#    - src/browser/webapi/NavigatorUAData.zig (uaPlatform / shortBrandList / fullBrandList)
+#    - src/browser/webapi/PluginArray.zig
+#    - src/browser/webapi/WorkerNavigator.zig (getLanguages 返回类型需跟 Navigator.zig 联动)
+#    - src/server/cdp/domains/emulation.zig (setUserAgentOverride 不处理 error.Reserved)
+
+# 5. 编译验证（只验证生产代码，不要求 make test 全绿）
+# make build    # 默认针对编译机 CPU
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
+
+cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda
+~/.local/bin/lightpanda version
+
+# 6. 备份到自己的远程仓库
+#    如果用 rebase 了需要 force push
+git push origin chrome
+```
+
+### 6.5 冲突预防：最小 diff 原则
+
+为了降低每次合并上游时的冲突概率：
+
+1. **只改必要行**：每次修改尽量集中在一两行内，不要大面积重构。
+2. **不碰测试代码**：测试文件、`test {}` 块一律不改动、不同步；遇到测试因生产改动而失败也不修（见第三节）。这确保冲突面只有生产代码这 8 个文件，测试相关永远是上游原版，不会成为同步障碍。
+3. **记录冲突文件**：对冲突热点了如指掌（就是「一、」里的 8 个文件），合并时直奔目标。
+
+### 6.6 同步节奏建议
+
+| 频率 | 操作 |
+|------|------|
+| 每周 | `git fetch upstream` 查看上游变动 |
+| 有冲突时 | 执行完整 merge/rebase 流程 |
+| 上游大版本更新 | 特别注意 build.zig.zon 依赖版本变化 |
+
+### 6.7 如何快速核对当前全部分歧
 
 任何时候都可以用这一条命令拿到当前 `chrome` 分支相对上游最新的完整改动清单，不用翻历史 commit：
 
@@ -496,4 +722,30 @@ make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-
 git diff upstream/main..HEAD --stat
 ```
 
-预期结果应该只有本文档「一」里列出的 8 个文件。如果哪天跑出来多了别的文件（尤其是测试文件），说明有人在测试相关的地方做了不该做的改动，需要按「三、关于测试代码」的原则回退掉。
+预期结果应该只有本文档「一」里列出的 8 个文件（外加本文档自己 `CHROME.md`）。如果哪天跑出来多了别的文件（尤其是测试文件），说明有人在测试相关的地方做了不该做的改动，需要按「三、关于测试代码」的原则回退掉。
+
+---
+
+## 七、验证方法
+
+修改完成后，通过以下方式验证（不要求 `make test` 全绿，见第三节，下面只列生产相关验证）：
+
+```bash
+# 1. 编译
+# make build  # 默认针对编译机 CPU 优化
+# 针对 Intel Skylake-SP (Xeon Platinum) 编译
+make build ZIGFLAGS="-Dcpu=skylake_avx512 -Dprebuilt_v8_path=.lp-cache/prebuilt-v8/v0.5.4/libc_v8_14.9.207.35_linux_x86_64.a"
+
+# 2. 访问指纹检测网站
+lightpanda fetch --url "https://bot.sannysoft.com" --dump html
+lightpanda fetch --url "https://abrahamjuliot.github.io/creepjs/" --dump html
+lightpanda fetch --url "https://www.browserscan.net/bot-detection" --dump html
+
+# 3. 验证 HTTP 请求头
+lightpanda fetch --url "https://httpbin.org/headers" --dump html
+# 确认返回的 headers 中包含：
+# - User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...
+# - Sec-Ch-Ua: "Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"
+# - Sec-Ch-Ua-Platform: "Windows"
+# - Accept-Language: en-US,en;q=0.9
+```
