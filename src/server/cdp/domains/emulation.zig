@@ -307,7 +307,9 @@ test "cdp.Emulation: setUserAgentOverride with valid user agent" {
     try ctx.expectSentResult(null, .{ .id = 1 });
 }
 
-test "cdp.Emulation: setUserAgentOverride accepts Mozilla user agent" {
+test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
+    testing.silenceLog(&.{.not_implemented});
+
     var ctx = try testing.context();
     defer ctx.deinit();
     _ = try ctx.loadBrowserContext(.{ .id = "BID-UA2" });
@@ -315,11 +317,28 @@ test "cdp.Emulation: setUserAgentOverride accepts Mozilla user agent" {
     try ctx.processMessage(.{
         .id = 2,
         .method = "Emulation.setUserAgentOverride",
-        .params = .{ .userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36" },
+        .params = .{ .userAgent = "Mozilla/5.0 (Windows NT 10.0)" },
     });
 
-    try ctx.expectSentResult(null, .{ .id = 2 });
-    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
+    try ctx.expectSentResult(null, .{});
+    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
+}
+
+test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
+    testing.silenceLog(&.{.not_implemented});
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-UA3" });
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Emulation.setUserAgentOverride",
+        .params = .{ .userAgent = "MOZILLA/5.0 test" },
+    });
+
+    try ctx.expectSentResult(null, .{});
+    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
 }
 
 test "cdp.Emulation: setUserAgentOverride rejects non-printable characters" {

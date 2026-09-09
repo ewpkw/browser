@@ -843,11 +843,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: XHR" {
-    // xhr_request_headers no longer drops the author-set User-Agent or
-    // Sec-Ch-Ua (this branch accepts Mozilla UAs and doesn't mark Sec-Ch-Ua
-    // as fixed), so it no longer accounts for 2 of the 3 expected http
-    // warnings; the remaining 1 is unrelated to header layering.
-    testing.expectLog(&.{.http});
+    testing.expectLog(&.{ .http, .http, .http });
     try testing.htmlRunner("net/xhr.html", .{});
 }
 

@@ -4515,9 +4515,10 @@ test "HttpClient: Transfer header layering" {
     try transfer.appendHeader("SEC-CH-UA", "\"Chromium\";v=\"140\"", .{ .source = .author });
     try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
 
-    // this branch accepts a Mozilla User-Agent instead of dropping it
+    // an invalid User-Agent never enters the list
+    testing.expectLog(&.{.http});
     try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
-    try testing.expectEqual("Mozilla/5.0", transfer.findRequestHeader("user-agent").?);
+    try testing.expectEqual("Lightpanda/1.0", transfer.findRequestHeader("user-agent").?);
 
     // a valid author User-Agent replaces the default
     try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });

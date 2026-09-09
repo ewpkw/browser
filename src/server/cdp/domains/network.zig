@@ -797,7 +797,9 @@ test "cdp.network setExtraHTTPHeaders rejects non-printable User-Agent" {
     try testing.expectEqual("hi", bc.extra_headers.items[0].value);
 }
 
-test "cdp.network setExtraHTTPHeaders accepts a Mozilla User-Agent" {
+test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent" {
+    testing.silenceLog(&.{.cdp});
+
     var ctx = try testing.context();
     defer ctx.deinit();
 
@@ -806,11 +808,11 @@ test "cdp.network setExtraHTTPHeaders accepts a Mozilla User-Agent" {
     try ctx.processMessage(.{
         .id = 3,
         .method = "Network.setExtraHTTPHeaders",
-        .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } },
+        .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0" } },
     });
 
     const bc = ctx.cdp().browser_context.?;
-    try testing.expectEqual(bc.extra_headers.items.len, 1);
+    try testing.expectEqual(bc.extra_headers.items.len, 0);
 }
 
 test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
@@ -829,27 +831,24 @@ test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
     try testing.expectEqual(bc.extra_headers.items.len, 1);
 }
 
-test "cdp.network setExtraHTTPHeaders rejects a header name smuggling a colon" {
+test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent smuggled via a colon in the key" {
     testing.silenceLog(&.{.cdp});
 
     var ctx = try testing.context();
     defer ctx.deinit();
 
-    const bc = try ctx.loadBrowserContext(.{ .id = "NID-UA4", .session_id = "NESI-UA4" });
+    _ = try ctx.loadBrowserContext(.{ .id = "NID-UA4", .session_id = "NESI-UA4" });
 
-    // A colon in the key desyncs the raw key from the first-colon parse that
-    // req.headers.set/libcurl use: "User-Agent:Mozilla/5.0 (X: Y)" parses to
+    // A colon in the key would desync the stored name from what lands on the
+    // wire once the pair is joined: "User-Agent:Mozilla/5.0 (X: Y)" parses to
     // name="User-Agent", value="Mozilla/5.0 (X: Y)" on the wire.
-    // This has nothing to do with the value containing "Mozilla" (this branch
-    // accepts Mozilla User-Agents, see the test above): a colon is simply not
-    // a valid HTTP token character, so the name is rejected regardless of what
-    // it smuggles.
     try ctx.processMessage(.{
         .id = 3,
         .method = "Network.setExtraHTTPHeaders",
         .params = .{ .headers = .{ .@"User-Agent:Mozilla/5.0 (X" = "Y)" } },
     });
 
+    const bc = ctx.cdp().browser_context.?;
     try testing.expectEqual(bc.extra_headers.items.len, 0);
 }
 
@@ -867,7 +866,7 @@ test "cdp.network setExtraHTTPHeaders rejects a header that smuggles CRLF" {
         .id = 3,
         .method = "Network.setExtraHTTPHeaders",
         .params = .{ .headers = .{
-            .@"x-custom" = "bar\r\nUser-Agent: CustomBot/1.0",
+            .@"x-custom" = "bar\r\nUser-Agent: Mozilla/5.0",
             .@"x-keep" = "ok",
         } },
     });

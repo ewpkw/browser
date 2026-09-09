@@ -1214,15 +1214,11 @@ test "Config: advertiseHost preserves concrete host when not a wildcard" {
     try std.testing.expectEqualStrings("127.0.0.1", config.advertiseHost());
 }
 
-test "Config: parseArgs accepts a mozilla user-agent" {
-    // parseArgs allocations live for the process; an arena stands in for main's.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36" };
+test "Config: parseArgs refuses a mozilla user-agent" {
+    log.expectLog(&.{.app});
+    const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "mozilla/1.0" };
     const proc_args: std.process.Args = .{ .vector = &argv };
-    const config = try parseArgs(arena.allocator(), proc_args);
-    try std.testing.expectEqualStrings("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36", config.userAgent().?);
+    try std.testing.expectError(error.InvalidArgument, parseArgs(std.testing.allocator, proc_args));
 }
 
 test "Config: parseArgs --http-version" {
@@ -1252,8 +1248,8 @@ test "Config: parseArgs --http-version" {
 
 test "Config: validateUserAgent" {
     try validateUserAgent("Lightpanda/1.0");
-    try validateUserAgent("mozilla/1.0");
-    try validateUserAgent("Mozilla/5.0");
+    try std.testing.expectError(error.Reserved, validateUserAgent("mozilla/1.0"));
+    try std.testing.expectError(error.Reserved, validateUserAgent("Mozilla/5.0"));
     try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua"));
 }
 

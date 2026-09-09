@@ -535,6 +535,7 @@ test "tests:beforeAll" {
     test_config = try Config.init(test_allocator, "test", .{
         .serve = .{
             .insecure_disable_tls_host_verification = true,
+            .user_agent_suffix = "internal-tester",
             .ws_max_concurrent = 50,
             .load_resources = .{ .worker = true, .iframe = true },
             .watchdog_ms = 0,

@@ -317,9 +317,7 @@ fn httpShutdownCallback(ctx: *anyopaque) void {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: fetch" {
-    // fetch_header_layers no longer drops the author-set User-Agent or
-    // Sec-Ch-Ua (this branch accepts Mozilla UAs and doesn't mark Sec-Ch-Ua
-    // as fixed), so it emits no http warnings.
+    testing.expectLog(&.{ .http, .http });
     try testing.htmlRunner("net/fetch.html", .{});
     try testing.htmlRunner("net/fetch_hash_route.html", .{});
 }
