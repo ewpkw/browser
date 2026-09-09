@@ -157,8 +157,24 @@ pub fn setValue(self: *Input, value: []const u8, frame: *Frame) !void {
         return error.InvalidStateError;
     }
     // This should _not_ call setAttribute. It updates the current state only
-    self._value = try self.sanitizeValue(true, value, frame);
+    const sanitized = try self.sanitizeValue(false, value, frame);
+    const changed = std.mem.eql(u8, self.getValue(), sanitized) == false;
+    if (changed == false and self._value != null) {
+        // _value itself isn't changing (not to be mixed up with setValue
+        // being called with the same as the default value, which would need
+        // to dupe)
+        self._user_edited = false;
+        return;
+    }
+    self._value = try frame.dupeString(sanitized);
     self._user_edited = false;
+
+    // move the text entry cursor position to the end of the text control
+    if (changed and self.selectionAvailable()) {
+        self._selection_start = @intCast(sanitized.len);
+        self._selection_end = @intCast(sanitized.len);
+        self._selection_direction = .none;
+    }
 }
 
 pub fn setUserValue(self: *Input, value: []const u8, frame: *Frame) !void {
@@ -485,7 +501,7 @@ const RadioGroupIterator = struct {
             const other_element = node.is(Element) orelse continue;
             const other_input = other_element.is(Input) orelse continue;
             if (other_input._input_type != .radio) continue;
-            const other_name = other_element.getAttributeSafe(comptime .wrap("name")) orelse continue;
+            const other_name = other_element.getName() orelse continue;
             if (!std.mem.eql(u8, self.name, other_name)) continue;
             return other_input;
         }
@@ -499,7 +515,7 @@ const RadioGroupIterator = struct {
 /// because nothing in the iteration mutates the tree.
 fn radioGroupIterator(self: *const Input) ?RadioGroupIterator {
     const element = self.asConstElement();
-    const name = element.getAttributeSafe(comptime .wrap("name")) orelse return null;
+    const name = element.getName() orelse return null;
     if (name.len == 0) return null;
     const root = @constCast(element.asConstNode()).getRootNode(.{});
     return .{
@@ -573,7 +589,7 @@ fn codepointCount(value: []const u8) usize {
 }
 
 pub fn getDisabled(self: *const Input) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("disabled")) != null;
+    return self.asConstElement().getAttributeInterned("disabled") != null;
 }
 
 pub fn setDisabled(self: *Input, disabled: bool, frame: *Frame) !void {
@@ -593,7 +609,7 @@ pub fn getMinLength(self: *const Input) i32 {
 }
 
 pub fn getSrc(self: *const Input, frame: *Frame) ![]const u8 {
-    const src = self.asConstElement().getAttributeSafe(comptime .wrap("src")) orelse return "";
+    const src = self.asConstElement().getAttributeInterned("src") orelse return "";
     return self.asConstElement().asConstNode().resolveURLReflect(src, frame, .{});
 }
 
@@ -607,6 +623,8 @@ const entry = text_entry.TextEntry(Input);
 pub const select = entry.select;
 pub const innerInsert = entry.innerInsert;
 pub const innerDelete = entry.innerDelete;
+pub const moveCaret = entry.moveCaret;
+pub const CaretMove = entry.CaretMove;
 pub const getSelectionDirection = entry.getSelectionDirection;
 pub const setSelectionStart = entry.setSelectionStart;
 pub const setSelectionEnd = entry.setSelectionEnd;
@@ -759,7 +777,7 @@ fn sanitizeValue(self: *Input, comptime dupe: bool, value: []const u8, frame: *F
         .@"datetime-local" => return try sanitizeDatetimeLocal(dupe, value, frame.arena),
         .number => return if (isValidFloatingPoint(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
         .range => {
-            const value_attr = self.asConstElement().getAttributeSafe(comptime .wrap("value")) orelse "";
+            const value_attr = self.asConstElement().getAttributeInterned("value") orelse "";
             return try sanitizeRange(dupe, value, self.getMin(), self.getMax(), self.getStep(), value_attr, frame);
         },
         .color => {
@@ -877,7 +895,7 @@ fn stepBy(self: *Input, n: i32, frame: *Frame) !void {
 fn stepBase(self: *const Input) f64 {
     const typ = self._input_type;
     if (valueToNumber(typ, self.getMin())) |min| return min;
-    if (valueToNumber(typ, self.asConstElement().getAttributeSafe(comptime .wrap("value")) orelse "")) |v| return v;
+    if (valueToNumber(typ, self.asConstElement().getAttributeInterned("value") orelse "")) |v| return v;
     return if (typ == .week) -259_200_000 else 0;
 }
 
@@ -1416,7 +1434,7 @@ pub fn getMin(self: *const Input) []const u8 {
 }
 
 pub fn getRequired(self: *const Input) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("required")) != null;
+    return self.asConstElement().getAttributeInterned("required") != null;
 }
 
 pub fn getStep(self: *const Input) []const u8 {
@@ -1504,12 +1522,12 @@ pub const Build = struct {
         const element = self.asElement();
 
         // Store initial values from attributes
-        self._default_value = element.getAttributeSafe(comptime .wrap("value"));
-        self._default_checked = element.getAttributeSafe(comptime .wrap("checked")) != null;
+        self._default_value = element.getAttributeInterned("value");
+        self._default_checked = element.getAttributeInterned("checked") != null;
 
         self._checked = self._default_checked;
 
-        self._input_type = if (element.getAttributeSafe(comptime .wrap("type"))) |type_attr|
+        self._input_type = if (element.getAttributeInterned("type")) |type_attr|
             Type.fromString(type_attr)
         else
             .text;

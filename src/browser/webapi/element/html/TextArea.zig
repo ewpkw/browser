@@ -79,9 +79,24 @@ pub fn getValue(self: *const TextArea) []const u8 {
 }
 
 pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
+    const changed = std.mem.eql(u8, self.getValue(), value) == false;
+    if (changed == false and self._value != null) {
+        // _value itself isn't changing (not to be mixed up with setValue
+        // being called with the same as the default value, which would need
+        // to dupe)
+        self._user_edited = false;
+        return;
+    }
     const owned = try frame.arena.dupe(u8, value);
     self._value = owned;
     self._user_edited = false;
+
+    // move the text entry cursor position to the end of the text control
+    if (changed) {
+        self._selection_start = @intCast(owned.len);
+        self._selection_end = @intCast(owned.len);
+        self._selection_direction = .none;
+    }
 }
 
 pub fn setUserValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
@@ -126,6 +141,8 @@ const entry = text_entry.TextEntry(TextArea);
 pub const select = entry.select;
 pub const innerInsert = entry.innerInsert;
 pub const innerDelete = entry.innerDelete;
+pub const moveCaret = entry.moveCaret;
+pub const CaretMove = entry.CaretMove;
 pub const getSelectionDirection = entry.getSelectionDirection;
 pub const setSelectionStart = entry.setSelectionStart;
 pub const setSelectionEnd = entry.setSelectionEnd;
@@ -248,11 +265,11 @@ pub fn suffersTooShort(self: *const TextArea) bool {
 }
 
 pub fn getDisabled(self: *const TextArea) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("disabled")) != null;
+    return self.asConstElement().getAttributeInterned("disabled") != null;
 }
 
 pub fn getRequired(self: *const TextArea) bool {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("required")) != null;
+    return self.asConstElement().getAttributeInterned("required") != null;
 }
 
 pub const JsApi = struct {

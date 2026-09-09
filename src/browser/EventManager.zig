@@ -26,9 +26,11 @@ const EventManagerBase = @import("EventManagerBase.zig");
 const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
 const Window = @import("webapi/Window.zig");
-const EventTarget = @import("webapi/EventTarget.zig");
 const Element = @import("webapi/Element.zig");
 const ShadowRoot = @import("webapi/ShadowRoot.zig");
+const Performance = @import("webapi/Performance.zig");
+const EventTarget = @import("webapi/EventTarget.zig");
+const MediaQueryList = @import("webapi/css/MediaQueryList.zig");
 const XMLHttpRequestEventTarget = @import("webapi/net/XMLHttpRequestEventTarget.zig");
 
 const log = lp.log;
@@ -87,6 +89,8 @@ pub fn dispatch(self: *EventManager, target: *EventTarget, event: *Event) Dispat
     switch (target._type) {
         .node => try self.dispatchNode(target.subtype(Node), event),
         .xhr => try self.dispatchDirect(target, event, target.subtype(XMLHttpRequestEventTarget).inlineHandler(event._type_string), .{ .context = "dispatch" }),
+        .media_query_list => try self.dispatchDirect(target, event, target.subtype(MediaQueryList).inlineHandler(event._type_string), .{ .context = "dispatch" }),
+        .performance => try self.dispatchDirect(target, event, target.subtype(Performance).inlineHandler(event._type_string), .{ .context = "dispatch" }),
         .window => try self.dispatchDirect(target, event, windowInlineHandler(target.subtype(Window), event._type_string), .{ .context = "dispatch" }),
         else => try self.dispatchDirect(target, event, null, .{ .context = "dispatch" }),
     }
@@ -788,7 +792,7 @@ const ActivationState = struct {
     fn findCheckedRadioInGroup(input: *Input, frame: *Frame) !?*Input {
         const elem = input.asElement();
 
-        const name = elem.getAttributeSafe(comptime .wrap("name")) orelse return null;
+        const name = elem.getName() orelse return null;
         if (name.len == 0) {
             return null;
         }
@@ -815,7 +819,7 @@ const ActivationState = struct {
                 continue;
             }
 
-            const other_name = other_element.getAttributeSafe(comptime .wrap("name")) orelse continue;
+            const other_name = other_element.getName() orelse continue;
             if (!std.mem.eql(u8, name, other_name)) {
                 continue;
             }

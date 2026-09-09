@@ -239,7 +239,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                 if (element._namespace != .html) {
                     continue;
                 }
-                const element_name = element.getAttributeSafe(comptime .wrap("name")) orelse continue;
+                const element_name = element.getName() orelse continue;
                 if (std.mem.eql(u8, element_name, name)) {
                     return element;
                 }
@@ -309,7 +309,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                     }
 
                     const el = node.is(Element) orelse return false;
-                    const class_attr = el.getAttributeSafe(comptime .wrap("class")) orelse return false;
+                    const class_attr = el.getAttributeInterned("class") orelse return false;
                     for (self._filter.names) |class_name| {
                         if (!Selector.classAttributeContainsCase(class_attr, class_name, self._filter.case_insensitive)) {
                             return false;
@@ -321,7 +321,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                     const el = node.is(Element) orelse return false;
                     // getElementsByName only considers HTML elements.
                     if (el._namespace != .html) return false;
-                    const name_attr = el.getAttributeSafe(comptime .wrap("name")) orelse return false;
+                    const name_attr = el.getName() orelse return false;
                     return std.mem.eql(u8, name_attr, self._filter);
                 },
                 .all_elements => return node._type == .element,
@@ -361,14 +361,14 @@ pub fn NodeLive(comptime mode: Mode) type {
                     const el = node.is(Element) orelse return false;
                     const Anchor = Element.Html.Anchor;
                     if (el.is(Anchor) == null) return false;
-                    return el.hasAttributeSafe(comptime .wrap("href"));
+                    return el.hasAttributeInterned("href");
                 },
                 .anchors => {
                     // Anchors are <a> elements with name attribute
                     const el = node.is(Element) orelse return false;
                     const Anchor = Element.Html.Anchor;
                     if (el.is(Anchor) == null) return false;
-                    return el.hasAttributeSafe(comptime .wrap("name"));
+                    return el.hasName();
                 },
                 .form => {
                     const el = node.is(Element) orelse return false;

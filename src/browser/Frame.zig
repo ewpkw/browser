@@ -37,6 +37,7 @@ const URL = @import("URL.zig");
 const referrer = @import("referrer.zig");
 const Blob = @import("webapi/Blob.zig");
 const FileList = @import("webapi/FileList.zig");
+const MediaQueryList = @import("webapi/css/MediaQueryList.zig");
 const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
@@ -190,6 +191,10 @@ _event_target_attr_listeners: GlobalEventHandlersLookup = .empty,
 // File objects (reference counted via their Blob proto); released at teardown.
 _file_lists: std.ArrayList(*FileList) = .empty,
 
+// Every matchMedia() result of this document, so a viewport change can fire
+// their `change`.
+_media_query_lists: std.ArrayList(*MediaQueryList) = .empty,
+
 /// Element `load`/`error` events queued to fire on the next scheduler tick,
 /// and flushed before window's `load` event.
 /// A call to `documentIsComplete` (which calls `_documentIsComplete`) resets it.
@@ -240,11 +245,19 @@ _upgrading_element: ?*Node = null,
 // during upgrade is a TypeError.
 _upgrading_consumed: bool = false,
 
-// Set when materializing the fragment parser's context element. The element
-// is never inserted into the tree so if its a custom element ,we must not run
-// its constructor (else we'll end up in an endless loop if the constructor
-// sets this.innerHTML = '...', which happens).
-_skip_custom_element_upgrade: bool = false,
+// How node_factory creates an element with a hyphenated HTML tag name.
+_custom_element_creation: enum {
+    // Look the definition up in this frame's registry and run the
+    // constructor synchronously.
+    construct,
+    // Fragment-parse context element. Not inserted into the tree, so its
+    // constructor must not run (you end up in an endless loop if the constructor
+    // does this.innerHTML = '...', which happens).
+    bare_context,
+    // The target document has no custom element registry (e.g. DOMParser). The
+    // element stays undefined until it's inserted into the frame's document.
+    undefined,
+} = .construct,
 
 // List of custom elements that were created before their definition was registered
 _undefined_custom_elements: std.ArrayList(*Element.Html.Custom) = .empty,
@@ -431,7 +444,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         ._proto = undefined,
         ._document = self.document,
         ._location = undefined,
-        ._performance = .init(factory, arena),
+        ._performance = try .init(factory, arena),
         ._screen = screen,
         ._visual_viewport = visual_viewport,
         ._cross_origin_wrapper = undefined,
@@ -457,7 +470,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .loader_id = self._loader_id,
         .cookie_jar = &session.cookie_jar,
         .notification = session.notification,
-        .performance = &self.window._performance,
+        .performance = self.window._performance,
     };
 
     self._style_manager = try StyleManager.init(self);
@@ -474,7 +487,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .local_arena = self.local_arena,
     });
     errdefer browser.env.destroyContext(self.js);
-    self.window._performance._scheduler = &self.js.scheduler;
+    self.window._performance.attach(self.js);
 
     const location = try Location.init("about:blank", self);
     // We're holding a reference in Zig-side.
@@ -594,6 +607,17 @@ pub fn deinit(self: *Frame) void {
 
     self._call_arena.release();
     self._local_arena.release();
+}
+
+pub fn viewportChanged(self: *Frame) void {
+    var i: usize = 0;
+    while (i < self._media_query_lists.items.len) : (i += 1) {
+        self._media_query_lists.items[i].viewportChanged();
+    }
+    i = 0;
+    while (i < self.child_frames.items.len) : (i += 1) {
+        self.child_frames.items[i].viewportChanged();
+    }
 }
 
 pub fn trackWorker(self: *Frame, worker: *Worker) !void {
@@ -1619,7 +1643,9 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
         // to sniff the content type
         var mime: Mime = blk: {
             if (transfer.contentType()) |ct| {
-                break :blk try Mime.parse(ct);
+                // A Content-Type we can't parse must not fail the navigation;
+                // browsers render the page anyway, so fall back to sniffing.
+                break :blk Mime.parseLenient(ct) catch Mime.sniff(data);
             }
             break :blk Mime.sniff(data);
         } orelse .unknown;
@@ -1925,7 +1951,7 @@ pub fn scriptAddedCallback(self: *Frame, comptime from_parser: bool, script: *El
         log.err(.frame, "frame.scriptAddedCallback", .{
             .err = err,
             .url = self.url,
-            .src = script.asElement().getAttributeSafe(comptime .wrap("src")),
+            .src = script.asElement().getAttributeInterned("src"),
             .type = self._type,
         });
     };
@@ -1951,7 +1977,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
             break :blk "about:srcdoc";
         }
 
-        var src = iframe.asElement().getAttributeSafe(comptime .wrap("src")) orelse "";
+        var src = iframe.asElement().getAttributeInterned("src") orelse "";
         if (src.len == 0) {
             src = "about:blank";
         }
@@ -2251,7 +2277,7 @@ pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Eleme
     // exists, so scan it.
     var tw = TreeWalker.Full.Elements.init(node, .{});
     while (tw.next()) |el| {
-        const element_id = el.getAttributeSafe(comptime .wrap("id")) orelse continue;
+        const element_id = el.getId() orelse continue;
         if (std.mem.eql(u8, element_id, id)) {
             return el;
         }
@@ -2260,7 +2286,7 @@ pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Eleme
 }
 
 pub fn performance(self: *Frame) *Performance {
-    return &self.window._performance;
+    return self.window._performance;
 }
 
 // Tracks a file input's FileList so its File refs are released at teardown.
@@ -2721,7 +2747,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
     // the ID map and invoking disconnectedCallback for custom elements
     var tw = TreeWalker.Full.Elements.init(child, .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+        if (el.getId()) |id| {
             self.removeElementIdWithMaps(old_id_maps.?, id);
         }
 
@@ -2764,7 +2790,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
 fn unregisterSubtreeIds(self: *Frame, node: *Node, id_maps: ElementIdMaps) void {
     var tw = TreeWalker.Full.Elements.init(node, .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+        if (el.getId()) |id| {
             self.removeElementIdWithMaps(id_maps, id);
         }
     }
@@ -2935,7 +2961,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
             // For main document parsing we know nodes are connected (fast path);
             // for fragment parsing (innerHTML) we check connectivity.
             if (child.isConnected() or child.isInShadowTree()) {
-                if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+                if (el.getId()) |id| {
                     try self.addElementId(parent, el, id);
                 }
                 try Element.Html.Custom.enqueueConnectedCallbackOnElement(true, el, self);
@@ -2989,7 +3015,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
                 // id to the new parent...
                 var tw = TreeWalker.Full.Elements.init(child, .{});
                 while (tw.next()) |el| {
-                    if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+                    if (el.getId()) |id| {
                         try self.addElementIdWithMaps(new_id_maps, el, id);
                     }
                 }
@@ -3009,7 +3035,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
 
     var tw = TreeWalker.Full.Elements.init(child, .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+        if (el.getId()) |id| {
             try self.addElementIdWithMaps(new_id_maps, el, id);
         }
 
@@ -3507,7 +3533,7 @@ pub fn openBlankTarget(self: *Frame, element: *Element, url: []const u8) !*Frame
 }
 
 fn hasRelToken(element: *Element, token: []const u8) bool {
-    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return false;
+    const rel = element.getAttributeInterned("rel") orelse return false;
     var it = std.mem.tokenizeAny(u8, rel, &std.ascii.whitespace);
     while (it.next()) |t| {
         if (std.ascii.eqlIgnoreCase(t, token)) {
@@ -3521,7 +3547,7 @@ fn findFrameByName(frame: *Frame, name: []const u8) ?*Frame {
     for (frame.child_frames.items) |f| {
         if (f.iframe) |iframe| {
             if (iframe.asNode().isConnected()) {
-                const frame_name = iframe.asElement().getAttributeSafe(comptime .wrap("name")) orelse "";
+                const frame_name = iframe.asElement().getName() orelse "";
                 if (std.mem.eql(u8, frame_name, name)) {
                     return f;
                 }
@@ -3552,7 +3578,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
     }
 
     if (submitter_) |submitter| {
-        if (submitter.getAttributeSafe(comptime .wrap("disabled")) != null) {
+        if (submitter.getAttributeInterned("disabled") != null) {
             return;
         }
     }
@@ -3574,7 +3600,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
                 break :blk ft;
             }
         }
-        break :blk form_element.getAttributeSafe(comptime .wrap("target"));
+        break :blk form_element.getAttributeInterned("target");
     };
 
     const target: TargetFrame = blk: {
@@ -3665,7 +3691,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         if (submit_button) |s| {
             if (s.getAttributeSafe(comptime .wrap("formmethod"))) |fm| break :blk fm;
         }
-        break :blk form_element.getAttributeSafe(comptime .wrap("method"));
+        break :blk form_element.getAttributeInterned("method");
     };
     const method = Element.Html.Form.normalizeMethod(method_attr, "get");
 
@@ -3721,7 +3747,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         if (submit_button) |s| {
             if (s.getAttributeSafe(comptime .wrap("formaction"))) |fa| break :blk fa;
         }
-        break :blk form_element.getAttributeSafe(comptime .wrap("action")) orelse self.url;
+        break :blk form_element.getAttributeInterned("action") orelse self.url;
     };
 
     var opts = NavigateOpts{

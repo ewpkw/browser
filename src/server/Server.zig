@@ -695,13 +695,11 @@ const Worker = struct {
         Worker.notifyLoopOfChange(server, .{ .ws = ws, .op = .{ .attach = driver } });
         driver.run();
         // Release first: until the loop has let go of this websocket it can
-        // still drop the link, and onLinkDisconnect requests a terminate. Doing
-        // it the other way round left that request landing after the cancel,
-        // so the teardown below ran with a pending terminate -- which is the
-        // one thing the cancel is here to prevent (cdp.deinit() and
-        // bidi.deinit() in our caller need V8 in a usable state).
+        // still drop the link, and onLinkDisconnect requests a terminate.
         Worker.releaseConnection(server, ws);
-        driver.browser.env.cancelTerminate();
+
+        // CDP/BiDi close the session before Browser.deinit, so disarm now.
+        driver.browser.prepareForTeardown();
     }
 
     // Worker -> loop: synchronous release. Blocks until the loop has dropped the
@@ -2136,6 +2134,7 @@ const LoopTest = struct {
         try posix.setsockopt(client, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout);
 
         const before = self.server.http_connections.last;
+        try pollReadable(self.server.listener);
         try self.server.accept(lp.datetime.milliTimestamp(.boot));
 
         const node = self.server.http_connections.last orelse return error.NotAccepted;
@@ -2143,6 +2142,16 @@ const LoopTest = struct {
             return error.NotAccepted;
         }
         return .{ client, @fieldParentPtr("node", node) };
+    }
+
+    // macOS delivers loopback traffic asynchronously: right after connect()
+    // or write() returns, the peer's accept queue or read buffer can still be
+    // empty. Linux processes it inline, so these tests never waited there.
+    fn pollReadable(fd: posix.socket_t) !void {
+        var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&pfd, 1000) == 0) {
+            return error.Timeout;
+        }
     }
 };
 
@@ -2153,13 +2162,14 @@ test "server: a shutdown in the same batch as a readable connection" {
     var lt = try LoopTest.init();
     defer lt.deinit();
 
-    const client, _ = try lt.accept();
+    const client, const conn = try lt.accept();
     defer sys_net.close(client);
 
     // shutdown first...
     lt.server.shutdown();
     // ...then the request, so it lands behind it in the batch
     try sys_net.writeAll(client, "GET /json/version HTTP/1.1\r\n\r\n");
+    try LoopTest.pollReadable(conn.socket);
 
     // beginShutdown drops every http connection, so running it where it
     // arrived left the rest of the batch pointing at a recycled (or freed)
@@ -2173,7 +2183,7 @@ test "server: an accept at the connection limit in the same batch as a readable 
     var lt = try LoopTest.init();
     defer lt.deinit();
 
-    const client, _ = try lt.accept();
+    const client, const conn = try lt.accept();
     defer sys_net.close(client);
 
     // one connection, and no room for another: the next accept has to make
@@ -2184,8 +2194,12 @@ test "server: an accept at the connection limit in the same batch as a readable 
     // the accept first...
     const second = try sys_net.connect(&lt.address);
     defer sys_net.close(second);
+    // the listener has to be in the batch too, or runOnce() sees the request
+    // alone and saturated() -- the thing under test -- never runs
+    try LoopTest.pollReadable(lt.server.listener);
     // ...then the request, so it lands behind it in the batch
     try sys_net.writeAll(client, "GET /json/version HTTP/1.1\r\n\r\n");
+    try LoopTest.pollReadable(conn.socket);
 
     // saturated() picks the idle connection to drop, which is the one the
     // batch is still holding a pointer to. Its request comes first.
@@ -2258,7 +2272,8 @@ test "server: accepted sockets get TCP keepalive" {
     var value: c_int = 0;
     var len: posix.socklen_t = @sizeOf(c_int);
     try testing.expectEqual(0, std.c.getsockopt(conn.socket, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &value, &len));
-    try testing.expectEqual(1, value);
+    // BSD reports the option bit (8), Linux reports 1
+    try testing.expect(value != 0);
 
     http.disconnect(lt.server, conn);
 }
@@ -2289,6 +2304,7 @@ test "server: http connections stay ordered by deadline" {
     const client_a, const conn_a = try lt.accept();
     defer sys_net.close(client_a);
     try sys_net.writeAll(client_a, "GET /json/version HTTP/1.1\r\n\r\n");
+    try LoopTest.pollReadable(conn_a.socket);
     const readable: IOEvent.ReadWrite = .{ .target = .{ .http = conn_a }, .readable = true, .writable = false, .hangup = false };
     http.processEvent(lt.server, conn_a, readable, lp.datetime.milliTimestamp(.boot));
 

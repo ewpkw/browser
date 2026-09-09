@@ -570,7 +570,8 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
     var fragment: ?*Node = null;
     if (html.len > 0) {
         const frag = (try Node.DocumentFragment.init(frame)).asNode();
-        try Frame.parse.htmlAsChildren(frame, frag, html);
+        // The parent is the parse context (a fragment parent means body).
+        try Frame.parse.fragment(frame, frag, html, .{ .context = parent.is(Element) });
         fragment = frag;
     }
 
@@ -620,41 +621,52 @@ pub fn getHTML(self: *Element, opts: dump.Opts.Shadow.Declarative, writer: *std.
 
 pub fn setInnerHTML(self: *Element, html: []const u8, frame: *Frame) !void {
     const parent = self.asNode();
-    return parent.setHTML(html, false, frame);
+    return parent.setHTML(html, .{}, frame);
 }
 
 /// allows declarative shadow dom
 pub fn setHTMLUnsafe(self: *Element, html: []const u8, frame: *Frame) !void {
     const parent = self.asNode();
-    return parent.setHTML(html, true, frame);
+    return parent.setHTML(html, .{ .allow_declarative_shadow = true }, frame);
 }
 
-pub fn getId(self: *const Element) []const u8 {
-    return self.getAttributeSafe(comptime .wrap("id")) orelse "";
+pub fn getId(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("id");
 }
 
 pub fn setId(self: *Element, value: []const u8, frame: *Frame) !void {
     return self.setAttributeSafe(comptime .wrap("id"), .wrap(value), frame);
 }
 
-pub fn getSlot(self: *const Element) []const u8 {
-    return self.getAttributeSafe(comptime .wrap("slot")) orelse "";
+// ** INTERN ONL **. Unlike other getters, e.g. getClassName, getSlot, this
+// isn't a WebApi (some individual types DO have a name getter, but not Element).
+// BUT, enough code internally needs this, that the helper exists.
+pub fn getName(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("name");
+}
+
+pub fn hasName(self: *const Element) bool {
+    return self.hasAttributeInterned("name");
+}
+
+pub fn getSlot(self: *const Element) ?[]const u8 {
+    return self.getAttributeSafe(comptime .wrap("slot"));
 }
 
 pub fn setSlot(self: *Element, value: []const u8, frame: *Frame) !void {
     return self.setAttributeSafe(comptime .wrap("slot"), .wrap(value), frame);
 }
 
-pub fn getDir(self: *const Element) []const u8 {
-    return self.getAttributeSafe(comptime .wrap("dir")) orelse "";
+pub fn getDir(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("dir");
 }
 
 pub fn setDir(self: *Element, value: []const u8, frame: *Frame) !void {
     return self.setAttributeSafe(comptime .wrap("dir"), .wrap(value), frame);
 }
 
-pub fn getClassName(self: *const Element) []const u8 {
-    return self.getAttributeSafe(comptime .wrap("class")) orelse "";
+pub fn getClassName(self: *const Element) ?[]const u8 {
+    return self.getAttributeInterned("class");
 }
 
 pub fn setClassName(self: *Element, value: []const u8, frame: *Frame) !void {
@@ -726,6 +738,16 @@ pub fn hasAttributeSafe(self: *const Element, name: String) bool {
     return self._attributes.hasSafe(name);
 }
 
+// Like getAttributeSafe, but faster! Only usable for values that are String.intern
+// so that the comparison becomes a single pointer equality.
+pub fn getAttributeInterned(self: *const Element, comptime name: []const u8) ?[]const u8 {
+    return self._attributes.getInterned(name);
+}
+
+pub fn hasAttributeInterned(self: *const Element, comptime name: []const u8) bool {
+    return self._attributes.hasInterned(name);
+}
+
 // Per HTML "concept-fe-disabled", only listed elements participate in the
 // disabled concept. Anything else (e.g. <div disabled>) has no disabled
 // state and never matches :disabled / :enabled.
@@ -741,7 +763,7 @@ pub fn isDisabled(self: *const Element) bool {
         return false;
     }
 
-    if (self.getAttributeSafe(comptime .wrap("disabled")) != null) {
+    if (self.getAttributeInterned("disabled") != null) {
         return true;
     }
 
@@ -753,7 +775,7 @@ pub fn isDisabled(self: *const Element) bool {
         if (self.asConstNode()._parent) |parent_node| {
             if (parent_node.is(Element)) |parent_el| {
                 if (parent_el.getTag() == .optgroup and
-                    parent_el.getAttributeSafe(comptime .wrap("disabled")) != null)
+                    parent_el.getAttributeInterned("disabled") != null)
                 {
                     return true;
                 }
@@ -768,7 +790,7 @@ pub fn isDisabled(self: *const Element) bool {
         current = node._parent;
         const ancestor = node.is(Element) orelse continue;
 
-        if (ancestor.getTag() == .fieldset and ancestor.getAttributeSafe(comptime .wrap("disabled")) != null) {
+        if (ancestor.getTag() == .fieldset and ancestor.getAttributeInterned("disabled") != null) {
             var child = ancestor.firstElementChild();
             while (child) |c| {
                 if (c.getTag() == .legend) {
@@ -2394,8 +2416,16 @@ pub const JsApi = struct {
     }
 
     pub const localName = bridge.accessor(Element.getLocalName, null, .{});
-    pub const id = bridge.accessor(Element.getId, Element.setId, .{ .ce_reactions = true });
-    pub const slot = bridge.accessor(Element.getSlot, Element.setSlot, .{ .ce_reactions = true });
+    pub const id = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getId() orelse "";
+        }
+    }.wrap, Element.setId, .{ .ce_reactions = true });
+    pub const slot = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getSlot() orelse "";
+        }
+    }.wrap, Element.setSlot, .{ .ce_reactions = true });
     pub const role = ariaAccessor("role");
     pub const ariaAtomic = ariaAccessor("aria-atomic");
     pub const ariaAutoComplete = ariaAccessor("aria-autocomplete");
@@ -2440,8 +2470,16 @@ pub const JsApi = struct {
     pub const ariaValueMin = ariaAccessor("aria-valuemin");
     pub const ariaValueNow = ariaAccessor("aria-valuenow");
     pub const ariaValueText = ariaAccessor("aria-valuetext");
-    pub const dir = bridge.accessor(Element.getDir, Element.setDir, .{ .ce_reactions = true });
-    pub const className = bridge.accessor(Element.getClassName, Element.setClassName, .{ .ce_reactions = true });
+    pub const dir = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getDir() orelse "";
+        }
+    }.wrap, Element.setDir, .{ .ce_reactions = true });
+    pub const className = bridge.accessor(struct {
+        fn wrap(self: *const Element) []const u8 {
+            return self.getClassName() orelse "";
+        }
+    }.wrap, Element.setClassName, .{ .ce_reactions = true });
     pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{ .ce_reactions = true });
     pub const part = bridge.accessor(Element.getPartList, null, .{});
     pub const dataset = bridge.accessor(Element.getDataset, null, .{});

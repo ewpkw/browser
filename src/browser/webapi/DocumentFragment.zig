@@ -76,7 +76,7 @@ pub fn getElementById(self: *DocumentFragment, id: []const u8) ?*Element {
 
     var tw = @import("TreeWalker.zig").Full.Elements.init(self.asNode(), .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |element_id| {
+        if (el.getId()) |element_id| {
             if (std.mem.eql(u8, element_id, id)) {
                 return el;
             }
@@ -162,13 +162,13 @@ pub fn getInnerHTML(self: *DocumentFragment, writer: *std.Io.Writer, frame: *Fra
 
 pub fn setInnerHTML(self: *DocumentFragment, html: []const u8, frame: *Frame) !void {
     const parent = self.asNode();
-    return parent.setHTML(html, false, frame);
+    return parent.setHTML(html, .{}, frame);
 }
 
 /// allows declarative shadow dom
 pub fn setHTMLUnsafe(self: *DocumentFragment, html: []const u8, frame: *Frame) !void {
     const parent = self.asNode();
-    return parent.setHTML(html, true, frame);
+    return parent.setHTML(html, .{ .allow_declarative_shadow = true }, frame);
 }
 
 pub fn cloneFragment(self: *DocumentFragment, deep: bool, frame: *Frame) !*Node {

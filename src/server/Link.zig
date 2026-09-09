@@ -28,7 +28,6 @@ const WS = @import("WS.zig");
 const CDP = @import("cdp/CDP.zig");
 const Driver = @import("Driver.zig");
 
-const log = lp.log;
 const posix = std.posix;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -330,8 +329,10 @@ test "link: send gives up when the peer stops reading" {
     // only half-closes the read side, hangs the whole process on SIGINT.
     try testing.expectError(error.Timeout, link.send(payload));
 
-    // and the run loop's reads share the fd: it must still be non-blocking
-    try testing.expectEqual(flags | nonblocking, try sys_net.fcntl(pair[1], posix.F.GETFL, 0));
+    // and the run loop's reads share the fd: it must still be non-blocking.
+    // Bit test, not equality: macOS adds an internal bit to F_GETFL after a write.
+    const after = try sys_net.fcntl(pair[1], posix.F.GETFL, 0);
+    try testing.expect(after & nonblocking != 0);
 }
 
 test "link: stops reading once the worker's inbox backs up" {

@@ -26,7 +26,6 @@ const URL = @import("../URL.zig");
 const Page = @import("../../Page.zig");
 const Blob = @import("../Blob.zig");
 const AbortSignal = @import("../AbortSignal.zig");
-const ContentTypeIterator = @import("../../Mime.zig").ContentTypeIterator;
 
 const Headers = @import("Headers.zig");
 const FormData = @import("FormData.zig");
@@ -138,7 +137,7 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
         // the user has not already set one via the headers init dict.
         if (extracted.content_type) |ct| {
             const hs = headers orelse try Headers.init(null, exec);
-            if (!hs.has("content-type", exec)) {
+            if (try hs.has("content-type", exec) == false) {
                 try hs.append("content-type", ct, exec);
             }
             headers = hs;
@@ -257,24 +256,21 @@ pub fn getBodyUsed(self: *const Request) bool {
     return self._body_used;
 }
 
-// Marks a present body consumed; returns a rejected promise if it already was.
-fn consume(self: *Request, local: *const js.Local) ?js.Promise {
+// Marks a present body consumed; a TypeError if it already was.
+fn consume(self: *Request, local: *const js.Local) !void {
     if (self._body == null) {
-        return null;
+        return;
     }
 
     if (self._body_used) {
-        return local.rejectPromise(.{ .type_error = "Body has already been read" });
+        return local.typeError("Body has already been read");
     }
     self._body_used = true;
-    return null;
 }
 
 pub fn blob(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    if (self.consume(local)) |rejected| {
-        return rejected;
-    }
+    try self.consume(local);
 
     const body = self._body orelse "";
     const headers = try self.getHeaders(exec);
@@ -286,17 +282,13 @@ pub fn blob(self: *Request, exec: *const Execution) !js.Promise {
 
 pub fn text(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    if (self.consume(local)) |rejected| {
-        return rejected;
-    }
+    try self.consume(local);
     return local.resolvePromise(body_init.stripUtf8Bom(self._body orelse ""));
 }
 
 pub fn json(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    if (self.consume(local)) |rejected| {
-        return rejected;
-    }
+    try self.consume(local);
 
     const value = local.parseJSON(body_init.stripUtf8Bom(self._body orelse "")) catch {
         return local.rejectPromise(.{ .syntax_error = "failed to parse" });
@@ -306,61 +298,28 @@ pub fn json(self: *Request, exec: *const Execution) !js.Promise {
 
 pub fn arrayBuffer(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    if (self.consume(local)) |rejected| {
-        return rejected;
-    }
+    try self.consume(local);
     return local.resolvePromise(js.ArrayBuffer{ .values = self._body orelse "" });
 }
 
 pub fn bytes(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    if (self.consume(local)) |rejected| {
-        return rejected;
-    }
+    try self.consume(local);
     return local.resolvePromise(js.TypedArray(u8){ .values = self._body orelse "" });
 }
 
 pub fn formData(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    if (self.consume(local)) |rejected| {
-        return rejected;
-    }
-
-    // Per Fetch, a null body acts as an empty byte sequence.
-    const body = self._body orelse "";
+    try self.consume(local);
 
     const headers = try self.getHeaders(exec);
-    const content_type = try headers.get("content-type", exec) orelse {
-        return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+    const content_type = try headers.get("content-type", exec);
+    // Per Fetch, a null body acts as an empty byte sequence.
+    const form_data = body_init.parseFormData(self._body orelse "", content_type, exec) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.TypeError => return local.typeError("Failed to parse body as FormData"),
     };
-    var it = ContentTypeIterator.init(content_type);
-    const essence = it.essence;
-
-    // [RFC7578]
-    // Parse bytes, using the value of the `boundary` parameter from mimeType,
-    // per the rules set forth in Returning Values from Forms: multipart/form-data.
-    if (std.ascii.eqlIgnoreCase(essence, "multipart/form-data")) {
-        const boundary = it.findBoundary();
-        if (boundary.len == 0) {
-            return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
-        }
-
-        const form_data = FormData.initFromMultipart(body, boundary, exec) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" }),
-        };
-        return local.resolvePromise(form_data);
-    }
-
-    if (std.ascii.eqlIgnoreCase(essence, "application/x-www-form-urlencoded")) {
-        const form_data = FormData.initFromUrlEncoded(body, exec) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" }),
-        };
-        return local.resolvePromise(form_data);
-    }
-
-    return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+    return local.resolvePromise(form_data);
 }
 
 pub fn clone(self: *const Request, exec: *const Execution) !*Request {

@@ -21,6 +21,7 @@ const zenai = @import("zenai");
 const lp = @import("lightpanda");
 
 const cli = @import("cli.zig");
+const string = @import("string.zig");
 const dump = @import("browser/dump.zig");
 const Mime = @import("browser/Mime.zig");
 
@@ -276,9 +277,9 @@ const CommonOptions = .{
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
     .{ .name = "user_agent", .type = ?[]const u8, .validator = userAgentValidator },
     .{ .name = "block_private_networks", .type = bool },
-    .{ .name = "block_cidrs", .type = ?[]const u8 },
-    .{ .name = "block_urls", .type = ?[]const u8 },
-    .{ .name = "adblock_lists", .type = ?[]const u8 },
+    .{ .name = "block_cidrs", .type = ?[]const u8, .validator = accumulateValidator },
+    .{ .name = "block_urls", .type = ?[]const u8, .validator = accumulateValidator },
+    .{ .name = "adblock_lists", .type = ?[]const u8, .validator = accumulateValidator },
     .{ .name = "cookie", .type = ?[]const u8 },
     .{ .name = "cookie_jar", .type = ?[]const u8 },
     .{ .name = "disable_subframes", .type = bool, .deprecated = "subframes are now disabled by default, use \"--load-resources iframe\" to enable" },
@@ -316,6 +317,11 @@ fn dumpValidator(_: Allocator, args: *std.process.Args.Iterator, target: *?DumpF
     var peek_args = args.*;
     if (peek_args.next()) |next_arg| {
         const mode = std.meta.stringToEnum(DumpFormat, next_arg) orelse {
+            // Anything else is the positional url, unless it is a misspelt format.
+            if (string.closest(next_arg, tagNames(DumpFormat), 2)) |near| {
+                log.fatal(.app, "invalid option choice", .{ .arg = "--dump", .value = log.red(next_arg), .did_you_mean = log.green(near) });
+                return error.InvalidArgument;
+            }
             target.* = .html;
             return;
         };
@@ -652,7 +658,7 @@ pub fn httpNavBurst(self: *const Config) u32 {
 
 pub fn httpConnectTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_connect_timeout orelse 0,
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_connect_timeout orelse 8000,
         .version => 0,
         else => unreachable,
     };
@@ -660,7 +666,7 @@ pub fn httpConnectTimeout(self: *const Config) u31 {
 
 pub fn httpTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_timeout orelse 5000,
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_timeout orelse 15000,
         .version => 5000,
         else => unreachable,
     };
@@ -1276,6 +1282,30 @@ test "Config: parseArgs refuses an invalid --http-header" {
     }
 }
 
+test "Config: parseArgs accumulates repeated list flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const argv = [_][*:0]const u8{
+        "lightpanda",         "fetch",
+        "--adblock-lists",    "easylist.txt",
+        "--adblock-lists",    "easyprivacy.txt,annoyances.txt",
+        "--block-cidrs",      "10.0.0.0/8",
+        "--block-cidrs",      "-10.0.0.42/32",
+        "http://example.com",
+    };
+    const proc_args: std.process.Args = .{ .vector = &argv };
+    const config = try parseArgs(arena.allocator(), proc_args);
+
+    var paths = config.adblockLists().?;
+    try std.testing.expectEqualStrings("easylist.txt", paths.next().?);
+    try std.testing.expectEqualStrings("easyprivacy.txt", paths.next().?);
+    try std.testing.expectEqualStrings("annoyances.txt", paths.next().?);
+    try std.testing.expectEqual(null, paths.next());
+
+    try std.testing.expectEqualStrings("10.0.0.0/8,-10.0.0.42/32", config.blockCidrs().?);
+}
+
 test "Config: parseArgs collects --http-header" {
     // The parsed headers are owned by the allocator for the process lifetime;
     // an arena stands in for main's.
@@ -1323,6 +1353,18 @@ test "Config: httpHeaders accessor" {
     }
 }
 
+/// For comma-separated flags the help documents as repeatable: each
+/// occurrence appends to what earlier ones left, so "--x a --x b" equals
+/// "--x a,b" instead of the last flag silently winning.
+fn accumulateValidator(allocator: Allocator, args: *std.process.Args.Iterator, field: *?[]const u8) !void {
+    const str = args.next() orelse return error.MissingArgument;
+    const existing = field.* orelse {
+        field.* = try allocator.dupe(u8, str);
+        return;
+    };
+    field.* = try std.mem.join(allocator, ",", &.{ existing, str });
+}
+
 fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua: *?[]const u8) !void {
     const str = args.next() orelse return error.MissingArgument;
     validateUserAgent(str) catch |err| {
@@ -1343,13 +1385,7 @@ pub fn validateUserAgent(ua: []const u8) !void {
 
 /// Tag names of a Zig enum, so a command's allowed values can't drift from the
 /// enum it sets.
-pub fn tagNames(comptime E: type) []const []const u8 {
-    const fields = @typeInfo(E).@"enum".fields;
-    var names: [fields.len][]const u8 = undefined;
-    for (fields, &names) |f, *n| n.* = f.name;
-    const frozen = names;
-    return &frozen;
-}
+pub const tagNames = cli.tagNames;
 
 /// `<a|b|c>` ghost-text hint built from the same enum's tag names.
 pub fn tagHint(comptime E: type) []const u8 {
