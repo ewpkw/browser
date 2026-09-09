@@ -85,7 +85,7 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 
 将上游的 Mozilla 拒绝测试反转为正向验证（本分支的核心意义就是允许 Mozilla UA）：
 - `test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent"` → 改为 `accepts a Mozilla User-Agent`，期望 `extra_headers.items.len == 1`
-- `test "...rejects a Mozilla User-Agent smuggled via a colon in the key"` → 改为 `accepts a Mozilla User-Agent with colon in key`，期望 `extra_headers.items.len == 1`
+- ~~`test "...rejects a Mozilla User-Agent smuggled via a colon in the key"` → 改为 `accepts ...`~~（**2026-09-09 修正**：该反转是错的。上游同期还有一条跟 Mozilla 无关的通用校验——header **名字**必须是合法 HTTP token，冒号不是合法字符，无论值是不是 Mozilla 都会被拒绝。已改回 `rejects a header name smuggling a colon`，期望 `extra_headers.items.len == 0`，并加注释说明拒绝原因与 Mozilla 无关）
 - `test "...rejects a header that smuggles CRLF"` → **保留测试但替换载荷**，将 `Mozilla/5.0` 改为 `CustomBot/1.0`（该测试核心是 CRLF 注入防护，与 Mozilla 无关）
 
 **文件**: `src/server/cdp/domains/emulation.zig`
@@ -100,6 +100,18 @@ Config.validateUserAgent(ua) catch |err| switch (err) {
 - `test "Config: parseArgs refuses a mozilla user-agent"` → 改为 `accepts a mozilla user-agent`，期望成功解析 Chrome UA
 - `test "Config: validateUserAgent"` → 删除 `error.Reserved` 断言，改为 `try validateUserAgent("mozilla/1.0")` 和 `try validateUserAgent("Mozilla/5.0")`
 - `userAgentValidator` 函数中的错误提示从 `"must be printable ASCII and can't contain Mozilla"` 改为 `"must be printable ASCII"`
+
+> **2026-09-09 补充修复**：上面这条测试最初反转时写成了 `config.user_agent.?`（`Config` 结构体没有这个顶层字段，正确访问方式是 `config.userAgent().?`，见 `userAgent()` 方法），导致 `make test` **整体编译失败**（`test` 块不参与 `make build`，所以之前只跑 `make build` 没发现）；同时这个测试直接用了裸的 `std.testing.allocator`，而 `parseArgs` 的 `userAgentValidator` 内部 `allocator.dupe` 出来的内存不会被 `Config.deinit` 释放（`deinit` 只负责 `http_headers`），触发内存泄漏检测失败。已改为跟相邻的 `--http-version`/`collects --http-header` 测试一致的 arena 模式。
+
+**文件**: `src/network/HttpClient.zig`（**2026-09-09 新增**，上游提交 `737f69ee4 http: improve header overwrite/enforcement` 引入，之前合并时漏掉）
+
+`test "HttpClient: Transfer header layering"` 里有一段验证「带 Mozilla 的 UA 会被 `verifyHeader`/`validateUserAgent` 拒绝、不会进入 header 列表」，与本分支核心原则冲突，已反转为：`Mozilla/5.0` 正常进入并覆盖默认 UA（同时删掉对应的 `testing.expectLog(&.{.http})`，因为不再有 "invalid header dropped" 日志）。
+
+**文件**: `src/browser/tests/net/fetch.html` / `src/browser/tests/net/xhr.html`（**2026-09-09 新增**，同一个上游提交 `737f69ee4` 引入，对应 HTML 测试之前也漏改）
+
+`fetch_header_layers` / `xhr_request_headers` 两个脚本分别用 `Headers.set('User-Agent', 'Mozilla/5.0 ...')` 和 `setRequestHeader('Sec-Ch-Ua', '"Chromium";v="140"')` 断言这两个 header 会被静默丢弃（因为上游：Mozilla 无效 + `Sec-Ch-Ua` 是 fixed）。本分支两者都不成立（Mozilla 有效，且见第 4.2 节，`Sec-Ch-Ua` 不再 fixed），已改为断言 author 层设置直接生效覆盖 baseline：`got['user-agent'] === 'Mozilla/5.0 (X11; Linux x86_64)'`，`got['sec-ch-ua'] === '"Chromium";v="140"'`。
+
+对应地，`src/browser/webapi/net/Fetch.zig` 的 `test "WebApi: fetch"` 里 `testing.expectLog(&.{ .http, .http })` 已删除（不再有 2 条 header-dropped 日志），`src/browser/webapi/net/XMLHttpRequest.zig` 的 `test "WebApi: XHR"` 从 `&.{ .http, .http, .http }` 减为 `&.{.http}`（3 条里只有 2 条跟本次改动有关，剩下 1 条来自 xhr.html 里其他不相关的用例）。
 
 ### 1.5 更新 help.zon 中的说明
 
@@ -149,10 +161,12 @@ pub const brands = [_]Brand{
 > `full_version` 字段用于 `Sec-Ch-Ua-Full-Version-List` header 和 `getHighEntropyValues().fullVersionList`。
 
 这会同时影响：
-- HTTP 头 `Sec-Ch-Ua` 的值（通过 `sec_ch_ua` 常量自动生成）
-- HTTP 头 `Sec-Ch-Ua-Full-Version-List` 的值（通过 `sec_ch_ua_full_version_list` 常量自动生成）
-- `navigator.userAgentData.brands` JS API 返回值（通过 `brandList()` 引用 `brands`）
-- `navigator.userAgentData.getHighEntropyValues()` 返回值
+- HTTP 头 `Sec-Ch-Ua` 的值（通过 `sec_ch_ua` 常量自动生成，使用 `.version`）
+- HTTP 头 `Sec-Ch-Ua-Full-Version-List` 的值（通过 `sec_ch_ua_full_version_list` 常量自动生成，使用 `.full_version`）
+- `navigator.userAgentData.brands` JS API 返回值（通过 `NavigatorUAData.shortBrandList()` 引用 `brands`，使用 `.version`）
+- `navigator.userAgentData.getHighEntropyValues().fullVersionList` 返回值（通过 `NavigatorUAData.fullBrandList()` 引用 `brands`，使用 `.full_version`）
+
+> **2026-09-09 修复的保真度缺陷**：上游 `NavigatorUAData.zig` 里只有一个 `brandList()`，内部统一用 `b.full_version`（上游自身无所谓，因为他们只有一个 `Lightpanda` 品牌，且不关心低熵/高熵区分）。直接照抄后，`navigator.userAgentData.brands`（低熵，真实 Chrome/Edge 应该返回主版本号如 `"151"`）跟 `Sec-Ch-Ua` HTTP 头（用的是短版本号 `v="151"`）对不上，会被任何做交叉校验的反爬系统（对比 HTTP 头和 JS API 的 brand version）发现不一致，直接判定为伪造。已拆成 `shortBrandList()`（给 `getBrands()`/`toJSON().brands`/`getHighEntropyValues().brands` 用，取 `.version`）和 `fullBrandList()`（给 `getHighEntropyValues().fullVersionList` 用，取 `.full_version`），与真实 Chrome/Edge 行为一致。
 
 ---
 
@@ -394,6 +408,15 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
 }
 ```
 
+> **2026-09-09 修正（重要保真度缺陷，见第二节末尾说明）**：上面的 `brandList()` 实现内部统一取 `b.full_version`，导致低熵的 `.brands` 也返回了完整构建版本号（如 `"151.0.7813.2"`），与 `Sec-Ch-Ua` HTTP 头里的短版本号 `v="151"` 对不上，是会被反爬交叉校验直接识别的不一致。现已拆分为两个函数，`getHighEntropyValues` 内：
+>
+> ```zig
+> .brands = shortBrandList(),        // 取 .version，如 "151"
+> .fullVersionList = fullBrandList(), // 取 .full_version，如 "151.0.7813.2"
+> ```
+>
+> 同时 `getBrands()`（给 `navigator.userAgentData.brands`）和 `toJSON().brands` 也都改为调用 `shortBrandList()`。
+
 ---
 
 ## 四、需要额外添加的 HTTP 头（2个文件）
@@ -432,11 +455,19 @@ pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
 
 替换为：
 ```zig
+// Headers _all_ requests include.
+// Sec-Ch-Ua / Sec-Ch-Ua-Full-Version-List are intentionally *not* marked
+// `.source = .fixed` (unlike upstream): this branch exists to behave like a
+// real Chrome/Edge, so a CDP client driving Network.setExtraHTTPHeaders (or
+// Emulation.setUserAgentOverride with `headers`) must be able to move these
+// client hints in lockstep with the UA. Marking them fixed only made every
+// such request emit an "ignore overriding fixed header" warn and silently
+// dropped the client's value.
 pub fn baselineHeaders(self: *const Client) [9]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
-        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
@@ -450,7 +481,11 @@ pub fn baselineHeaders(self: *const Client) [9]Transfer.RequestHeader {
 }
 ```
 
-> **注意**：数组大小从 `[4]` 扩展为 `[9]`。`Sec-Ch-Ua` 和 `Sec-Ch-Ua-Full-Version-List` 标记为 `.source = .fixed`，不可通过 CDP 覆盖。当 Chrome 版本升级时，修改对应值即可。
+> **注意**：数组大小为 `[9]`。当 Chrome 版本升级时，修改对应值即可。
+>
+> **2026-09-09 修正**：上述“`Sec-Ch-Ua`/`Sec-Ch-Ua-Full-Version-List` 标记为 `.source = .fixed`，不可通过 CDP 覆盖”的设计不对。这个 `.fixed` 实际是上游为了保护自己“永不接受 Mozilla UA”的设计而强加的防篡改措施，对本分支而言正好相反：我们需要 CDP 客户端能完整控制 client hints，与真实浏览器行为一致。
+>
+> 历史代码库 `Transfer.putHeader`（`src/network/HttpClient.zig`）对 `.fixed` header 的处理：任何低优先级 source（包括 `.cdp`）尝试覆盖都会直接 `return` 不生效，并打印 `log.warn(.http, "ignore overriding fixed header", .{ .header = hdr.name })`。而 `src/server/cdp/domains/network.zig` 的 `httpRequestStart` 会对**每个 HTTP 请求**都应用一次 `bc.extra_headers`（以 `.source = .cdp` 身份）——只要客户端（如你们的 worker）通过 `Network.setExtraHTTPHeaders` 包含了 `Sec-Ch-Ua`，就会产生每请求一条的 warn 刷屏，且客户端设置的值被静默丢弃。去掉 `.fixed` 后两个问题一并解决（header 可正常覆盖，不再命中 fixed 分支，日志自然消失）。
 
 ---
 
@@ -472,6 +507,20 @@ testing.expectEqual({brand: 'Not=A?Brand', version: "99"}, navigator.userAgentDa
 testing.expectEqual({brand: 'Microsoft Edge', version: "151"}, navigator.userAgentData.brands[1]);
 testing.expectEqual({brand: 'Chromium', version: "151"}, navigator.userAgentData.brands[2]);
 ```
+
+> **2026-09-09 重要补充**：上面这一处之前已经同步过，但这个文件里其余大部分断言长期没同步（只改到了 `userAgentData`/`getHighEntropyValues`，遗漏了第三节里其余所有改动对应的期望值），CHROME.md 之前也没记录。因为测试套件长期不能成功编译（见 1.4 节“补充修复”），这个遗漏一直没被发现。本次已全部补齐：
+>
+> | 断言 | 旧（上游）值 | 新（本分支）值 | 对应实现改动 |
+> |------|-----------|-------------|-------------|
+> | `navigator.userAgent.includes('Lightpanda')` | true | false，且需 `includes('Edg/')` | 3.1 |
+> | `navigator.appVersion` | `'1.0'` | 完整 Edge UA 字符串（去掉 `Mozilla/` 前缀） | 3.1 |
+> | `navigator.language` | `'en-US'` | `'zh-CN'` | 3.7 |
+> | `navigator.languages` | `[2]` 长 | `[3]` 长，`['zh-CN','en-US','en']` | 3.7 |
+> | `navigator.hardwareConcurrency` | `4` | `32` | 3.3 |
+> | `navigator.maxTouchPoints` | `0` | `10` | 3.5 |
+> | `navigator.vendor` | `''` | `'Google Inc.'` | 3.2 |
+> | `navigator.doNotTrack`（`id=navigator` 和 `id=navigator_native_descriptor_walk` 两处） | `null` | `'1'` | 3.6 |
+> | `navigator.deviceMemory` | `8` | `32` | 3.4 |
 
 ### 5.2 更新 userAgentData 高熵值测试
 
@@ -521,17 +570,21 @@ test_config = try Config.init(test_allocator, "test", .{
 
 | # | 文件 | 修改类型 | 说明 |
 |---|------|---------|------|
-| 1 | `src/Config.zig` | 修改+反转测试 | 默认 UA、brands（含 full_version）、删除 validateUserAgent Mozilla 检测、添加 CH 常量、反转 CLI UA 测试 |
-| 2 | `src/network/HttpClient.zig` | 修改 | baselineHeaders 添加 Sec-Ch-Ua-Full-Version-List + 5 个 Client Hints（[4]→[9]，Transfer.RequestHeader 类型） |
+| 1 | `src/Config.zig` | 修改+反转测试 | 默认 UA、brands（含 full_version）、删除 validateUserAgent Mozilla 检测、添加 CH 常量、反转 CLI UA 测试；2026-09-09 又修正了该测试里的 `config.user_agent`→`config.userAgent()` 字段引用错误和内存泄漏 |
+| 2 | `src/network/HttpClient.zig` | 修改 | baselineHeaders 添加 Sec-Ch-Ua-Full-Version-List + 5 个 Client Hints（[4]→[9]，Transfer.RequestHeader 类型）；2026-09-09 去掉 Sec-Ch-Ua/Full-Version-List 的 `.source=.fixed`（见 4.2）；修正 `Transfer header layering` 测试里 Mozilla UA 被拒绝的断言（见 1.4） |
 | 3 | `src/browser/webapi/Navigator.zig` | 修改 | appVersion、vendor、hardwareConcurrency、deviceMemory、maxTouchPoints、doNotTrack、language/languages、platform |
-| 4 | `src/browser/webapi/NavigatorUAData.zig` | 修改 | platform="Windows"、高熵值匹配 Chrome（platformVersion、uaFullVersion） |
+| 4 | `src/browser/webapi/NavigatorUAData.zig` | 修改 | platform="Windows"、高熵值匹配 Chrome（platformVersion、uaFullVersion）；2026-09-09 拆分 shortBrandList/fullBrandList，修正低熵 brands 返回 full_version 的保真度缺陷（见 2.1、3.11） |
 | 5 | `src/browser/webapi/PluginArray.zig` | 修改 | length=5 (非零) |
 | 6 | `src/server/cdp/domains/emulation.zig` | 修改+反转测试 | 删除 Mozilla 拒绝逻辑；反转测试为"accepts Mozilla" |
-| 7 | `src/server/cdp/domains/network.zig` | 反转测试+改载荷 | 反转 Mozilla UA 拒绝测试为接受；CRLF 测试替换载荷 |
+| 7 | `src/server/cdp/domains/network.zig` | 反转测试+改载荷 | 反转 Mozilla UA 拒绝测试为接受；CRLF 测试替换载荷；2026-09-09 修正“冒号 smuggle”测试应保留“拒绝”语义（拒绝原因与 Mozilla 无关，是 header 名字非 token，见 1.4） |
 | 8 | `src/help.zon` | 修改 | 更新帮助文本（user-agent + user-agent-suffix） |
-| 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新 brands 和 highEntropy 期望值为 Chrome 值 |
+| 9 | `src/browser/tests/navigator/navigator.html` | 修改 | 更新 brands 和 highEntropy 期望值为 Chrome 值；2026-09-09 补齐此前遗漏的 appVersion/language(s)/hardwareConcurrency/maxTouchPoints/vendor/doNotTrack/deviceMemory 期望值（见 5.1） |
 | 10 | `src/testing.zig` | 修改 | 删除上游 `user_agent_suffix = "internal-tester"`，使用默认 Chrome UA |
 | 11 | `src/browser/webapi/WorkerNavigator.zig` | 上游同步联动 | 上游新增文件，`getLanguages` 委托 `Navigator.getLanguages`，返回类型 `[2]`→`[3]` 对齐本分支（否则 snapshot_creator 编译失败） |
+| 12 | `src/browser/tests/net/fetch.html` | 反转测试（2026-09-09） | `fetch_header_layers` 反转为接受 Mozilla UA + author 层可覆盖 Sec-Ch-Ua |
+| 13 | `src/browser/tests/net/xhr.html` | 反转测试（2026-09-09） | `xhr_request_headers` 同上 |
+| 14 | `src/browser/webapi/net/Fetch.zig` | 测试计数修正（2026-09-09） | `test "WebApi: fetch"` 删除对应的 `expectLog(&.{ .http, .http })` |
+| 15 | `src/browser/webapi/net/XMLHttpRequest.zig` | 测试计数修正（2026-09-09） | `test "WebApi: XHR"` 的 `expectLog` 从 3 条减为 1 条 |
 
 ---
 
@@ -891,6 +944,42 @@ git push origin chrome
 | 每周 | `git fetch upstream` 查看上游变动 |
 | 有冲突时 | 执行完整 merge/rebase 流程 |
 | 上游大版本更新 | 特别注意 build.zig.zon 依赖版本变化 |
+
+### 9.7 本次同步记录（2026-09-09）
+
+- 合并 `upstream/main`（自上次同步 `c5aaafe59` 以来共 **89 个新提交**）。
+- **零文本冲突**（`git merge-tree` 预演 + 实际 `git merge --no-ff` 均无冲突），无需手工解决。
+- 已逐个确认本分支的所有冲突热点文件（`Config.zig`/`HttpClient.zig`/`Navigator.zig`/`NavigatorUAData.zig`/`PluginArray.zig`/`emulation.zig`/`network.zig`/`help.zon`/`testing.zig`/`WorkerNavigator.zig`/`navigator.html`）在这 89 个新提交里的真实改动内容，**均未触及本分支的 UA / Mozilla 校验 / Sec-Ch-Ua / Navigator / PluginArray 相关代码**，不需要新的策略反转。
+- `build.zig`、`build.zig.zon`、`.github/actions/install/action.yml`（V8 版本/标签）、`Makefile` **均无变化**，不需要重新执行第 8.6 节的大陆网络离线抓取流程，V8 缓存路径（`v0.5.4`）不变。
+- 本次新合入的上游功能：adblock 引入 request-engine（`isUrlBlocked` 改为接收 `*const Transfer`，支持 `$document`/`$subdocument`/`$third-party` 修饰符）；CLI `--dump` 拼写建议（did-you-mean）；`--adblock-lists`/`--block-cidrs`/`--block-urls` 可重复传值累加；HTTP 超时默认值调整（connect `0`→`8000ms`，transfer `5000`→`15000ms`）；`Emulation.setDeviceMetricsOverride`/`clearDeviceMetricsOverride` 改为调用 `Browser.setViewportOverride()`；isolated world 每 frame 独立 context；`Performance` 实现 `EventTarget`；等等。
+
+**合并过程中发现并修复的历史遗留问题**（均非本次合并引入，是之前几轮 `git merge upstream/main` 遗留的，本轮一并清理）：
+
+1. `src/Config.zig`：`test "Config: parseArgs accepts a mozilla user-agent"` 写错了字段访问方式（`config.user_agent` 应为 `config.userAgent()`），导致测试直接**编译失败**，阻塞整个 `make test`（之前几轮合并只验证了 `make build`，`test` 块不参与 `make build`，所以一直没暴露）。同时修正该测试的内存泄漏（漏用 arena）。
+2. `src/network/HttpClient.zig`：`test "HttpClient: Transfer header layering"`（上游 `737f69ee4` 引入）仍按“Mozilla UA 会被拒绝”断言，与本分支核心原则冲突，已反转（见 1.4）。
+3. `src/server/cdp/domains/network.zig`：“冒号走私 key”测试之前被错误地反转为“接受”，已改回“拒绝”，并注明拒绝原因跟 Mozilla 无关（见 1.4）。
+4. `src/browser/tests/net/{fetch,xhr}.html`：`fetch_header_layers` / `xhr_request_headers`（同一上游提交 `737f69ee4` 引入的 HTML 版姊妹测试）同样漏改，已同步修正（见 1.4）。
+5. `src/browser/tests/navigator/navigator.html`：`CHROME.md` 第 3.1~3.9 节实现改动对应的测试期望值长期未同步（见 5.1 里的对照表）。
+6. `src/browser/webapi/NavigatorUAData.zig`：发现并修复一个**真实保真度缺陷**——`navigator.userAgentData.brands`（低熵）错误返回了完整构建版本号，与 `Sec-Ch-Ua` HTTP 头不一致，会被反爬交叉校验识别（见 2.1、3.11）。这个是直接影响本分支存在意义的问题，之前因测试套件整体编译不过（第 1 点）而被掩盖，从未被发现。
+7. `src/network/HttpClient.zig` `baselineHeaders()`：`Sec-Ch-Ua`/`Sec-Ch-Ua-Full-Version-List` 之前被标为 `.source = .fixed`（沿用上游设计），导致生产环境 `worker` 通过 CDP `setExtraHTTPHeaders` 设置这些 header 时，每个请求都会刷一条 `ignore overriding fixed header` 的 warn 日志，且客户端设置的值被静默丢弃。已去掉 `.fixed`（见 4.2）。
+
+**本次验证结果**：`make test` 共 **1460 个测试，1458 个通过**，失败 2 个（见下）。
+
+**已知遗留问题：`WebApi: Frames` / `WebApi: Window` 两个测试确定性失败**
+
+- 与本次合并、与本分支的 Chrome 模拟目标均无直接关系：失败点分别是 `cross_realm_collection.html`（iframe 跨 realm `childNodes` 缓存失效）和 `body_onload3.html`（`window.onload`/`body.onload` 类型判定）。
+- 已确认**不是本次合并、也不是本轮修复引入的**：在合并前的 HEAD 上完全一样的失败，纯粹是之前几次合并遗留的问题（因为测试套件从更早版本开始就一直编译不过，被完全掩盖）。
+- 已确认**不是随机波动，也不是测试端口冲突**：单独跑、清空 `.zig-cache` 重跑、确认 `127.0.0.1:9582` 空闲时单独跑，均稳定重现。
+- 已确认**不是本分支相对上游的源码差异造成**：对比 `git diff upstream/main..HEAD`，`Window.zig`/`node_live.zig`/`Frame.zig`/`Node.zig` 等涉及文件均与上游完全一致（无 diff）；把两边相关源码内容直接 `diff` 对比，也是字节对字节完全相同。
+- 已确认**不是编译缓存问题**：用全新 `--cache-dir` 完全冷构建，仍失败。
+- 已定位到一个确定性的复现/排除步骤：在 `/tmp` 下新建一个 `git worktree add /tmp/lp-upstream-check upstream/main`，先把本分支与上游的 **16 个差异源文件**（`git diff --name-only upstream/main..HEAD` 列出的、不含 `CHROME.md`）全部拷进去覆盖 → 在这个纯净的 upstream 工作树里用同一命令跑 `WebApi: Frames`，**成功复现了失败**。然后逐个二分回退：
+  - 回退 `testing.zig` → 仍失败（排除）
+  - 再回退 `HttpClient.zig` + `http.zig` → 仍失败（排除）
+  - 再回退 `Config.zig` + `help.zon` + `emulation.zig` + `network.zig` 四个 → **PASS**（锁定范围内）
+  - 四个里单独回退 `help.zon` + `network.zig`，保留 `Config.zig` + `emulation.zig` → 仍失败
+  - **已缩小到：罪魁祸首在 `src/Config.zig` 和/或 `src/server/cdp/domains/emulation.zig` 这两个文件里**（因 `error.Reserved` 的声明与 `switch` 分支必须同进同退，这两个文件不能单独拆开测试，否则直接编译失败，无法进一步二分）。
+  - 令人费解的是：逐行比对这两个文件与上游的完整 diff（就是 1.3/1.4 节记录的那些 UA/Mozilla 相关改动），找不到任何看似与 DOM/iframe/collection 缓存相关的内容。具体机制需要单独开一个专题排查（建议：先固定住其他 14 个文件，只把 Config+emulation 换成上游版本确认修复，再把这两个文件里的具体改动拆成更小的语义单元——比如单独只改 `user_agent_base` 字符串、单独只删 `validateUserAgent` 里的 Mozilla 判断——逐个尝试，定位到具体哪一行造成的）。
+  - 本问题不阻塞本次合并，本次任务范围内不再继续深入，待你确认下一步。
 
 ---
 
