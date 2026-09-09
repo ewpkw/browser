@@ -431,11 +431,18 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 }
 
 // Headers _all_ requests include.
+// Sec-Ch-Ua / Sec-Ch-Ua-Full-Version-List are intentionally *not* marked
+// `.source = .fixed` (unlike upstream): this branch exists to behave like a
+// real Chrome/Edge, so a CDP client driving Network.setExtraHTTPHeaders (or
+// Emulation.setUserAgentOverride with `headers`) must be able to move these
+// client hints in lockstep with the UA. Marking them fixed only made every
+// such request emit an "ignore overriding fixed header" warn and silently
+// dropped the client's value.
 pub fn baselineHeaders(self: *const Client) [9]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
-        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
@@ -4369,10 +4376,9 @@ test "HttpClient: Transfer header layering" {
     try transfer.appendHeader("SEC-CH-UA", "\"Chromium\";v=\"140\"", .{ .source = .author });
     try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
 
-    // an invalid User-Agent never enters the list
-    testing.expectLog(&.{.http});
+    // this branch accepts a Mozilla User-Agent instead of dropping it
     try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
-    try testing.expectEqual("Lightpanda/1.0", transfer.findRequestHeader("user-agent").?);
+    try testing.expectEqual("Mozilla/5.0", transfer.findRequestHeader("user-agent").?);
 
     // a valid author User-Agent replaces the default
     try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });

@@ -476,10 +476,12 @@
       testing.expectEqual('fr', got['accept-language']);
       testing.expectEqual('a, b', got['x-multi']);
       testing.expectEqual('a=1; b=2', got['cookie']);
-      testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
-      testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
-      testing.expectEqual(true, got['sec-ch-ua'].includes('Lightpanda'));
-      testing.expectEqual(false, got['sec-ch-ua'].includes('Chromium'));
+      // This branch accepts a Mozilla User-Agent (CHROME.md §1.2) and does
+      // not mark Sec-Ch-Ua as a fixed, non-overridable header (CHROME.md §4.2
+      // conflict note), so an author-set header from script wins over the
+      // baseline, exactly like any other request header.
+      testing.expectEqual('Mozilla/5.0 (X11; Linux x86_64)', got['user-agent']);
+      testing.expectEqual('"Chromium";v="140"', got['sec-ch-ua']);
     });
   }
 </script>

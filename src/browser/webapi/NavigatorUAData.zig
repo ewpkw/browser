@@ -32,7 +32,7 @@ const Brand = struct {
 };
 
 pub fn getBrands(_: *const NavigatorUAData) []const Brand {
-    return brandList();
+    return shortBrandList();
 }
 
 pub fn getMobile(_: *const NavigatorUAData) bool {
@@ -50,7 +50,7 @@ pub fn toJSON(_: *const NavigatorUAData) struct {
 } {
     return .{
         .mobile = false,
-        .brands = brandList(),
+        .brands = shortBrandList(),
         .platform = uaPlatform(),
     };
 }
@@ -58,7 +58,7 @@ pub fn toJSON(_: *const NavigatorUAData) struct {
 pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
     _ = hints;
     return exec.js.local.?.resolvePromise(.{
-        .brands = brandList(),
+        .brands = shortBrandList(),
         .mobile = false,
         .platform = uaPlatform(),
         .architecture = "x86",
@@ -66,13 +66,35 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
         .model = "",
         .platformVersion = "15.0.0",
         .uaFullVersion = "151.0.7813.2",
-        .fullVersionList = brandList(),
+        .fullVersionList = fullBrandList(),
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
     });
 }
 
-fn brandList() []const Brand {
+// Low-entropy brand list (navigator.userAgentData.brands / toJSON().brands /
+// getHighEntropyValues().brands): real Chrome/Edge reports the *major* version
+// here (e.g. "151"), not the full build version. This must match
+// Config.HttpHeaders.sec_ch_ua (the Sec-Ch-Ua HTTP header), which also uses
+// .version, otherwise a fingerprinting check comparing the two finds them
+// inconsistent and flags the client as non-Chrome.
+fn shortBrandList() []const Brand {
+    const out = comptime blk: {
+        const src = &Config.HttpHeaders.brands;
+        var arr: [src.len]Brand = undefined;
+        for (src, 0..) |b, i| {
+            arr[i] = .{ .brand = b.brand, .version = b.version };
+        }
+        const final = arr;
+        break :blk final;
+    };
+    return &out;
+}
+
+// High-entropy fullVersionList: real Chrome/Edge reports the full build
+// version here (e.g. "151.0.7813.2"), matching
+// Config.HttpHeaders.sec_ch_ua_full_version_list.
+fn fullBrandList() []const Brand {
     const out = comptime blk: {
         const src = &Config.HttpHeaders.brands;
         var arr: [src.len]Brand = undefined;

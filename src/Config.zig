@@ -1209,11 +1209,14 @@ test "Config: advertiseHost preserves concrete host when not a wildcard" {
 }
 
 test "Config: parseArgs accepts a mozilla user-agent" {
+    // parseArgs allocations live for the process; an arena stands in for main's.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36" };
     const proc_args: std.process.Args = .{ .vector = &argv };
-    const config = try parseArgs(std.testing.allocator, proc_args);
-    defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36", config.user_agent.?);
+    const config = try parseArgs(arena.allocator(), proc_args);
+    try std.testing.expectEqualStrings("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36", config.userAgent().?);
 }
 
 test "Config: parseArgs --http-version" {

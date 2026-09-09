@@ -5,30 +5,38 @@
   // Navigator should be accessible from window
   testing.expectEqual(navigator, window.navigator);
   testing.expectEqual(true, navigator.userAgent.length > 0);
-  testing.expectEqual(true, navigator.userAgent.includes('Lightpanda'));
+  // This branch impersonates Edge on Windows, so the UA must NOT contain
+  // "Lightpanda" (see CHROME.md §1.1).
+  testing.expectEqual(false, navigator.userAgent.includes('Lightpanda'));
+  testing.expectEqual(true, navigator.userAgent.includes('Edg/'));
   testing.expectEqual('Netscape', navigator.appName);
-  testing.expectEqual('1.0', navigator.appVersion);
+  // appVersion mirrors the UA minus the "Mozilla/" prefix (CHROME.md §3.1).
+  testing.expectEqual('5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0', navigator.appVersion);
   testing.expectEqual(true, navigator.platform.length > 0);
 
   // Platform should be one of the known values
   const validPlatforms = ['MacIntel', 'Win32', 'Linux x86_64', 'FreeBSD', 'Unknown'];
   testing.expectEqual(true, validPlatforms.includes(navigator.platform));
-  testing.expectEqual('en-US', navigator.language);
+  // language/languages are pinned to zh-CN first (CHROME.md §3.7).
+  testing.expectEqual('zh-CN', navigator.language);
   testing.expectEqual(true, Array.isArray(navigator.languages));
-  testing.expectEqual(2, navigator.languages.length);
-  testing.expectEqual('en-US', navigator.languages[0]);
-  testing.expectEqual('en', navigator.languages[1]);
+  testing.expectEqual(3, navigator.languages.length);
+  testing.expectEqual('zh-CN', navigator.languages[0]);
+  testing.expectEqual('en-US', navigator.languages[1]);
+  testing.expectEqual('en', navigator.languages[2]);
   testing.expectEqual(true, navigator.onLine);
   testing.expectEqual(true, navigator.cookieEnabled);
   testing.expectEqual(true, navigator.hardwareConcurrency > 0);
-  testing.expectEqual(4, navigator.hardwareConcurrency);
-  testing.expectEqual(0, navigator.maxTouchPoints);
-  testing.expectEqual('', navigator.vendor);
+  // hardwareConcurrency/maxTouchPoints/vendor/doNotTrack/deviceMemory are
+  // pinned to non-bot-looking values (CHROME.md §3.2-§3.6).
+  testing.expectEqual(32, navigator.hardwareConcurrency);
+  testing.expectEqual(10, navigator.maxTouchPoints);
+  testing.expectEqual('Google Inc.', navigator.vendor);
   testing.expectEqual('Gecko', navigator.product);
   testing.expectEqual(false, navigator.javaEnabled());
   testing.expectEqual(false, navigator.webdriver);
 
-  testing.expectEqual(null, navigator.doNotTrack);
+  testing.expectEqual('1', navigator.doNotTrack);
 
   // GPC must default to false — per https://w3c.github.io/gpc/#javascript-property
   // the signal reflects an explicit user preference (Firefox defaults to false;
@@ -68,7 +76,7 @@
       else if (d.get !== undefined) { d.get.toString(); }
     }
   } while (obj = Object.getPrototypeOf(obj));
-  testing.expectEqual(null, navigator.doNotTrack);
+  testing.expectEqual('1', navigator.doNotTrack);
 </script>
 
 <script id=permission_query type=module>
@@ -104,7 +112,8 @@
 </script>
 
 <script id=deviceMemory>
-  testing.expectEqual(8, navigator.deviceMemory);
+  // Pinned to 32GB, a plausible high-end desktop value (CHROME.md §3.4).
+  testing.expectEqual(32, navigator.deviceMemory);
 </script>
 
 <script id=userAgentData>
