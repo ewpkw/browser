@@ -176,6 +176,7 @@ pub fn setValue(self: *Select, value: []const u8, frame: *Frame) !void {
     while (it.next()) |option| {
         option._selected = std.mem.eql(u8, option.getValue(frame), value);
     }
+    frame.domChanged();
 }
 
 pub fn getSelectedIndex(self: *Select) i32 {
@@ -197,7 +198,7 @@ pub fn getSelectedIndex(self: *Select) i32 {
     return if (has_options) 0 else -1;
 }
 
-pub fn setSelectedIndex(self: *Select, index: i32) !void {
+pub fn setSelectedIndex(self: *Select, index: i32, frame: *Frame) !void {
     // Mark that selectedIndex has been explicitly set
     self._selected_index_set = true;
 
@@ -215,6 +216,7 @@ pub fn setSelectedIndex(self: *Select, index: i32) !void {
         }
         current_index += 1;
     }
+    frame.domChanged();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-type
@@ -224,7 +226,7 @@ pub fn getType(self: *const Select) []const u8 {
     return if (self.getMultiple()) "select-multiple" else "select-one";
 }
 
-pub fn getOptions(self: *Select, frame: *Frame) !*collections.HTMLOptionsCollection {
+fn getOptions(self: *Select, frame: *Frame) !*collections.HTMLOptionsCollection {
     // select_options mode is the select's list of options: option children
     // plus the option children of optgroup children.
     const node_live = collections.NodeLive(.select_options).init(self.asNode(), {}, frame);
@@ -307,7 +309,7 @@ pub fn getForm(self: *Select, frame: *Frame) ?*Form {
     return null;
 }
 
-pub fn getLabels(self: *Select, frame: *Frame) !js.Array {
+fn getLabels(self: *Select, frame: *Frame) !js.Array {
     return @import("Label.zig").getControlLabels(self.asElement(), frame);
 }
 
@@ -318,14 +320,14 @@ pub fn getWillValidate(self: *const Select) bool {
     return !self.asConstElement().isDisabled();
 }
 
-pub fn getValidity(self: *Select, frame: *Frame) !*ValidityState {
+fn getValidity(self: *Select, frame: *Frame) !*ValidityState {
     if (self._validity) |v| return v;
     const v = try frame._factory.create(ValidityState{ ._owner = self.asElement() });
     self._validity = v;
     return v;
 }
 
-pub fn getValidationMessage(self: *const Select) []const u8 {
+fn getValidationMessage(self: *const Select) []const u8 {
     if (!self.getWillValidate()) return "";
     if (self._custom_validity) |msg| return msg;
     if (self.suffersValueMissing()) return "Please select an item in the list.";
@@ -342,11 +344,11 @@ pub fn checkValidity(self: *Select, frame: *Frame) !bool {
     return false;
 }
 
-pub fn reportValidity(self: *Select, frame: *Frame) !bool {
+fn reportValidity(self: *Select, frame: *Frame) !bool {
     return self.checkValidity(frame);
 }
 
-pub fn setCustomValidity(self: *Select, message: []const u8, frame: *Frame) !void {
+fn setCustomValidity(self: *Select, message: []const u8, frame: *Frame) !void {
     if (message.len == 0) {
         self._custom_validity = null;
     } else {
@@ -370,10 +372,6 @@ pub fn suffersValueMissing(self: *const Select) bool {
     // sense.
     if (opt._value) |v| return v.len == 0;
     return false;
-}
-
-pub fn getDisabled(self: *const Select) bool {
-    return self.asConstElement().getAttributeInterned("disabled") != null;
 }
 
 pub fn getMultiple(self: *const Select) bool {

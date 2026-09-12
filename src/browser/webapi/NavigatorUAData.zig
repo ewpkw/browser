@@ -31,15 +31,15 @@ const Brand = struct {
     version: []const u8,
 };
 
-pub fn getBrands(_: *const NavigatorUAData) []const Brand {
+fn getBrands(_: *const NavigatorUAData) []const Brand {
     return shortBrandList();
 }
 
-pub fn getMobile(_: *const NavigatorUAData) bool {
+fn getMobile(_: *const NavigatorUAData) bool {
     return false;
 }
 
-pub fn getPlatform(_: *const NavigatorUAData) []const u8 {
+fn getPlatform(_: *const NavigatorUAData) []const u8 {
     return uaPlatform();
 }
 
@@ -55,8 +55,15 @@ pub fn toJSON(_: *const NavigatorUAData) struct {
     };
 }
 
-pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
+fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8, exec: *const Execution) !js.Promise {
+    // This should always return `brands` + `mobile` + `platform` and then whatever
+    // "hints" field is requested (assuming the browser has permission), but it's
+    // also valid to just return everything.
+
     _ = hints;
+
+    const brands = brandList();
+
     return exec.js.local.?.resolvePromise(.{
         .brands = shortBrandList(),
         .mobile = false,
@@ -66,18 +73,17 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
         .model = "",
         .platformVersion = "15.0.0",
         .uaFullVersion = "151.0.7813.2",
-        .fullVersionList = fullBrandList(),
+        .fullVersionList = brands,
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
     });
 }
 
-// Low-entropy brand list (navigator.userAgentData.brands / toJSON().brands /
-// getHighEntropyValues().brands): real Chrome/Edge reports the *major* version
-// here (e.g. "151"), not the full build version. This must match
-// Config.HttpHeaders.sec_ch_ua (the Sec-Ch-Ua HTTP header), which also uses
-// .version, otherwise a fingerprinting check comparing the two finds them
-// inconsistent and flags the client as non-Chrome.
+// Low-entropy brand list (navigator.userAgentData.brands, toJSON().brands and
+// getHighEntropyValues().brands): real Chrome/Edge report the *major* version
+// there ("151"), never the full build version, and it must match the Sec-Ch-Ua
+// HTTP header (Config.HttpHeaders.sec_ch_ua, which uses .version). `brandList`
+// above carries the full versions and is only correct for `fullVersionList`.
 fn shortBrandList() []const Brand {
     const out = comptime blk: {
         const src = &Config.HttpHeaders.brands;
@@ -91,10 +97,7 @@ fn shortBrandList() []const Brand {
     return &out;
 }
 
-// High-entropy fullVersionList: real Chrome/Edge reports the full build
-// version here (e.g. "151.0.7813.2"), matching
-// Config.HttpHeaders.sec_ch_ua_full_version_list.
-fn fullBrandList() []const Brand {
+fn brandList() []const Brand {
     const out = comptime blk: {
         const src = &Config.HttpHeaders.brands;
         var arr: [src.len]Brand = undefined;
