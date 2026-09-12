@@ -3581,10 +3581,81 @@ pub const Transfer = struct {
             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
         }
 
+        try self.seedFetchMetadata();
+
         // --http-header extras; setHeader so a same-name header (e.g.
         // Accept-Language) overrides the baseline instead of duplicating.
         for (self.client.network.config.httpHeaders()) |hdr| {
             try self.setHeader(hdr.name, hdr.value, .{ .source = .cli });
+        }
+    }
+
+    // Chrome sets the Sec-Fetch-* family on every request it starts, so a
+    // client that never sends them is conspicuous on its own. But the values
+    // have to agree with each other and with what is being fetched: one fixed
+    // triple in baselineHeaders() would have a <script> claiming
+    // `sec-fetch-dest: document`, which is louder than sending nothing. Hence
+    // they are derived per request, here, where the resource type and the
+    // initiator are known.
+    fn seedFetchMetadata(self: *Transfer) !void {
+        const req = &self.req;
+
+        const maybe_dest: ?[]const u8 = switch (req.resource_type) {
+            .document => "document",
+            .stylesheet => "style",
+            .script => "script",
+            .image => "image",
+            .xhr, .fetch, .eventsource => "empty",
+            // The spec splits workers into several destinations (classic vs
+            // module, shared, nested) and we don't guess: those requests keep
+            // sending no fetch metadata at all.
+            .worker => null,
+        };
+        const dest = maybe_dest orelse return;
+
+        // The Fetch standard's request modes are exactly Chrome's
+        // sec-fetch-mode values.
+        const mode: []const u8 = switch (req.request_mode) {
+            .navigate => "navigate",
+            .cors => "cors",
+            .no_cors => "no-cors",
+            .same_origin => "same-origin",
+        };
+
+        // Chrome keys `sec-fetch-site` off the *initiating* document. For a
+        // subresource `req.origin` is exactly that. For a navigation it is
+        // not: Frame resolves its own origin to the destination before the
+        // request goes out, so anything derived from it would have a brand new
+        // page claim it was opened by a page that does not exist yet — a
+        // louder tell than sending nothing. No initiator reaches this layer,
+        // so navigations report "none", which is what Chrome sends for a
+        // user-initiated top-level load.
+        const site: []const u8 = if (req.resource_type == .document) "none" else blk: {
+            const origin = req.origin orelse break :blk "none";
+            if (URL.isSameOrigin(req.url, origin)) {
+                break :blk "same-origin";
+            }
+            if (Cookie.areHostsSameSite(URL.getHostname(req.url), URL.getHostname(origin))) {
+                break :blk "same-site";
+            }
+            break :blk "cross-site";
+        };
+
+        // Baseline priority (.user_agent), like the client hints: a driver or
+        // --http-header stays free to override any of them.
+        try self.addHeader("Sec-Fetch-Dest", dest, .{});
+        try self.addHeader("Sec-Fetch-Mode", mode, .{});
+        try self.addHeader("Sec-Fetch-Site", site, .{});
+
+        // Only navigations carry these, and `?1` says a person triggered the
+        // request — which is what a driver fetching a page on someone's behalf
+        // looks like. Subresources never get an `Upgrade-Insecure-Requests` or
+        // a user-activation flag, and Chrome only hints priority on the main
+        // document.
+        if (req.resource_type == .document) {
+            try self.addHeader("Sec-Fetch-User", "?1", .{});
+            try self.addHeader("Upgrade-Insecure-Requests", "1", .{});
+            try self.addHeader("Priority", "u=0, i", .{});
         }
     }
 
