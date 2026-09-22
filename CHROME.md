@@ -891,7 +891,7 @@ zig build --fetch
 export LIGHTPANDA_DISABLE_TELEMETRY=1
 ZIGFLAGS="-Dcpu=skylake_avx512" make build
 mkdir -p "$HOME/.local/bin" && cp -f zig-out/bin/lightpanda "$HOME/.local/bin/lightpanda"
-echo "完成：lightpanda serve --host 0.0.0.0 --port 9222"
+echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loopback，理由见 §9-15
 ```
 
 用法：`chmod +x init.sh && sudo ./init.sh /path/to/browser`
@@ -931,6 +931,9 @@ echo "完成：lightpanda serve --host 0.0.0.0 --port 9222"
 12. 小噪声（非问题）：httpbin 把请求头名按首字母大写重新格式化，回显成 `Sec-Ch-Ua-Wow64`；实际发出的是 `Sec-Ch-Ua-WoW64`（`baselineHeaders` 可证）。
 13. **`Browser.getVersion` 的 `jsVersion` / `revision` / `protocolVersion` 仍是上游硬编码值**（`JS_VERSION = "12.4.254.8"`、`REVISION = "@9e6ded5ac…"`）：5.8 只对齐了 `userAgent` 与 `product`，V8 版本与 Edge 151 不自洽。**本轮决定不改**（按第 2 节原则 6：没有站点拿 jsVersion 去交叉比对 UA，改动只会多两个无谓的 delta）；若以后要改，就在 5.8 那节里多贴两个常量。
 14. **⚠ 待你核实的存疑值（本次未改）**：真实 Edge 的 `Sec-Ch-Ua-Full-Version-List` 里，`Microsoft Edge` 应该用 **Edge 自己的构建号**（形如 `15x.0.4xxx.x`），`Chromium` 才用 Chrome 底座的构建号（形如 `15x.0.8xxx.x`）。当前 `Config.HttpHeaders.brands` 两项都写的是同一个 `151.0.7813.2`（Chrome 风格的号）。影响范围：`Sec-Ch-Ua-Full-Version-List`、`getHighEntropyValues().fullVersionList` / `uaFullVersion`、`Browser.getVersion` 的 `product`（5.8 故意与它们同源，所以改要一起改）。**需你先用真机 Edge 151 抄一份真实头再定**，本轮按你的要求保持 151 与现有取值不动。
+15. **`/json/version` 明文自报 `Lightpanda/1.0`**（`src/server/http.zig` 的 `buildJSONVersionResponse()`：`"Browser"` 与 `"User-Agent"` 两个值都是硬编码的 `Lightpanda/1.0`，另有一个键名就叫 `Lightpanda-Version`）。**决定：不改**，fork 保持 8 个文件。**理由：页面脚本读不到** —— 该响应不带任何 `Access-Control-*` 头（已在 `http.zig` 全文核实），跨源的 `fetch`/`XHR` 打 `127.0.0.1:9222/json/version` 会被 CORS 拦住拿不到响应体（只能探测到端口存活，真 Chrome 的 DevTools 端点也一样），WS 升级路径另有 `ForbiddenOrigin` / `ForbiddenHost` 校验。所以 bot.sannysoft / browserscan / creepjs 这类**站点侧**检测看不到它，与第 1 节不变量 2 不冲突。
+    **失效条件（必须守住）**：跨源只拦浏览器，拦不住直连客户端。上面那个结论仅在 **CDP 端口不出 loopback** 时成立 —— CLI 默认 `--host 127.0.0.1`（`Config.zig` 的 `serve.host`），一旦改成 `0.0.0.0`/对外暴露，同网段任何能连上端口的对端 curl 一次就拿走明文 `Lightpanda/1.0`（含版本号）。如果部署形态必须对外，再回来把这一条改成 fork（届时两个值跟 5.8 同源，`Lightpanda-Version` 键名要一并换）。
+    **运维口径（本轮已定）**：本文档所有启动示例统一写 `--host 127.0.0.1`（含 8.7 一键脚本的收尾提示），与 CLI 默认一致；反爬站点的威胁模型里“监听地址”不是对外特征（它进不了内网端口），所以该泄露面属于运维问题，不归本分支的伪造特征范围。真需要跨机访问 CDP 时再评估上面那句 fork。
 
 ---
 
