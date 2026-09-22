@@ -2,7 +2,7 @@
 
 本文档的唯一用途：**让每一次上游同步又快又不出错**。因此只写两类内容——① 当前状态（分支目的、人设取值、fork 增量、已知限制），② 可重放流程（同步 SOP、验收、环境与编译、从零重建）。一次性迁移记录（某次要重抓哪个依赖、上次冲突长什么样）不写，处理完即丢。
 
-> **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `e8aa75939`。
+> **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `d873e1bd7`。
 >
 > **版本类信息一律从仓库读，不在本文档写死**，否则必然过期：
 >
@@ -23,7 +23,7 @@
 这条目的优先于"跟随上游"。同步时必须守住的五条不变量：
 
 1. **含 Mozilla 的 UA 一律被接受并生效**（CLI `--user-agent`、CDP `Emulation.setUserAgentOverride`、`Network.setExtraHTTPHeaders` 三条路都不许被挡）。
-2. **HTTP 头与 JS 侧同源自洽**：`Sec-Ch-Ua` ↔ `navigator.userAgentData.brands`；`Sec-Ch-Ua-Full-Version-List` ↔ `getHighEntropyValues().fullVersionList`；`Accept-Language` ↔ `navigator.language(s)`；`userAgent` 去前缀 ↔ `appVersion`。任一对不上就是伪造特征。
+2. **HTTP 头与 JS 侧同源自洽**：`Sec-Ch-Ua` ↔ `navigator.userAgentData.brands`；`Sec-Ch-Ua-Full-Version-List` ↔ `getHighEntropyValues().fullVersionList`；`Accept-Language` ↔ `navigator.language(s)`；`userAgent` 去前缀 ↔ `appVersion`；人设 UA / 完整号 ↔ CDP `Browser.getVersion` 的 `userAgent` + `product`（见 5.8）。任一对不上就是伪造特征。
 3. **低熵 brands 用短版本号，高熵 `fullVersionList` 用完整构建号**，两者不得混用。
 4. **人设不随编译机变化**：`platform`/`architecture`/`bitness` 等一律写死 Windows x86_64 对应值，不读 `builtin`（ARM 机上编译会露馅）。
 5. **CDP 与 CLI 能覆盖 baseline**：默认头一律用最低优先级，不加 `.source = .fixed`。
@@ -46,7 +46,7 @@
 核对命令（任何时候）：
 
 ```bash
-git diff upstream/main..HEAD --stat -- src   # 必须恰好第 4 节那 7 个文件
+git diff upstream/main..HEAD --stat -- src   # 必须恰好第 4 节那 8 个文件
 ```
 
 ---
@@ -60,8 +60,10 @@ git diff upstream/main..HEAD --stat -- src   # 必须恰好第 4 节那 7 个文
 | `Sec-Ch-Ua-Full-Version-List` | `"Not=A?Brand";v="99", "Microsoft Edge";v="151.0.7813.2", "Chromium";v="151.0.7813.2"` |
 | `Sec-Ch-Ua-Platform` / `-Mobile` / `-Arch` / `-Bitness` / `-WoW64` | `"Windows"` / `?0` / `"x86"` / `"64"` / `?0` |
 | `Accept-Language` | `zh-CN,zh;q=0.9,en;q=0.8`（由 `--locale` 推导） |
-| `Sec-Fetch-Dest` / `-Mode` / `-Site` | **逐请求推导**，取值见 5.3(b) |
-| `Sec-Fetch-User` / `Upgrade-Insecure-Requests` / `Priority` | 仅顶层导航：`?1` / `1` / `u=0, i` |
+| `Accept`（仅顶层导航） | `text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`（上游 `Config.HttpHeaders.navigation_accept`，本分支不改） |
+| `Sec-Fetch-Dest` / `-Mode` / `-Site` | **上游逐请求推导**（子帧算 `iframe`、worker 算 `worker`、非 `https` 上下文整族不发、重定向链只准变远）；本分支不再插手，见 5.3(b) |
+| `Sec-Fetch-User` | 仅**用户发起的**顶层导航：`?1`（上游发） |
+| `Upgrade-Insecure-Requests` / `Priority` | 仅用户发起的顶层导航：`1` / `u=0, i`（**上游不发，本分支补**，见 5.3(b)） |
 | `navigator.language` / `.languages` | `zh-CN` / `[zh-CN, zh, en]` |
 | `navigator.appVersion` | UA 去掉 `Mozilla/` 前缀 |
 | `navigator.platform` / `vendor` / `doNotTrack` | `Win32` / `Google Inc.` / `"1"` |
@@ -69,28 +71,30 @@ git diff upstream/main..HEAD --stat -- src   # 必须恰好第 4 节那 7 个文
 | `navigator.userAgentData.brands` | `Not=A?Brand 99` / `Microsoft Edge 151` / `Chromium 151`（短版本号） |
 | `getHighEntropyValues()` | `architecture=x86`、`bitness=64`、`platform=Windows`、`platformVersion=15.0.0`、`uaFullVersion=151.0.7813.2`、`model=""`、`wow64=false`、`formFactor=[Desktop]` |
 | `navigator.plugins.length` | `5` |
+| CDP `Browser.getVersion` | `userAgent` = 上表那串 Edge 151 UA、`product` = `Edg/151.0.7813.2`（见 5.8） |
 | Intl / `toLocaleString` 默认 locale | `zh-CN`（上游 `Platform.init` 在 `InitializeICU` 前 `setenv("LC_ALL", tag)`） |
 
 - `--user-agent-suffix` 拼在默认 UA 之后；`--user-agent` 整体覆盖。
 - 运行时可切换人设而不改代码：`--locale en-US`、CDP `Emulation.setUserAgentOverride({ acceptLanguage })` 会同时刷新 `Accept-Language` 头、`navigator.language(s)`、Intl。
-- **若将来升级 Edge 版本**，要同时改四处才自洽：`Config.user_agent_base`（UA 段始终是 `<短>.0.0.0`）、`Config.HttpHeaders.brands`（`.version` 短号 + `.full_version` 完整号）、`Navigator.getAppVersion`（= UA 去前缀）、`NavigatorUAData.uaFullVersion`（= brands 里 Edge/Chromium 的 `.full_version`）。真实取值可查 `https://headers.depar.ch/microsoft-edge`。`Not=A?Brand` 的 `.full_version` 保持 `"99"` 是真实 Chrome 对该 GREASE 品牌的行为，不是漏改。
+- **若将来升级 Edge 版本**，要同时改**五处**才自洽：`Config.user_agent_base`（UA 段始终是 `<短>.0.0.0`）、`Config.HttpHeaders.brands`（`.version` 短号 + `.full_version` 完整号）、`Navigator.getAppVersion`（= UA 去前缀）、`NavigatorUAData.uaFullVersion`（= brands 里 Edge/Chromium 的 `.full_version`）、`browser.zig` 的 `CDP_USER_AGENT` + `PRODUCT`（见 5.8）。真实取值可查 `https://headers.depar.ch/microsoft-edge`。`Not=A?Brand` 的 `.full_version` 保持 `"99"` 是真实 Chrome 对该 GREASE 品牌的行为，不是漏改。
 
 ---
 
-## 4. fork 增量总览（7 个文件，136 增 / 45 删）
+## 4. fork 增量总览（8 个文件，91 增 / 47 删）
 
 | # | 文件 | 增/删 | 改动点 |
 |---|------|---|---|
 | 1 | `src/Config.zig` | 8 / 8 | 默认 UA、brands、`default_locale`、`validateUserAgent` 行为、CLI 错误提示文案（5 处） |
 | 2 | `src/help.zon` | 4 / 5 | `--user-agent` / `--user-agent-suffix` / `--locale` 帮助文本（3 条） |
-| 3 | `src/network/HttpClient.zig` | 87 / 3 | `baselineHeaders()` 扩为 `[9]` 且两个 Sec-Ch-Ua 头不标 `.fixed`；新增 `seedFetchMetadata()` + `seedHeaders()` 里一行调用（2 处） |
+| 3 | `src/network/HttpClient.zig` | 34 / 3 | `baselineHeaders()` 扩为 `[9]` 且两个 Sec-Ch-Ua 头不标 `.fixed`；新增 `seedNavigationUrgency()` + `seedHeaders()` 里一行调用（2 处）。**Sec-Fetch 家族本身已由上游实现，fork 不再插手**（见 5.3(b)） |
 | 4 | `src/browser/webapi/Navigator.zig` | 7 / 13 | 7 处单行取值 |
 | 5 | `src/browser/webapi/NavigatorUAData.zig` | 26 / 14 | `uaPlatform`、3 处调用改 `shortBrandList()`、高熵 4 个值写死、新增 `shortBrandList()`（4 处 + 1 个新函数） |
 | 6 | `src/browser/webapi/PluginArray.zig` | 1 / 1 | `length` 0 → 5 |
 | 7 | `src/server/cdp/domains/emulation.zig` | 3 / 1 | 删 `error.Reserved` prong（+3 行注释） |
+| 8 | `src/server/cdp/domains/browser.zig` | 8 / 2 | `CDP_USER_AGENT` + `PRODUCT` 对齐人设（2 个常量） |
 
 > 「逻辑改动点」不等于 `git diff` 的 hunk 数（相邻改动会被并成一个 hunk，例如 Navigator 7 行取值只构成 4 个 hunk）。核对以第 5 节的逐项列表为准。
-> `src/browser/webapi/WorkerNavigator.zig` 曾是第 8 个 fork 文件（被迫跟随 `Navigator.getLanguages` 返回类型）。语言人设改由 `default_locale` 驱动后它已回归上游原样，不再是冲突点。
+> 历史上 `src/browser/webapi/WorkerNavigator.zig` 曾多占一个 fork 名额（被迫跟随 `Navigator.getLanguages` 返回类型）。语言人设改由 `default_locale` 驱动后它已回归上游原样，不再是冲突点。
 
 ---
 
@@ -243,71 +247,51 @@ pub fn baselineHeaders(self: *const Client) [9]Transfer.RequestHeader {
 - `Accept-Language` 必须用 `self.getAcceptLanguage()`，不要用已废弃的 `HttpHeaders.accept_language` 常量，否则 `--locale` 与 CDP `acceptLanguage` 不作用于真实请求头。
 - 5 个 Client-Hint 的值只写在这里，`Config.zig` 里不再有对应常量。
 
-**(b) 新增 `seedFetchMetadata()`：逐请求生成 Sec-Fetch 家族**
+**(b) 新增 `seedNavigationUrgency()`：只补上游不发的两个导航头**
 
-不能塞进 `baselineHeaders()`：这一组头互相关联，对所有请求写死同一组值会让一个 `<script>` 自称 `sec-fetch-dest: document`，比干脆不发更显眼。做法是在 `Transfer.seedHeaders()` 里插一行，旁边加一个新函数：
+> **背景（必读）**：基线 `d873e1bd7` 起，**上游自己实现了 Sec-Fetch 家族**——`setFetchMetadataHeaders()`（`HttpClient.zig`，在 `pipeline()` 里与重定向/continue 各入口调用）、`Transfer.FetchSite` 枚举、`Transfer.destination()`、`Request.initiator_origin`。本分支原来那份 `seedFetchMetadata()` 因此被整体删除，**不要再把它贴回来**：它在 `seedHeaders()` 里用 `addHeader` 播种，上游在 `pipeline()` 里用 `setHeader` 发同名头，优先级相同且是覆盖语义 → Dest/Mode/Site 三行等于白写，而它按 `resource_type == .document` 判顶层，会给子帧文档错发 `Sec-Fetch-User: ?1`（真实 Chrome 子帧是 `iframe` 且不带 user flag）。
+
+上游还顺手修好了本分支当年记录的两条已知不一致（原 §9-10 的 ①②）：子帧文档 `dest: iframe`、导航的 `sec-fetch-site` 用真实发起方算。上游机制如下，同步时只需确认它没被改坏，**不需要 fork**：
+
+| 上游机制 | 行为 |
+|---|---|
+| `Transfer.destination()` | `.document` 且 `owner.?.parent != null` → `iframe`，否则 `document`；`worker` → `worker`（本分支当年选择不发，现在发了） |
+| `Request.initiator_origin` | 导航的发起方 origin，由 `Frame.zig` 传入（`navigate` 的 `opts.initiator_origin`、子帧 `self.origin`）；**为 null 才视为"用户发起"** |
+| `FetchSite.forRequest/next` | 导航按 `initiator_origin`、子资源按 `origin` 算 same-origin/same-site/cross-site；重定向链只能变远（`@max`），不会 `a→b→a` 谎报 same-origin |
+| `URL.isPotentiallyTrustworthy` | 非安全上下文（`http://`）**整族 `sec-fetch-*` 不发**，且会先把已播种的低优先级 `sec-fetch-*` 删掉 |
+
+本分支只剩这两个头是上游不发的（真实 Chrome/Edge 的用户发起顶层导航会带）：
 
 ```zig
 // seedHeaders() 里只插这一行：紧跟 baselineHeaders 循环之后、--http-header 循环之前
-try self.seedFetchMetadata();
+try self.seedNavigationUrgency();
 ```
 
 函数全文（同步后原样贴回即可，不碰任何上游函数体）：
 
 ```zig
-fn seedFetchMetadata(self: *Transfer) !void {
+// The Sec-Fetch-* family is upstream's job (`setFetchMetadataHeaders`, which
+// knows the navigation's initiator and the frame hierarchy). What upstream
+// does not send are the two headers a real Chrome/Edge puts on a
+// user-initiated top-level navigation, so this branch adds exactly those,
+// gated on the same condition upstream uses for `Sec-Fetch-User`. Baseline
+// priority (.user_agent), like the client hints: a driver or --http-header
+// stays free to override them.
+fn seedNavigationUrgency(self: *Transfer) !void {
     const req = &self.req;
-
-    const maybe_dest: ?[]const u8 = switch (req.resource_type) {
-        .document => "document",
-        .stylesheet => "style",
-        .script => "script",
-        .image => "image",
-        .xhr, .fetch, .eventsource => "empty",
-        .worker => null, // destination 细分太细，不猜：worker 请求不发 fetch 元数据
-    };
-    const dest = maybe_dest orelse return;
-
-    // Fetch 标准的四种 mode 与 Chrome 的 sec-fetch-mode 值一字不差
-    const mode: []const u8 = switch (req.request_mode) {
-        .navigate => "navigate",
-        .cors => "cors",
-        .no_cors => "no-cors",
-        .same_origin => "same-origin",
-    };
-
-    // 导航一律 none：Frame 在 newRequest 之前就把自身 origin 设成了目标 URL，
-    // 这一层拿不到发起文档；据此算 same-origin 等于让会话第一个请求谎称"由同源
-    // 页面打开"，那本身就是 headless 特征。子资源的 req.origin 才是发起文档。
-    const site: []const u8 = if (req.resource_type == .document) "none" else blk: {
-        const origin = req.origin orelse break :blk "none";
-        if (URL.isSameOrigin(req.url, origin)) {
-            break :blk "same-origin";
-        }
-        if (Cookie.areHostsSameSite(URL.getHostname(req.url), URL.getHostname(origin))) {
-            break :blk "same-site";
-        }
-        break :blk "cross-site";
-    };
-
-    try self.addHeader("Sec-Fetch-Dest", dest, .{});
-    try self.addHeader("Sec-Fetch-Mode", mode, .{});
-    try self.addHeader("Sec-Fetch-Site", site, .{});
-
-    // 只有顶层导航带这三个：?1 表示由用户触发（驱动器替用户加载页面正是这个形态）
-    if (req.resource_type == .document) {
-        try self.addHeader("Sec-Fetch-User", "?1", .{});
-        try self.addHeader("Upgrade-Insecure-Requests", "1", .{});
-        try self.addHeader("Priority", "u=0, i", .{});
+    if (req.request_mode != .navigate or req.initiator_origin != null) {
+        return;
     }
+    try self.addHeader("Upgrade-Insecure-Requests", "1", .{});
+    try self.addHeader("Priority", "u=0, i", .{});
 }
 ```
 
-- 依赖 `URL`（`src/browser/URL.zig`）与 `Cookie`（`storage/Cookie.zig`）两个 import，`HttpClient.zig` 顶部本来就有，不需要新加。
-- `Cookie.areHostsSameSite` 已实现 eTLD+1 比较（走 public suffix list），不要自己重写。
-- 六个头全部用 baseline 优先级（`HeaderOpts` 默认 `.user_agent`），不加 `.fixed`。
-- 不会引发多余预检：`CorsGate` 只对 `.author`（脚本写的）头判 unsafe header。
-- 实测结果：顶层导航 `document/navigate/none/?1` + U-I-R + `u=0, i`；classic script `script/no-cors/same-origin|cross-site`；module script `script/cors/cross-site`；XHR `empty/cors/same-origin`。
+- 判据必须与上游 `setFetchMetadataHeaders()` 里发 `Sec-Fetch-User` 的那句**一字不差地同源**（`request_mode == .navigate and initiator_origin == null`），否则会出现"有 U-I-R 没 Sec-Fetch-User"这种真实浏览器不会有的组合。上游若改名/改判据，这里跟着改。
+- 不依赖 `URL`/`Cookie`：Sec-Fetch 的计算全交上游，本函数只读 `req` 两个字段。
+- 两个头都是 baseline 优先级（`HeaderOpts` 默认 `.user_agent`），不加 `.fixed`；CDP/`--http-header` 仍可覆盖。
+- 与上游的非安全上下文裁剪不冲突：上游只删 `sec-fetch-` 前缀的名字，`Upgrade-Insecure-Requests` 在 `http://` 导航上照发 —— 这恰恰是这个头的用途（请求服务端升级到 HTTPS），真实 Chrome 也是这么做的。
+- **同步检查点**：若哪天上游补上 U-I-R 或 `Priority`，按第 2 节原则 1 把这个函数和这一行调用一起删掉，并删掉本节。
 
 ### 5.4 `src/browser/webapi/Navigator.zig`
 
@@ -422,6 +406,26 @@ const reserved = if (Config.validateUserAgent(ua)) false else |err| switch (err)
 - 错误集收窄后 `switch (err)` 只列 `error.NonPrintable` 就是穷尽的。若上游给 `validateUserAgent` 加了新错误，这里会报「switch 未穷尽」，补上新错误的 prong 即可。
 - 上游 `acceptLanguage` 处理必须收下（与 5.1(c) 配套）：它让 CDP/Playwright 下发的 `acceptLanguage` 同时覆盖 `Accept-Language` 头与 `navigator.languages`。
 
+### 5.8 `src/server/cdp/domains/browser.zig` — `Browser.getVersion`
+
+只改两个常量的值，不动周围的上游注释与逻辑：
+
+```zig
+// 上游
+const CDP_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const PRODUCT = "Chrome/124.0.6367.29";
+
+// 本分支（与 5.1(a) 的 UA、与 5.1(b) brands 里 Microsoft Edge 的 .full_version 同源）
+const CDP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0";
+const PRODUCT = "Edg/151.0.7813.2";
+```
+
+- **为什么必改**：`Browser.getVersion` 是 CDP 客户端（Playwright / Puppeteer）拿 `browser.version()` 的唯一途径。不改的话，客户端看到 Mac Chrome/124，而真实请求头与 `navigator.*` 是 Windows Edge/151 —— 这是一次交叉比对就能抓到的人设自相矛盾（第 1 节不变量 2）。
+- `PRODUCT` 用 `Edg/` 前缀是真实 Edge 的形态（Chrome 是 `Chrome/`，Edge 是 `Edg/`），完整号与 `Sec-Ch-Ua-Full-Version-List` 里 Edge 那一项的 `.full_version` 一字不差。
+- 上游这两行上方已有一句注释（"CDP_USER_AGENT const is not used by the browser for the HTTP client nor exposed to the JS"）——**保留不动**，另在其下面贴本分支自己的 6 行说明。不改 `PROTOCOL_VERSION` / `REVISION` / `JS_VERSION`（见 §9-13）。
+- 该文件的 `test` 直接引用 `CDP_USER_AGENT` / `PRODUCT` 常量作断言，所以改值**不会新增失败测试**（第 10 节不因此加行）。
+- 升级 Edge 版本时这里是第 1 节 §3 末尾说的"五处"之一，别漏。
+
 ---
 
 ## 6. 上游同步 SOP
@@ -434,7 +438,7 @@ lightpanda-io/browser（SSH，只读）= remote `upstream`
         ▼
   本机 main 分支（跟踪上游，永远快进，保持纯净）
         │
-        └── chrome 分支 ── 第 4 节那 7 个生产文件的改动（不碰测试代码）
+        └── chrome 分支 ── 第 4 节那 8 个生产文件的改动（不碰测试代码）
                            备份推到 remote `origin`
 ```
 
@@ -460,13 +464,19 @@ git checkout main && git merge --ff-only upstream/main
 # 2. chrome 合并 main
 git checkout chrome && git merge main
 
-# 3. 解冲突：只会出现在第 4 节那 7 个文件（测试代码永远与上游一致，天然不冲突）
+# 3. 解冲突：只会出现在第 4 节那 8 个文件（测试代码永远与上游一致，天然不冲突）
 for f in $(git diff --name-only --diff-filter=U); do git checkout --theirs "$f"; done
 #    然后照第 5 节把 fork 行逐个贴回去，再 git add <file>
 
+# 3b. 查语义冲突（git 永远不报这一步，但它才是真正的风险所在）：
+#     上游有没有新造出与本分支同一目的的机制？有 -> 按第 2 节原则 1 删掉 fork 那一份。
+#     必查关键字（历史上就是这几类）：
+git log --oneline <旧基线>..upstream/main | grep -iE "sec-fetch|client.?hint|user.?agent|navigator|locale|accept-language|version"
+git grep -n "<本分支某个 fork 函数名>" upstream/main -- src   # 上游是否已有同名/同类实现
+
 # 4. 静态核对（本分支不跑 make test）
 zig fmt --check ./*.zig ./**/*.zig
-git diff upstream/main --stat -- src        # 必须恰好 7 个文件
+git diff upstream/main --stat -- src        # 必须恰好 8 个文件
 
 # 5. 依赖与环境：diff 这两个文件，变了就按 8.3/8.4 重抓
 git diff <旧基线>..upstream/main -- build.zig.zon .github/actions/install/action.yml
@@ -483,6 +493,8 @@ git commit && git push origin chrome
 
 若上游改动让某处 fork 覆盖变多余（上游提供了同类开关），**优先删掉 fork 覆盖、改用上游开关**，并删掉本文档对应条目——这是增量不持续膨胀的唯一办法。
 
+> **这一步不能只靠 `git merge` 的冲突提示**。文本无冲突 ≠ 语义无冲突：上游可以在别的函数里实现同一件事，而你的 fork 因为调得更早/更晚而静默变成死代码（实例：上游的 `setFetchMetadataHeaders()` 用 `setHeader` 覆盖了本分支 `seedHeaders()` 里 `addHeader` 播种的 Sec-Fetch 值，本分支那份实现全量存活却几乎不起作用，见 5.3(b)）。所以 3b 的那两条 grep 是必做的，不依赖有没有冲突。
+
 ### 6.3 从零重建 chrome 分支（换新服务器 / 新仓库）
 
 不需要 cherry-pick 旧 commit：第 5 节就是完整的 fork 源码，直接在上游最新代码上重贴一遍。
@@ -492,14 +504,14 @@ git clone git@github.com:lightpanda-io/browser.git browser && cd browser
 git remote rename origin upstream
 git remote add origin git@github.com:<你的账号>/browser.git   # 占位符
 git checkout -b chrome                      # 基线 = 当时的 upstream/main
-# 照第 5 节 5.1 → 5.7 逐文件贴 fork 改动（贴前先过第 2 节原则 1）
-git diff upstream/main --stat -- src        # 必须恰好 7 个文件
+# 照第 5 节 5.1 → 5.8 逐文件贴 fork 改动（贴前先过第 2 节原则 1）
+git diff upstream/main --stat -- src        # 必须恰好 8 个文件
 zig fmt --check ./*.zig ./**/*.zig
 # 环境按 8.1 → 8.7 装齐，编译 + 按第 7 节验收
 git add -A && git commit -m "feat(chrome): 对齐真实 Chrome/Edge 的 UA 与客户端特征（详见 CHROME.md）" && git push -u origin chrome
 ```
 
-> 备选搬代码法（旧分支基线很旧时才用）：`git checkout <旧chrome> -- <7 个文件>`，但**必须逐个与第 5 节核对**，否则会把旧基线的上游代码一起搬进来。
+> 备选搬代码法（旧分支基线很旧时才用）：`git checkout <旧chrome> -- <8 个文件>`，但**必须逐个与第 5 节核对**，否则会把旧基线的上游代码一起搬进来。
 > 提交前 CHROME.md 必须与代码一致：文档与代码不同步比代码有 bug 更贵。
 
 ### 6.4 每次同步后必须回文档更新的地方
@@ -507,16 +519,17 @@ git add -A && git commit -m "feat(chrome): 对齐真实 Chrome/Edge 的 UA 与�
 | 章节 | 要核什么 |
 |---|---|
 | 文档头 | `fork 基线` 改成新的上游 HEAD |
-| 第 3 节 | 人设取值有没有因上游新机制而变动（如新增 client hint / locale 相关开关） |
-| 第 4、5 节 | 与实际 `git diff upstream/main -- src` 逐条对齐；被上游机制取代的 fork 改动整节删掉 |
-| 第 7 节 | 验收基准值是否需要刷新（实测后回写） |
-| 第 8 节 | 编译/依赖流程本身有没有变（`build.zig` 选项、Makefile 目标、目录迁移） |
+| 第 3 节 | 人设取值有没有因上游新机制而变动（如新增 client hint / locale / 导航头相关开关）；上游新发的头要与本分支补的头对齐（参 5.3(b)） |
+| 第 4、5 节 | 与实际 `git diff upstream/main --numstat -- src` 逐条对齐（**行数也会变**）；被上游机制取代的 fork 改动整节删掉 |
+| 第 6 节 | 本次同步是否把某条“只汇报不改”的限制改成了 fork 文件（§4 文件数会变） |
+| 第 7 节 | 验收基准值是否需要刷新（**实测后**才回写，没实测就标注"待复验"，不要直接搬旧值） |
+| 第 8 节 | 编译/依赖流程本身有没有变（`build.zig` 选项、Makefile 目标、目录迁移）；`zig-v8` tag 变了则 8.3 的坑 1 会重现 |
 | 第 9 节 | 上游 API 补齐了哪条限制（补齐就从清单里删掉） |
 
 核对命令（三条全绿才算同步完成）：
 
 ```bash
-git diff upstream/main..HEAD --stat -- src   # 恰好 7 个文件
+git diff upstream/main..HEAD --stat -- src   # 恰好 8 个文件
 zig fmt --check ./*.zig ./**/*.zig            # 与 CI 一致
 zig build --fetch                            # 依赖可离线解析
 ```
@@ -526,7 +539,7 @@ zig build --fetch                            # 依赖可离线解析
 | 频率 | 操作 |
 |---|---|
 | 每周 | `git fetch upstream`，`git merge-tree` 干跑评估冲突 |
-| 上游有 UA / client hint / navigator / locale / sec-fetch 相关变更 | 立即同步，确认第 1 节五条不变量未被削弱 |
+| 上游有 UA / client hint / navigator / locale / sec-fetch 相关变更 | 立即同步，并**必须做 6.2 第 3b 步**（同一类机制的语义冲突只在这里能发现），确认第 1 节五条不变量未被削弱 |
 | `build.zig.zon` / `action.yml` 变更 | 按 6.2 第 5 步重抓依赖，核对 V8 tag 与 Zig 版本 |
 
 ---
@@ -546,8 +559,9 @@ cp -f zig-out/bin/lightpanda ~/.local/bin/lightpanda && lightpanda version
 # 2. HTTP 请求头：与第 3 节表格逐项核对
 lightpanda fetch --dump html "https://httpbin.org/headers"
 #   Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
-#   Sec-Fetch-Dest: document / Mode: navigate / Site: none / User: ?1
-#   Upgrade-Insecure-Requests: 1  Priority: u=0, i      <-- 只在顶层导航出现
+#   Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8   <-- 上游发的
+#   Sec-Fetch-Dest: document / Mode: navigate / Site: none / User: ?1        <-- 上游发的
+#   Upgrade-Insecure-Requests: 1  Priority: u=0, i      <-- 本分支补的（5.3(b)），只在用户发起的顶层导航出现
 
 # 3. JS 侧指纹与 HTTP 头锁得住（核心一致性检查）
 #    脚本必须包在显式 <body> 里：写成 data:text/html,<script>…document.body… 会在 <head>
@@ -569,6 +583,8 @@ lightpanda fetch --load-resources iframe,worker --wait-until networkidle --wait-
 lightpanda fetch --load-resources iframe,worker --wait-until networkidle --wait-ms 15000 --dump markdown "https://abrahamjuliot.github.io/creepjs/"
 
 # 5b. 已实测基准（同一套命令的正常输出长这样，偏离就是回归）
+#     ⚠ 下列值是在旧基线 e8aa75939 上测的；同步后（当前 d873e1bd7）尚未重跑过这三条，
+#       当成"预期大致如此"看，跑完请把实际结果回写本节（第 6 节第 7 条的规矩）。
 #   browserscan Bot Detection：WebDriver / WebDriver Advance / Selenium / Webdriverio /
 #     NightmareJS / PhantomJS / Awesomium / Cef / CefSharp / Coaches / FMiner / Born /
 #     Phantomas / Rhino / Headless Chrome / CDP / Dev Tool —— 共 17 项全 Normal，0 Abnormal
@@ -633,6 +649,10 @@ await send("Network.setExtraHTTPHeaders", { headers: { "Sec-Ch-Ua": '"Chromium";
 await send("Page.navigate", { url: "https://httpbin.org/headers" }, sid);
 await new Promise((r) => setTimeout(r, 2500));
 console.log("C headers =", await evalJs(sid, "document.body.innerText"));
+
+// D: Browser.getVersion 必须报同一个人设（对应 5.8）
+const ver = await send("Browser.getVersion", {});
+console.log("D getVersion =", JSON.stringify({ product: ver.product, userAgent: ver.userAgent }));
 ws.close();
 MJS
 node /tmp/cdp_check.mjs
@@ -644,9 +664,10 @@ node /tmp/cdp_check.mjs
 | `A2` | `["en-US","en"]` | `acceptLanguage` 没接入 `setAcceptLanguageOverride` |
 | `B` | UA = A1 值、`Accept-Language: en-US,en;q=0.9` | 覆盖只作用 JS、没进真实请求头 |
 | `C` | `Sec-Ch-Ua` = `"Chromium";v="999"`，且出现 `X-Cdp-Probe: 42` | 上游把 `.source = .fixed` 加回来了，或漏发 `Network.enable` |
+| `D` | `product` = `Edg/151.0.7813.2`、`userAgent` = A1 那串 | 5.8 那两个常量被上游原版覆盖回来了（`Browser.getVersion` 与真实头分叉，Playwright 拿到的版本就假） |
 | `/tmp/lp.log` | **不得出现** `User agent must not contain Mozilla`、`ignore overriding fixed header` | 分支核心目的失效 |
 
-### 第八步：Sec-Fetch 逐资源类型自洽性（验 5.3(b)）
+### 第八步：Sec-Fetch 逐资源类型自洽性（验 5.3(b)：上游机制 + 本分支补的两个头）
 
 `--dump` 只能看到顶层导航；子资源要看 CDP 的 `Network.requestWillBeSent`：
 
@@ -680,15 +701,20 @@ MJS
 node --check /tmp/cdp_secfetch.mjs && node /tmp/cdp_secfetch.mjs
 ```
 
-| 条目类型 | 应包含 |
-|---|---|
-| Document | `dest: document`、`mode: navigate`、`site: none`、`user: ?1`、`upgrade-insecure-requests: 1`、`priority: u=0, i` |
-| Script（classic `<script src>`） | `dest: script`、**`mode: no-cors`**、`site: same-origin` 或 `cross-site`，**无** user / U-I-R / priority |
-| Script（module 或 `crossorigin`） | `dest: script`、`mode: cors`、`site: …` |
-| Image | `dest: image`、`mode: no-cors`、`site: …` |
-| Stylesheet | `dest: style`、`mode: cors`、`site: …` |
-| XHR / Fetch | `dest: empty`、`mode: cors`、`site: …` |
-| Worker | 不发任何 sec-fetch（表里不猜，见第 9 节） |
+| 条目类型 | 应包含 | 谁发的 |
+|---|---|---|
+| Document（CDP/CLI 发起的顶层导航） | `dest: document`、`mode: navigate`、`site: none`、`user: ?1`、`upgrade-insecure-requests: 1`、`priority: u=0, i` | 前四项上游，后两项本分支 |
+| Document（页内跳转、链接导航） | `dest: document`、`mode: navigate`、`site: same-origin\|same-site\|cross-site`、**无** `user`、**无** U-I-R / priority | 全上游（`initiator_origin` 不为 null） |
+| 子帧文档（iframe） | `dest: iframe`、`mode: navigate`（或 `no-cors`）、`site: …`、**无** `user` | 全上游 |
+| Script（classic `<script src>`） | `dest: script`、**`mode: no-cors`**、`site: same-origin` 或 `cross-site`，**无** user / U-I-R / priority | 全上游 |
+| Script（module 或 `crossorigin`） | `dest: script`、`mode: cors`、`site: …` | 全上游 |
+| Image | `dest: image`、`mode: no-cors`、`site: …` | 全上游 |
+| Stylesheet | `dest: style`、`mode: cors`、`site: …` | 全上游 |
+| XHR / Fetch | `dest: empty`、`mode: cors`、`site: …` | 全上游 |
+| Worker | `dest: worker`、`mode: …`、`site: …` | 全上游（本分支旧版选择不发，现已交上游） |
+| 任何 `http://`（非安全上下文）请求 | **不发 `sec-fetch-*` 整族**；但顶层导航仍发 U-I-R / priority | 上游裁剪 + 本分支补 |
+
+> 前三行是本轮同步的重点：旧版本它们全坏在同一个位置（本分支按 `resource_type == .document` 判顶层），现在全部由上游拿真实发起方算。跑这一步时只要看到子帧或页内跳转带上了 `user: ?1`，或 `site` 永远是 `none`，说明上游的 `initiator_origin` 链路被改坏了。
 
 ---
 
@@ -899,10 +925,12 @@ echo "完成：lightpanda serve --host 0.0.0.0 --port 9222"
 7. **`navigator.plugins` 内容仍为空**（只改了 `length`，见 5.6）。
 8. **CDP 无法运行时改 Intl/Date 的 locale/timezone**：上游 `Emulation.setLocaleOverride` / `setTimezoneOverride` 是 noop（需要 zig-v8-fork 暴露 `Isolate::DateTimeConfigurationChangeNotification` 与 ICU 默认 locale 绑定），只能靠进程参数 `--locale` / `--timezone`。
 9. **`window.chrome`、`navigator.getBattery`、`navigator.getUserMedia`、`window.outerHeight/outerWidth` 未实现**（上游 API 缺失）：bot.sannysoft 上表现为 `Chrome (New) missing (failed)`、`HEADCHR_CHROME_OBJ FAIL`、`CHR_BATTERY FAIL`，creepjs 报 `ReferenceError: outerHeight is not defined`。`window.chrome` 是个很小的空对象桩，getBattery 要实现 Promise 对象——**待决策，未做**。
-10. **Sec-Fetch 的覆盖边界**（5.3(b) 已补齐主链路）：`worker` 类型不发 fetch 元数据（规范 destination 细分太细，不猜）；子资源不发 `Priority`（真实 Chrome 每请求都带，但 urgency 依赖一堆启发式）；`Accept-Encoding` 仍是 `deflate, gzip, br`，真实 Edge 是 `gzip, deflate, br, zstd`（由 curl 编译选项决定）。
-    两条已知不一致：① 开 `--load-resources iframe` 后子帧文档请求会自称 `dest: document` + `user: ?1`（Chrome 是 `iframe` 且不带 user flag）——`Request` 上找不出可靠的"是否顶层"信号（`document_frame_id` 对子帧也等于自身 `frame_id`，见 `global_scope.zig:164`），宁可不猜；② 导航的 `sec-fetch-site` 恒为 `none`，页内跳转时 Chrome 会给 `same-origin`/`same-site`/`cross-site`，要真值必须把发起文档从 `Frame.navigate` 当 `cookie_origin` 传下来（上游注释已为这件事留了字段），但那会新增一个 fork 文件，按最小增量原则暂不做，代价是带 Referer 的页内跳转会 `none` + Referer 轻度不一致。
-11. **换 UA 人设时 client hints 不跟着变**：`--user-agent` 只改 UA（实测 UA 变 Chrome/120 而 `Sec-Ch-Ua` 仍是 151），`--http-header` 又拦住 `Sec-Ch-Ua`（见第 6 条）。要换版本人设：走 CDP（`Network.enable` + `setExtraHTTPHeaders`，实测可覆盖），或同时改代码里的 `user_agent_base` + `brands`（第 3 节末尾那四处）。
+10. **Fetch 元数据的覆盖边界**（Sec-Fetch 家族本身已由上游实现，见 5.3(b)）：子资源不发 `Priority`（真实 Chrome 每请求都带，但 urgency 依赖一堆启发式，本分支只在顶层导航补一个 `u=0, i`）；`Accept-Encoding` 仍是 `deflate, gzip, br`，真实 Edge 是 `gzip, deflate, br, zstd`（由 curl 编译选项决定）；`Accept` 缺 `image/avif,image/webp,...` 那一段（上游 `navigation_accept` 的原值，本分支不改）。
+    旧版这两条已知不一致已被上游修正，不属本分支了：① 子帧文档自称 `dest: document` + `user: ?1`（现为 `iframe` 且不带 user flag）；② 导航的 `sec-fetch-site` 恒为 `none`（现按 `Request.initiator_origin` 算真值）。
+11. **换 UA 人设时 client hints 不跟着变**：`--user-agent` 只改 UA（实测 UA 变 Chrome/120 而 `Sec-Ch-Ua` 仍是 151），`--http-header` 又拦住 `Sec-Ch-Ua`（见第 6 条）。要换版本人设：走 CDP（`Network.enable` + `setExtraHTTPHeaders`，实测可覆盖），或同时改代码里的 `user_agent_base` + `brands`（第 3 节末尾那**五处**）。注意 `Browser.getVersion` 不会跟着 `--user-agent` 变（它是 5.8 的编译期常量）。
 12. 小噪声（非问题）：httpbin 把请求头名按首字母大写重新格式化，回显成 `Sec-Ch-Ua-Wow64`；实际发出的是 `Sec-Ch-Ua-WoW64`（`baselineHeaders` 可证）。
+13. **`Browser.getVersion` 的 `jsVersion` / `revision` / `protocolVersion` 仍是上游硬编码值**（`JS_VERSION = "12.4.254.8"`、`REVISION = "@9e6ded5ac…"`）：5.8 只对齐了 `userAgent` 与 `product`，V8 版本与 Edge 151 不自洽。**本轮决定不改**（按第 2 节原则 6：没有站点拿 jsVersion 去交叉比对 UA，改动只会多两个无谓的 delta）；若以后要改，就在 5.8 那节里多贴两个常量。
+14. **⚠ 待你核实的存疑值（本次未改）**：真实 Edge 的 `Sec-Ch-Ua-Full-Version-List` 里，`Microsoft Edge` 应该用 **Edge 自己的构建号**（形如 `15x.0.4xxx.x`），`Chromium` 才用 Chrome 底座的构建号（形如 `15x.0.8xxx.x`）。当前 `Config.HttpHeaders.brands` 两项都写的是同一个 `151.0.7813.2`（Chrome 风格的号）。影响范围：`Sec-Ch-Ua-Full-Version-List`、`getHighEntropyValues().fullVersionList` / `uaFullVersion`、`Browser.getVersion` 的 `product`（5.8 故意与它们同源，所以改要一起改）。**需你先用真机 Edge 151 抄一份真实头再定**，本轮按你的要求保持 151 与现有取值不动。
 
 ---
 
@@ -918,6 +946,10 @@ echo "完成：lightpanda serve --host 0.0.0.0 --port 9222"
 | `cdp.Emulation: setUserAgentOverride acceptLanguage drives navigator.languages` | 首句断言默认 `navigator.language === 'en-US'` |
 | `cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent` / `… smuggled via a colon in the key` | 断言拒绝 Mozilla UA |
 | `WebApi: Navigator` / `WebApi: NavigatorUAData` 系列 | 断言 `vendor === ''`、`platform` 跟编译机、`doNotTrack === null`、默认并发/内存/触点数、`brands` 为 `Lightpanda` 全版本号 |
-| fetch / CDP Network 域里断言"请求头集合恰好等于某几个"的用例 | 5.3(b) 给每个请求新增了 Sec-Fetch 元数据 |
+
+两个本轮核实过、**不列入上表**的点（免得下次同步误判）：
+
+- `src/server/cdp/domains/browser.zig` 的 `test` 直接拿 `CDP_USER_AGENT` / `PRODUCT` 常量作期望值，所以 5.8 改值不产生失败测试。
+- 上游自己的 Sec-Fetch 测试（`HttpClient.zig` 里的 `sec-fetch-*` 断言、`tests/net/fetch.html`）逐个头断言，不断言"头集合恰好等于哪几个"；本分支只剩 U-I-R + Priority 两个额外头，不跟这些断言冲突。旧版表格最后那一行（"fork 给每个请求新增 Sec-Fetch 元数据以至断言集不对"）已随 5.3(b) 收敛到上游而作废；**但若以后上游新增"恰好等于 N 个头"式的断言，失败原因就归到这一条**，处遇同上：不修不删。
 
 > 唯一需要守住的纪律：**永远不要把这类测试"反向改写"成断言接受 Mozilla UA**。那会让测试变绿但污染测试代码，并使 `git diff upstream/main --stat -- src` 多出文件——违反第 2 节原则 6。

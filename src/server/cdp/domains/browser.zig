@@ -38,8 +38,14 @@ const REVISION = "@9e6ded5ac1ff5e38d930ae52bd9aec09bd1a68e4";
 // CDP_USER_AGENT const is not used by the browser for the HTTP client (see
 // src/http/client.zig) nor exposed to the JS (see
 // src/browser/html/navigator.zig).
-const CDP_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-const PRODUCT = "Chrome/124.0.6367.29";
+// This branch must answer with the same persona the HTTP headers and
+// navigator.* report (see CHROME.md): a CDP client cross-checking
+// Browser.getVersion against the real requests would otherwise see a Mac
+// Chrome/124 on one side and Windows Edge/151 on the other. `product` uses
+// Edge's own `Edg/` prefix and the full build version, matching
+// Config.HttpHeaders.brands' Microsoft Edge .full_version.
+const CDP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0";
+const PRODUCT = "Edg/151.0.7813.2";
 
 const JS_VERSION = "12.4.254.8";
 const DEV_TOOLS_WINDOW_ID = 1923710101;
