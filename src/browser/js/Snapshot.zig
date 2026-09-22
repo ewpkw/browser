@@ -20,6 +20,7 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("js.zig");
+const WasmStreaming = @import("WasmStreaming.zig");
 const bridge = @import("bridge.zig");
 const reflect = @import("../reflect.zig");
 
@@ -33,6 +34,7 @@ const log = lp.log;
 const JsApis = bridge.JsApis;
 const PageJsApis = bridge.PageJsApis;
 const SharedWorkerJsApis = bridge.SharedWorkerJsApis;
+const ServiceWorkerJsApis = bridge.ServiceWorkerJsApis;
 const DedicatedWorkerJsApis = bridge.DedicatedWorkerJsApis;
 
 const Snapshot = @This();
@@ -151,6 +153,11 @@ pub fn create() !Snapshot {
     const isolate = v8.v8__SnapshotCreator__getIsolate(snapshot_creator).?;
     defer v8.v8__Isolate__LowMemoryNotification(isolate);
 
+    // WebAssembly.compileStreaming/instantiateStreaming are installed at
+    // context genesis, and only if the isolate has a streaming callback. The
+    // pointer is not serialized; the runtime isolate registers its own.
+    v8.v8__Isolate__SetWasmStreamingCallback(isolate, WasmStreaming.callback);
+
     {
         // CreateBlob, which we'll call once everything is setup, MUST NOT
         // be called from an active HandleScope. Hence we have this scope to
@@ -218,6 +225,12 @@ pub fn create() !Snapshot {
             const SharedWorkerGlobalScope = @import("../webapi/SharedWorkerGlobalScope.zig");
             const index = try createSnapshotContext(.worker, &SharedWorkerJsApis, SharedWorkerGlobalScope.JsApi, isolate, snapshot_creator.?, &templates);
             std.debug.assert(index == 2);
+        }
+
+        {
+            const ServiceWorkerGlobalScope = @import("../webapi/ServiceWorkerGlobalScope.zig");
+            const index = try createSnapshotContext(.worker, &ServiceWorkerJsApis, ServiceWorkerGlobalScope.JsApi, isolate, snapshot_creator.?, &templates);
+            std.debug.assert(index == 3);
         }
     }
 
@@ -887,9 +900,7 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
         }
     }
 
-    // The remaining per-class setup targets the class's own instance template;
-    // in [Global] flattening mode the global already has these (or doesn't need
-    // them), so skip it.
+    // Flattening mirrors members onto a global, not per-interface setup.
     if (comptime flatten) {
         return;
     }
@@ -905,7 +916,8 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
         // "console", not "Console").
         const tag = if (@hasDecl(JsApi.Meta, "class_string")) JsApi.Meta.class_string else JsApi.Meta.name;
         const js_value = v8.v8__String__NewFromUtf8(isolate, tag.ptr, v8.kNormal, @intCast(tag.len));
-        v8.v8__Template__Set(@ptrCast(instance), js_name, js_value, v8.ReadOnly + v8.DontEnum);
+        // Interfaces inherit tags from prototypes; namespaces keep own tags.
+        v8.v8__Template__Set(@ptrCast(member_template), js_name, js_value, v8.ReadOnly + v8.DontEnum);
     }
 
     // @LOG-UNKNOWN-PROPERTY

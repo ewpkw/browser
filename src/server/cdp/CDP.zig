@@ -83,8 +83,9 @@ disable_set_cache_disabled: bool = false,
 // one message at a time.
 message_arena: std.heap.ArenaAllocator,
 
-// Used for processing notifications within a browser context.
+// Retained until the outermost notification handler returns.
 notification_arena: std.heap.ArenaAllocator,
+notification_depth: u32 = 0,
 
 // Valid for 1 frame navigation (what CDP calls a "renderer")
 frame_arena: std.heap.ArenaAllocator,
@@ -458,6 +459,10 @@ pub const BrowserContext = struct {
     session_id: ?[]const u8,
     attached_sessions: std.ArrayList(AttachedSession) = .empty,
 
+    // A cancelled text-less keyDown drops the char message that follows it
+    // (chromedp's keyDown/char/keyUp split), as Chrome does.
+    suppress_next_char: bool = false,
+
     security_origin: []const u8,
     page_life_cycle_events: bool,
     secure_context_type: []const u8,
@@ -711,8 +716,8 @@ pub const BrowserContext = struct {
         // (`Label.findLabelByFor` against `ownerDocument`) and visibility
         // checks (`frame._style_manager`) are per-frame; getting this wrong on
         // cross-frame queries produces names/visibility from the wrong document.
-        const fallback = self.mainFrame() orelse return error.FrameNotLoaded;
-        const frame = root.dom.ownerFrame(fallback);
+        const main_frame = self.mainFrame() orelse return error.FrameNotLoaded;
+        const frame = root.dom.ownerFrame(main_frame) orelse return error.InvalidNodeId;
         const label_index = try frame.call_arena.create(Label.LabelByForIndex);
         label_index.* = .{};
         return .{
@@ -936,8 +941,9 @@ pub const BrowserContext = struct {
 
     fn onFrameNavigated(ctx: *anyopaque, msg: *const Notification.FrameNavigated) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        defer self.resetNotificationArena();
-        return @import("domains/page.zig").frameNavigated(self.notification_arena, self, msg);
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        return @import("domains/page.zig").frameNavigated(arena, self, msg);
     }
 
     fn onFrameNavigateFailed(ctx: *anyopaque, msg: *const Notification.FrameNavigateFailed) !void {
@@ -984,14 +990,16 @@ pub const BrowserContext = struct {
                 try self.captured_requests.put(self.frame_arena, key, owned_body);
             }
         }
-        defer self.resetNotificationArena();
-        try network_domain.httpRequestStart(self.notification_arena, self, msg);
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        try network_domain.httpRequestStart(arena, self, msg);
     }
 
     fn onHttpRequestIntercept(ctx: *anyopaque, msg: *const Notification.RequestIntercept) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        defer self.resetNotificationArena();
-        try @import("domains/fetch.zig").requestIntercept(self.notification_arena, self, msg);
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        try @import("domains/fetch.zig").requestIntercept(arena, self, msg);
     }
 
     fn onHttpRequestFail(ctx: *anyopaque, msg: *const Notification.RequestFail) !void {
@@ -1023,7 +1031,8 @@ pub const BrowserContext = struct {
 
     fn onHttpResponseHeadersDone(ctx: *anyopaque, msg: *const Notification.ResponseHeaderDone) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        defer self.resetNotificationArena();
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
 
         // Prepare the captured response value.
         const key = keyFromTransfer(msg.transfer);
@@ -1056,7 +1065,7 @@ pub const BrowserContext = struct {
             };
         }
 
-        return network_domain.httpResponseHeaderDone(self.notification_arena, self, msg);
+        return network_domain.httpResponseHeaderDone(arena, self, msg);
     }
 
     fn onHttpRequestDone(ctx: *anyopaque, msg: *const Notification.RequestDone) !void {
@@ -1087,8 +1096,9 @@ pub const BrowserContext = struct {
 
     fn onHttpRequestAuthRequired(ctx: *anyopaque, data: *const Notification.RequestAuthRequired) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        defer self.resetNotificationArena();
-        try @import("domains/fetch.zig").requestAuthRequired(self.notification_arena, self, data);
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        try @import("domains/fetch.zig").requestAuthRequired(arena, self, data);
     }
 
     fn onHttpRequestServedFromCache(ctx: *anyopaque, msg: *const Notification.RequestServedFromCache) !void {
@@ -1098,18 +1108,28 @@ pub const BrowserContext = struct {
 
     fn onConsoleMessage(ctx: *anyopaque, msg: *const Notification.ConsoleMessage) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        defer self.resetNotificationArena();
-        return @import("domains/console.zig").consoleMessage(self.notification_arena, self, msg);
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        return @import("domains/console.zig").consoleMessage(arena, self, msg);
     }
 
     fn onRuntimeConsoleMessage(ctx: *anyopaque, msg: *const Notification.ConsoleMessage) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
-        defer self.resetNotificationArena();
-        return @import("domains/runtime.zig").consoleMessage(self.notification_arena, self, msg);
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        return @import("domains/runtime.zig").consoleMessage(arena, self, msg);
     }
 
-    fn resetNotificationArena(self: *BrowserContext) void {
-        defer _ = self.cdp.notification_arena.reset(.{ .retain_with_limit = 1024 * 64 });
+    fn acquireNotificationArena(self: *BrowserContext) Allocator {
+        self.cdp.notification_depth += 1;
+        return self.notification_arena;
+    }
+
+    fn releaseNotificationArena(self: *BrowserContext) void {
+        self.cdp.notification_depth -= 1;
+        if (self.cdp.notification_depth == 0) {
+            _ = self.cdp.notification_arena.reset(.{ .retain_with_limit = 1024 * 64 });
+        }
     }
 
     pub fn callInspector(self: *const BrowserContext, msg: []const u8) void {
@@ -1151,7 +1171,8 @@ pub const BrowserContext = struct {
         };
 
         const cdp = self.cdp;
-        const allocator = cdp.link.send_arena.allocator();
+        const allocator = cdp.link.acquireSendArena();
+        defer cdp.link.releaseSendArena();
 
         const field = ",\"sessionId\":\"";
 
@@ -1376,14 +1397,12 @@ pub const Command = struct {
         return self.browser_context.?;
     }
 
-    const SendResultOpts = struct {
-        include_session_id: bool = true,
-    };
-    pub fn sendResult(self: *Command, result: anytype, opts: SendResultOpts) !void {
+    const SendResultOpts = struct {};
+    pub fn sendResult(self: *Command, result: anytype, _: SendResultOpts) !void {
         return self.sender.sendJSON(.{
             .id = self.input.id,
             .result = if (comptime @typeInfo(@TypeOf(result)) == .null) struct {}{} else result,
-            .sessionId = if (opts.include_session_id) self.input.session_id else null,
+            .sessionId = self.input.session_id,
         });
     }
 
@@ -1392,14 +1411,12 @@ pub const Command = struct {
         return self.cdp.sendEvent(method, p, opts);
     }
 
-    const SendErrorOpts = struct {
-        include_session_id: bool = true,
-    };
-    pub fn sendError(self: *Command, code: i32, message: []const u8, opts: SendErrorOpts) !void {
+    const SendErrorOpts = struct {};
+    pub fn sendError(self: *Command, code: i32, message: []const u8, _: SendErrorOpts) !void {
         return self.sender.sendJSON(.{
             .id = self.input.id,
             .@"error" = .{ .code = code, .message = message },
-            .sessionId = if (opts.include_session_id) self.input.session_id else null,
+            .sessionId = self.input.session_id,
         });
     }
 

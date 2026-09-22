@@ -24,6 +24,7 @@ const Env = @import("Env.zig");
 const Origin = @import("Origin.zig");
 const Scheduler = @import("Scheduler.zig");
 const Execution = @import("Execution.zig");
+const WasmStreaming = @import("WasmStreaming.zig");
 
 const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
@@ -103,6 +104,9 @@ identity_arena: Allocator,
 // Unlike other v8 types, like functions or objects, modules are not shared
 // across origins.
 global_modules: std.ArrayList(v8.Global) = .empty,
+
+// WebAssembly streaming compilations still waiting on their Response.
+wasm_streams: std.ArrayList(*WasmStreaming) = .empty,
 
 // Our module cache: normalized module specifier => module.
 module_cache: std.StringHashMapUnmanaged(ModuleEntry) = .empty,
@@ -201,6 +205,10 @@ pub fn deinit(self: *Context) void {
         v8.v8__Global__Reset(global);
     }
 
+    while (self.wasm_streams.pop()) |stream| {
+        stream.abort(null);
+    }
+
     self.page.releaseOrigin(self.origin);
 
     // Clear the embedder data so that if V8 keeps this context alive
@@ -253,6 +261,12 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
         // one context to access another.
         const token_local = v8.v8__Global__Get(&origin.security_token, isolate.handle);
         v8.v8__Context__SetSecurityToken(ls.local.handle, token_local);
+
+        // navigator.serviceWorker is [SecureContext]. With the feature
+        // disabled, Env.createContext has already removed it.
+        if (self.global == .frame and self.page.session.experimental_features.serviceworker and self.execution.isSecureContext() == false) {
+            env.hideServiceWorker(true, ls.local.handle, v8.v8__Context__Global(ls.local.handle).?);
+        }
     }
 }
 

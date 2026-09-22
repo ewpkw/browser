@@ -33,8 +33,8 @@ pub fn parseDimensionViewport(value: []const u8, frame: *Frame) ?f64 {
     const parsed = units.parse(value) catch return null;
     return switch (parsed.unit) {
         .none, .px => parsed.value,
-        .vh => parsed.value * @as(f64, @floatFromInt(frame._page.getViewport().height)) / 100.0,
-        .vw => parsed.value * @as(f64, @floatFromInt(frame._page.getViewport().width)) / 100.0,
+        .vh => parsed.value * @as(f64, @floatFromInt(frame.page.getViewport().height)) / 100.0,
+        .vw => parsed.value * @as(f64, @floatFromInt(frame.page.getViewport().width)) / 100.0,
         else => null,
     };
 }
@@ -206,6 +206,7 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Css";
+        pub const class_string = "CSS";
 
         // Per the CSSOM spec, CSS is a namespace object — members are own
         // properties so Object.entries(CSS) returns them.

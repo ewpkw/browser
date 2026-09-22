@@ -51,6 +51,15 @@ pub const Method = enum(u8) {
     OPTIONS = 5,
     PATCH = 6,
     PROPFIND = 7,
+
+    // The safe methods of RFC 9110 9.2.1 (we have no TRACE). PROPFIND is
+    // read-only in practice but isn't on that list.
+    pub fn isSafe(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .OPTIONS => true,
+            .PUT, .POST, .DELETE, .PATCH, .PROPFIND => false,
+        };
+    }
 };
 
 pub const Header = struct {
@@ -348,6 +357,11 @@ pub const Connection = struct {
         try libcurl.curl_easy_setopt(easy, .copy_post_fields, body.ptr);
     }
 
+    pub fn setNoBody(self: *const Connection) !void {
+        const easy = self._easy;
+        try libcurl.curl_easy_setopt(easy, .no_body, true);
+    }
+
     pub fn setGetMode(self: *const Connection) !void {
         try libcurl.curl_easy_setopt(self._easy, .http_get, true);
     }
@@ -406,6 +420,13 @@ pub const Connection = struct {
         try libcurl.curl_easy_setopt(self._easy, .connect_only, value);
     }
 
+    // Close this connection when the transfer ends instead of returning it to
+    // libcurl's keepalive pool. Read by libcurl when the transfer completes,
+    // so it can be set while the response is being received.
+    pub fn setForbidReuse(self: *const Connection) !void {
+        try libcurl.curl_easy_setopt(self._easy, .forbid_reuse, true);
+    }
+
     pub fn setWriteCallback(
         self: *Connection,
         comptime data_cb: libcurl.CurlWriteFunction,
@@ -454,6 +475,9 @@ pub const Connection = struct {
         // timeouts
         try libcurl.curl_easy_setopt(self._easy, .timeout_ms, config.httpTimeout());
         try libcurl.curl_easy_setopt(self._easy, .connect_timeout_ms, config.httpConnectTimeout());
+
+        // Otherwise requests issued before ALPN settles each open a socket.
+        try libcurl.curl_easy_setopt(self._easy, .pipewait, true);
 
         // compression, don't remove this. CloudFront will send gzip content
         // even if we don't support it, and then it won't be decompressed.

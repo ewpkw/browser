@@ -120,7 +120,7 @@ pub fn init(exec: *const Execution) !*XMLHttpRequest {
         ._exec = exec,
         ._arena = arena,
         ._proto = undefined,
-        ._request_headers = try Headers.init(null, exec),
+        ._request_headers = try Headers.initGuarded(null, .request, exec),
     });
     return self;
 }
@@ -360,7 +360,7 @@ pub fn send(self: *XMLHttpRequest, body_: ?BodyInit, exec_: *const Execution) !v
         try self._request_headers.populateRequestHeaders(transfer);
 
         if (transfer.req.credentialsAllowed()) {
-            try exec.headersForRequest(transfer);
+            try exec.headersForRequest(transfer, .{});
         }
     }
 
@@ -518,6 +518,14 @@ fn getResponseURL(self: *XMLHttpRequest) []const u8 {
 }
 
 fn getResponse(self: *XMLHttpRequest, exec: *const Execution) !?Response {
+    // https://xhr.spec.whatwg.org/#the-response-attribute
+    // default/text can be read while still loading, so we return the
+    // current bytes directly instead of caching a value that would go
+    // stale as more data arrives.
+    if (self._response_type == .default or self._response_type == .text) {
+        return .{ .text = self._response_data.items };
+    }
+
     if (self._ready_state != .done) {
         return null;
     }
@@ -529,7 +537,7 @@ fn getResponse(self: *XMLHttpRequest, exec: *const Execution) !?Response {
 
     const data = self._response_data.items;
     const res: Response = switch (self._response_type) {
-        .default, .text => .{ .text = data },
+        .default, .text => unreachable,
         .json => blk: {
             const local = exec.js.local.?;
 
@@ -559,7 +567,7 @@ fn getResponse(self: *XMLHttpRequest, exec: *const Execution) !?Response {
                     if (!final.isHTML()) {
                         return null;
                     }
-                    const document = try exec._factory.node(Node.Document{ ._proto = undefined, ._type = .generic });
+                    const document = try exec._factory.genericDocument(.{});
                     try Frame.parse.htmlAsChildren(frame, document.asNode(), data);
                     break :blk .{ .document = document };
                 },
@@ -790,21 +798,14 @@ fn stateChanged(self: *XMLHttpRequest, state: ReadyState, exec: *const Execution
 }
 
 fn parseMethod(method: []const u8) !http.Method {
-    if (std.ascii.eqlIgnoreCase(method, "get")) {
-        return .GET;
-    }
-    if (std.ascii.eqlIgnoreCase(method, "post")) {
-        return .POST;
-    }
-    if (std.ascii.eqlIgnoreCase(method, "delete")) {
-        return .DELETE;
-    }
-    if (std.ascii.eqlIgnoreCase(method, "put")) {
-        return .PUT;
-    }
-    if (std.ascii.eqlIgnoreCase(method, "propfind")) {
-        return .PROPFIND;
-    }
+    if (std.ascii.eqlIgnoreCase(method, "get")) return .GET;
+    if (std.ascii.eqlIgnoreCase(method, "put")) return .PUT;
+    if (std.ascii.eqlIgnoreCase(method, "post")) return .POST;
+    if (std.ascii.eqlIgnoreCase(method, "delete")) return .DELETE;
+    if (std.ascii.eqlIgnoreCase(method, "head")) return .HEAD;
+    if (std.ascii.eqlIgnoreCase(method, "options")) return .OPTIONS;
+    if (std.ascii.eqlIgnoreCase(method, "patch")) return .PATCH;
+    if (std.ascii.eqlIgnoreCase(method, "propfind")) return .PROPFIND;
     return error.InvalidMethod;
 }
 
@@ -846,8 +847,21 @@ pub const JsApi = struct {
 };
 
 const testing = @import("../../../testing.zig");
+
+test "parseMethod: accepts known methods case-insensitively" {
+    try testing.expectEqual(.GET, try parseMethod("GET"));
+    try testing.expectEqual(.GET, try parseMethod("get"));
+    try testing.expectEqual(.HEAD, try parseMethod("Head"));
+    try testing.expectEqual(.POST, try parseMethod("post"));
+    try testing.expectEqual(.PUT, try parseMethod("put"));
+    try testing.expectEqual(.DELETE, try parseMethod("delete"));
+    try testing.expectEqual(.OPTIONS, try parseMethod("options"));
+    try testing.expectEqual(.PATCH, try parseMethod("patch"));
+    try testing.expectEqual(.PROPFIND, try parseMethod("propfind"));
+}
+
 test "WebApi: XHR" {
-    testing.expectLog(&.{ .http, .http, .http });
+    testing.expectLog(&.{ .http, .http });
     try testing.htmlRunner("net/xhr.html", .{});
 }
 
