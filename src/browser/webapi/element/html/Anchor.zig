@@ -16,13 +16,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const lp = @import("lightpanda");
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../../js/js.zig");
 const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
-
 const URL = @import("../../../URL.zig");
+
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
@@ -248,7 +249,7 @@ pub const JsApi = struct {
     pub const rel = reflect.string("rel");
     pub const @"type" = reflect.string("type");
     pub const text = bridge.accessor(Anchor.getText, Anchor.setText, .{ .ce_reactions = true });
-    pub const relList = bridge.accessor(_getRelList, null, .{ .null_as_undefined = true });
+    pub const relList = bridge.accessor(_getRelList, _setRelList, .{ .null_as_undefined = true, .ce_reactions = true });
     pub const toString = bridge.function(Anchor.getHref, .{});
 
     fn _getRelList(self: *Anchor, frame: *Frame) !?*@import("../../collections.zig").DOMTokenList {
@@ -259,6 +260,11 @@ pub const JsApi = struct {
             return null;
         }
         return element.getRelList(frame);
+    }
+
+    fn _setRelList(self: *Anchor, value: lp.String, frame: *Frame) !void {
+        const list = try _getRelList(self, frame) orelse return;
+        try list.setValue(value, frame);
     }
 };
 

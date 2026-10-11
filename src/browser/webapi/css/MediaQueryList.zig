@@ -45,7 +45,7 @@ pub fn init(query: []const u8, frame: *Frame) !*MediaQueryList {
         ._frame = frame,
         ._matches = MediaQuery.matches(media, frame.page.getViewport()),
     });
-    try frame._media_query_lists.append(frame.arena, self);
+    try frame._media_query_lists.append(frame.page_arena, self);
     return self;
 }
 
@@ -73,7 +73,7 @@ pub fn viewportChanged(self: *MediaQueryList) void {
     const frame = self._frame;
     if (!frame.hasDirectListeners(self.asEventTarget(), "change", self._on_change)) return;
     self.dispatchChange(matches) catch |err| {
-        log.warn(.browser, "matchMedia change", .{ .err = err, .media = self._media });
+        log.debug(.browser, "matchMedia change", .{ .err = err, .media = self._media });
     };
 }
 

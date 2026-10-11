@@ -39,6 +39,26 @@ _value: ?[]const u8 = null,
 _selected: bool = false,
 _default_selected: bool = false,
 
+pub fn constructor(text_: ?js.NullableString, value_: ?js.NullableString, default_selected_: ?bool, selected_: ?bool, frame: *Frame) !*Option {
+    const node = try Frame.node_factory.createElementNS(frame.document, .html, "option", null);
+    const el = node.as(Element);
+
+    const text = if (text_) |t| t.value else "";
+    if (text.len > 0) {
+        _ = try node.appendChild(try frame.document.createTextNode(text), frame);
+    }
+    if (value_) |v| {
+        try el.setAttributeSafe(comptime .wrap("value"), .wrap(v.value), frame);
+    }
+    if (default_selected_ orelse false) {
+        try el.setAttributeSafe(comptime .wrap("selected"), comptime .wrap(""), frame);
+    }
+
+    const self = el.as(Option);
+    self._selected = selected_ orelse false;
+    return self;
+}
+
 pub fn asElement(self: *Option) *Element {
     return Factory.protoOf(self).asElement();
 }
@@ -50,14 +70,12 @@ pub fn asNode(self: *Option) *Node {
 }
 
 pub fn getValue(self: *Option, frame: *Frame) []const u8 {
-    // If value attribute exists, use that; otherwise use text content (stripped)
+    // If value attribute exists, use that; otherwise use the text
     if (self._value) |v| {
         return v;
     }
 
-    const node = self.asNode();
-    const text = node.getTextContentAlloc(frame.local_arena) catch return "";
-    return std.mem.trim(u8, text, &std.ascii.whitespace);
+    return self.strippedText(frame.local_arena);
 }
 
 pub fn setValue(self: *Option, value: []const u8, frame: *Frame) !void {
@@ -67,8 +85,24 @@ pub fn setValue(self: *Option, value: []const u8, frame: *Frame) !void {
 }
 
 pub fn getText(self: *const Option, frame: *Frame) []const u8 {
+    return self.strippedText(frame.call_arena);
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+fn strippedText(self: *const Option, allocator: std.mem.Allocator) []const u8 {
     const node: *Node = @constCast(self.asConstElement().asConstNode());
-    return node.getTextContentAlloc(frame.call_arena) catch "";
+    const content = node.getTextContentAlloc(allocator) catch return "";
+
+    // Strip and collapse ASCII whitespace.
+    var result = std.ArrayList(u8).initCapacity(allocator, content.len) catch return "";
+    var it = std.mem.tokenizeAny(u8, content, " \t\n\r\x0C");
+    while (it.next()) |word| {
+        if (result.items.len > 0) {
+            result.appendAssumeCapacity(' ');
+        }
+        result.appendSliceAssumeCapacity(word);
+    }
+    return result.items;
 }
 
 fn setText(self: *Option, value: []const u8, frame: *Frame) !void {
@@ -79,7 +113,7 @@ pub fn getSelected(self: *const Option) bool {
     return self._selected;
 }
 
-fn setSelected(self: *Option, selected: bool, frame: *Frame) !void {
+pub fn setSelected(self: *Option, selected: bool, frame: *Frame) !void {
     self.setSelectedness(selected);
     frame.domChanged();
 }
@@ -96,7 +130,7 @@ fn setSelectedness(self: *Option, selected: bool) void {
 }
 
 /// The <select> this option belongs to, directly or through an <optgroup>.
-fn ownerSelect(self: *Option) ?*Select {
+pub fn ownerSelect(self: *Option) ?*Select {
     var node = self.asNode().parentNode();
     while (node) |n| : (node = n.parentNode()) {
         if (n.is(Select)) |select| return select;
@@ -135,12 +169,14 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLOptionElement";
+        pub const constructor_alias = "Option";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     const reflect = Element.Reflect(Option);
 
+    pub const constructor = bridge.constructor(Option.constructor, .{});
     pub const value = bridge.accessor(Option.getValue, Option.setValue, .{ .ce_reactions = true });
     pub const text = bridge.accessor(Option.getText, Option.setText, .{ .ce_reactions = true });
     pub const label = bridge.accessor(Option.getLabel, Option.setLabel, .{ .ce_reactions = true });

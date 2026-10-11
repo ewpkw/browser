@@ -66,6 +66,22 @@ const InitializeParams = struct {
     clientInfo: Implementation,
 };
 
+/// `clientInfo.name` from `initialize` params, or null when absent or malformed.
+pub fn clientName(params: ?std.json.Value) ?[]const u8 {
+    const obj = switch (params orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    const info = switch (obj.get("clientInfo") orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (info.get("name") orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
 const Capabilities = struct {
     experimental: ?std.json.Value = null,
     roots: ?RootsCapability = null,
@@ -127,6 +143,9 @@ pub const Tool = struct {
     title: ?[]const u8 = null,
     description: ?[]const u8 = null,
     inputSchema: []const u8,
+    /// Declaring one obliges every call to answer with a conforming
+    /// `structuredContent`, so only the tools that always can carry it.
+    outputSchema: ?[]const u8 = null,
     annotations: ?ToolAnnotations = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -145,6 +164,12 @@ pub const Tool = struct {
         _ = try jw.beginWriteRaw();
         try jw.writer.writeAll(self.inputSchema);
         jw.endWriteRaw();
+        if (self.outputSchema) |s| {
+            try jw.objectField("outputSchema");
+            _ = try jw.beginWriteRaw();
+            try jw.writer.writeAll(s);
+            jw.endWriteRaw();
+        }
         if (self.annotations) |a| {
             try jw.objectField("annotations");
             try jw.write(a);
@@ -187,6 +212,16 @@ pub fn ImageContent(comptime T: type) type {
 pub fn CallToolResult(comptime Content: type) type {
     return struct {
         content: Content,
+        isError: bool = false,
+    };
+}
+
+/// The text block stays alongside `structuredContent`: it is what the model
+/// reads, and the spec asks for the serialized form next to it anyway.
+pub fn StructuredCallToolResult(comptime Content: type, comptime Structured: type) type {
+    return struct {
+        content: Content,
+        structuredContent: Structured,
         isError: bool = false,
     };
 }
@@ -260,6 +295,8 @@ test "MCP.protocol - request parsing" {
     try testing.expectString("2024-11-05", init_params.value.protocolVersion);
     try testing.expectString("test-client", init_params.value.clientInfo.name);
     try testing.expectString("1.0.0", init_params.value.clientInfo.version);
+    try testing.expectString("test-client", clientName(req.params).?);
+    try testing.expect(clientName(null) == null);
 }
 
 test "MCP.protocol - ping request parsing" {
@@ -299,7 +336,7 @@ test "MCP.protocol - error formatting" {
     const response = Response{
         .id = .{ .string = "abc" },
         .@"error" = .{
-            .code = @intFromEnum(ErrorCode.MethodNotFound),
+            .code = @backingInt(ErrorCode.MethodNotFound),
             .message = "Method not found",
         },
     };

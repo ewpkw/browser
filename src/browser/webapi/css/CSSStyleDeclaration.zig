@@ -114,7 +114,8 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
             }
 
             // Resolve inline `style=` declarations through the element's
-            // parsed inline style, so computed values match `el.style`.
+            // parsed inline style, so computed values match `el.style`. One
+            // an !important rule beats falls through to the values below.
             if (style_manager.inlineStyleValue(element, wrapped)) |value| {
                 return value;
             }
@@ -136,13 +137,13 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
     return getDefaultPropertyValue(self, wrapped);
 }
 
-/// The value of a declared property, or null when it isn't declared. The
-/// `overflow` shorthand reads as its longhands when both are present with
-/// the same priority, the way the CSSOM serializes a shorthand.
+/// The value of a declared property, or null when it isn't declared. An axis
+/// shorthand reads as its longhands when both are present with the same
+/// priority, the way the CSSOM serializes a shorthand.
 pub fn declaredValue(self: *const CSSStyleDeclaration, name: String, frame: *Frame) ?[]const u8 {
-    if (name.eql(overflow_shorthand)) {
-        const x = self.findProperty(comptime .wrap("overflow-x")) orelse return null;
-        const pair = self.overflowPair(x) orelse return null;
+    if (CssParser.axisShorthand(name.str())) |shorthand| {
+        const x = self.findProperty(.wrap(shorthand.x)) orelse return null;
+        const pair = self.axisPair(x) orelse return null;
         var buf = std.Io.Writer.Allocating.init(frame.local_arena);
         pair.formatValue(&buf.writer) catch return null;
         return buf.written();
@@ -151,19 +152,14 @@ pub fn declaredValue(self: *const CSSStyleDeclaration, name: String, frame: *Fra
     return prop._value.str();
 }
 
-// `overflow` is the one shorthand whose longhands the style cascade folds
-// (StyleManager tracks overflow-x and overflow-y), so it is the one this
-// object stores expanded, as the CSSOM does for every shorthand: setting it
-// sets both longhands, reading or serializing it recombines them.
-const overflow_shorthand: String = .wrap("overflow");
-
-/// Both overflow longhands, declared with the same priority: the pair reads
-/// and serializes as the shorthand.
-const OverflowPair = struct {
+/// Both longhands of an axis shorthand, declared with the same priority: the
+/// pair reads and serializes as the shorthand.
+const AxisPair = struct {
+    name: []const u8,
     x: *const Property,
     y: *const Property,
 
-    fn formatValue(self: OverflowPair, writer: *std.Io.Writer) !void {
+    fn formatValue(self: AxisPair, writer: *std.Io.Writer) !void {
         try self.x._value.format(writer);
         if (!self.x._value.eql(self.y._value)) {
             try writer.writeByte(' ');
@@ -171,26 +167,24 @@ const OverflowPair = struct {
         }
     }
 
-    fn format(self: OverflowPair, writer: *std.Io.Writer) !void {
-        try writer.writeAll("overflow: ");
+    fn format(self: AxisPair, writer: *std.Io.Writer) !void {
+        try writer.writeAll(self.name);
+        try writer.writeAll(": ");
         try self.formatValue(writer);
         try formatDeclarationEnd(self.x._important, writer);
     }
 };
 
-/// The pair `prop` belongs to, when it is an overflow longhand and the other
-/// is declared with the same priority.
-fn overflowPair(self: *const CSSStyleDeclaration, prop: *const Property) ?OverflowPair {
-    const is_x = prop._name.eql(comptime .wrap("overflow-x"));
-    if (!is_x and !prop._name.eql(comptime .wrap("overflow-y"))) {
-        return null;
-    }
-    const other: String = if (is_x) comptime .wrap("overflow-y") else comptime .wrap("overflow-x");
-    const partner = self.findProperty(other) orelse return null;
+/// The pair `prop` belongs to, when it is an axis longhand and the other is
+/// declared with the same priority.
+fn axisPair(self: *const CSSStyleDeclaration, prop: *const Property) ?AxisPair {
+    const longhand = CssParser.axisLonghand(prop._name.str()) orelse return null;
+    const partner = self.findProperty(.wrap(longhand.partner())) orelse return null;
     if (partner._important != prop._important) {
         return null;
     }
-    return if (is_x) .{ .x = prop, .y = partner } else .{ .x = partner, .y = prop };
+    const name = longhand.shorthand.name;
+    return if (longhand.is_x) .{ .name = name, .x = prop, .y = partner } else .{ .name = name, .x = partner, .y = prop };
 }
 
 fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame: *Frame) []const u8 {
@@ -201,19 +195,23 @@ fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame
         .width => element.boxAxis(frame, .width),
         .height => element.boxAxis(frame, .height),
     };
-    return std.fmt.allocPrint(frame.local_arena, "{d}px", .{value}) catch "auto";
+    return frame.local_arena.print("{d}px", .{value}) catch "auto";
 }
 
 pub fn getPropertyPriority(self: *const CSSStyleDeclaration, property_name: []const u8, frame: *Frame) []const u8 {
     const normalized = normalizePropertyName(property_name, &frame.buf);
-    const wrapped = String.wrap(normalized);
-    if (wrapped.eql(overflow_shorthand)) {
-        const x = self.findProperty(comptime .wrap("overflow-x")) orelse return "";
-        const pair = self.overflowPair(x) orelse return "";
-        return if (pair.x._important) "important" else "";
+    return if (self.declaredImportant(.wrap(normalized))) "important" else "";
+}
+
+/// Whether a declared property is !important; false when it isn't declared.
+pub fn declaredImportant(self: *const CSSStyleDeclaration, name: String) bool {
+    if (CssParser.axisShorthand(name.str())) |shorthand| {
+        const x = self.findProperty(.wrap(shorthand.x)) orelse return false;
+        const pair = self.axisPair(x) orelse return false;
+        return pair.x._important;
     }
-    const prop = self.findProperty(wrapped) orelse return "";
-    return if (prop._important) "important" else "";
+    const prop = self.findProperty(name) orelse return false;
+    return prop._important;
 }
 
 pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value: []const u8, priority_: ?[]const u8, frame: *Frame) !void {
@@ -240,10 +238,10 @@ pub fn setProperty(self: *CSSStyleDeclaration, property_name: []const u8, value:
 /// not override an earlier !important one (CSS cascade precedence).
 fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Declaration, frame: *Frame) !void {
     const normalized = normalizePropertyName(declaration.name, &frame.buf);
-    if (overflow_shorthand.eqlSlice(normalized)) {
-        const values = CssParser.splitOverflow(declaration.value) orelse return;
-        try self.applyParsedDeclaration(.{ .name = "overflow-x", .value = values.x, .important = declaration.important }, frame);
-        try self.applyParsedDeclaration(.{ .name = "overflow-y", .value = values.y, .important = declaration.important }, frame);
+    if (CssParser.axisShorthand(normalized)) |shorthand| {
+        const values = CssParser.splitAxisPair(declaration.value) orelse return;
+        try self.applyParsedDeclaration(.{ .name = shorthand.x, .value = values.x, .important = declaration.important }, frame);
+        try self.applyParsedDeclaration(.{ .name = shorthand.y, .value = values.y, .important = declaration.important }, frame);
         return;
     }
     if (!declaration.important) {
@@ -266,10 +264,10 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
     }
 
     const normalized = normalizePropertyName(property_name, &frame.buf);
-    if (overflow_shorthand.eqlSlice(normalized)) {
-        const values = CssParser.splitOverflow(value) orelse return false;
-        const x = try self.setPropertyImpl("overflow-x", values.x, important, frame);
-        const y = try self.setPropertyImpl("overflow-y", values.y, important, frame);
+    if (CssParser.axisShorthand(normalized)) |shorthand| {
+        const values = CssParser.splitAxisPair(value) orelse return false;
+        const x = try self.setPropertyImpl(shorthand.x, values.x, important, frame);
+        const y = try self.setPropertyImpl(shorthand.y, values.y, important, frame);
         return x or y;
     }
 
@@ -290,7 +288,7 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
     // Create new property
     const prop = try frame._factory.create(Property{
         ._node = .{},
-        ._name = try String.init(frame.arena, normalized, .{}),
+        ._name = try String.init(frame.page_arena, normalized, .{}),
         ._value = try initOwnedString(frame._factory.storageAllocator(), normalized_value),
         ._important = important,
     });
@@ -309,10 +307,10 @@ pub fn removeProperty(self: *CSSStyleDeclaration, property_name: []const u8, fra
 
 fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, frame: *Frame) !?[]const u8 {
     const normalized = normalizePropertyName(property_name, &frame.buf);
-    if (overflow_shorthand.eqlSlice(normalized)) {
-        const old_value = self.declaredValue(overflow_shorthand, frame) orelse "";
-        const x = try self.removePropertyImpl("overflow-x", frame);
-        const y = try self.removePropertyImpl("overflow-y", frame);
+    if (CssParser.axisShorthand(normalized)) |shorthand| {
+        const old_value = self.declaredValue(.wrap(shorthand.name), frame) orelse "";
+        const x = try self.removePropertyImpl(shorthand.x, frame);
+        const y = try self.removePropertyImpl(shorthand.y, frame);
         if (x == null and y == null) {
             return null;
         }
@@ -402,7 +400,7 @@ pub fn replaceCssText(self: *CSSStyleDeclaration, text: []const u8, frame: *Fram
 
 pub fn format(self: *const CSSStyleDeclaration, writer: *std.Io.Writer) !void {
     var first = true;
-    // An overflow pair serializes once, where its first longhand sits.
+    // An axis pair serializes once, where its first longhand sits.
     var skip: ?*const Property = null;
     var it = self.iterator();
     while (it.next()) |prop| {
@@ -413,7 +411,7 @@ pub fn format(self: *const CSSStyleDeclaration, writer: *std.Io.Writer) !void {
             try writer.writeByte(' ');
         }
         first = false;
-        if (self.overflowPair(prop)) |pair| {
+        if (self.axisPair(prop)) |pair| {
             try pair.format(writer);
             skip = if (pair.x == prop) pair.y else pair.x;
         } else {
@@ -494,13 +492,13 @@ fn normalizePropertyValue(arena: Allocator, property_name: []const u8, raw_value
     }
 
     // Canonicalize anchor-size() function: anchor name (dashed ident) comes before size keyword
-    if (std.mem.indexOf(u8, value, "anchor-size(")) |idx| {
+    if (std.mem.find(u8, value, "anchor-size(")) |idx| {
         return canonicalizeAnchorSize(arena, value, idx);
     }
 
     // Canonicalize anchor() function: anchor name (dashed ident) comes before position keyword
     // Note: indexOf finds first occurrence, so we check it's not part of "anchor-size("
-    if (std.mem.indexOf(u8, value, "anchor(")) |idx| {
+    if (std.mem.find(u8, value, "anchor(")) |idx| {
         if (idx == 0 or value[idx - 1] != '-') {
             return canonicalizeAnchor(arena, value, idx);
         }
@@ -779,14 +777,14 @@ fn canonicalizeAnchor(arena: Allocator, value: []const u8, start_index: usize) !
 
 // Check if a value is "X X" (duplicate) and return just "X"
 fn collapseDuplicateValue(value: []const u8) ?[]const u8 {
-    const space_idx = std.mem.indexOfScalar(u8, value, ' ') orelse return null;
+    const space_idx = std.mem.findScalar(u8, value, ' ') orelse return null;
     if (space_idx == 0 or space_idx >= value.len - 1) return null;
 
     const first = value[0..space_idx];
     const rest = std.mem.trimStart(u8, value[space_idx + 1 ..], " ");
 
     // Check if there's only one more value (no additional spaces)
-    if (std.mem.indexOfScalar(u8, rest, ' ') != null) return null;
+    if (std.mem.findScalar(u8, rest, ' ') != null) return null;
 
     if (std.mem.eql(u8, first, rest)) {
         return first;
@@ -1063,7 +1061,7 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const cssText = bridge.accessor(CSSStyleDeclaration.getCssText, CSSStyleDeclaration.setCssText, .{});
+    pub const cssText = bridge.accessor(CSSStyleDeclaration.getCssText, CSSStyleDeclaration.setCssText, .{ .ce_reactions = true });
     pub const length = bridge.accessor(CSSStyleDeclaration.length, null, .{});
     pub const item = bridge.function(_item, .{});
 
@@ -1076,9 +1074,9 @@ pub const JsApi = struct {
 
     pub const getPropertyValue = bridge.function(CSSStyleDeclaration.getPropertyValue, .{});
     pub const getPropertyPriority = bridge.function(CSSStyleDeclaration.getPropertyPriority, .{});
-    pub const setProperty = bridge.function(CSSStyleDeclaration.setProperty, .{});
-    pub const removeProperty = bridge.function(CSSStyleDeclaration.removeProperty, .{});
-    pub const cssFloat = bridge.accessor(CSSStyleDeclaration.getFloat, CSSStyleDeclaration.setFloat, .{});
+    pub const setProperty = bridge.function(CSSStyleDeclaration.setProperty, .{ .ce_reactions = true });
+    pub const removeProperty = bridge.function(CSSStyleDeclaration.removeProperty, .{ .ce_reactions = true });
+    pub const cssFloat = bridge.accessor(CSSStyleDeclaration.getFloat, CSSStyleDeclaration.setFloat, .{ .ce_reactions = true });
 };
 
 const testing = @import("../../../testing.zig");

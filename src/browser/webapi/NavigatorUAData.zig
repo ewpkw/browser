@@ -115,7 +115,7 @@ fn uaPlatform() []const u8 {
 }
 
 fn uaArchitecture() []const u8 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .x86, .x86_64 => "x86",
         .aarch64, .aarch64_be, .arm, .armeb => "arm",
         else => "",
@@ -123,7 +123,7 @@ fn uaArchitecture() []const u8 {
 }
 
 fn uaBitness() []const u8 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .x86_64, .aarch64, .aarch64_be, .powerpc64, .powerpc64le, .riscv64 => "64",
         else => "32",
     };

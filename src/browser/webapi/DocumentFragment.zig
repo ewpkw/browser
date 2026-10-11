@@ -23,6 +23,7 @@ const Frame = @import("../Frame.zig");
 const Node = @import("Node.zig");
 const Element = @import("Element.zig");
 const ShadowRoot = @import("ShadowRoot.zig");
+const Template = @import("element/html/Template.zig");
 const collections = @import("collections.zig");
 const Selector = @import("selector/Selector.zig");
 
@@ -32,6 +33,7 @@ pub const Proto = Node;
 
 _type: Type,
 _proto: *Node,
+_template: ?*Template = null,
 
 pub const Type = union(enum) {
     generic,
@@ -59,6 +61,13 @@ pub fn init(document: *const Node.Document, frame: *Frame) !*DocumentFragment {
         ._type = .generic,
         ._proto = undefined,
     });
+}
+
+pub fn getHost(self: *const DocumentFragment) ?*Element {
+    return switch (self._type) {
+        .shadow_root => |shadow_root| shadow_root._host,
+        .generic => if (self._template) |template| template.asElement() else null,
+    };
 }
 
 pub fn asNode(self: *DocumentFragment) *Node {
@@ -163,12 +172,6 @@ pub fn getInnerHTML(self: *DocumentFragment, writer: *std.Io.Writer, frame: *Fra
 pub fn setInnerHTML(self: *DocumentFragment, html: []const u8, frame: *Frame) !void {
     const parent = self.asNode();
     return parent.setHTML(html, .{}, frame);
-}
-
-/// allows declarative shadow dom
-pub fn setHTMLUnsafe(self: *DocumentFragment, html: []const u8, frame: *Frame) !void {
-    const parent = self.asNode();
-    return parent.setHTML(html, .{ .allow_declarative_shadow = true }, frame);
 }
 
 pub fn cloneFragment(self: *DocumentFragment, deep: bool, document: *const Node.Document, frame: *Frame) !*Node {

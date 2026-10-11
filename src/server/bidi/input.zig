@@ -21,7 +21,7 @@ const lp = @import("lightpanda");
 
 const Frame = @import("../../browser/Frame.zig");
 const Node = @import("../../browser/webapi/Node.zig");
-const KeyboardEvent = @import("../../browser/webapi/event/KeyboardEvent.zig");
+const keyboard = @import("../../browser/frame/keyboard.zig");
 
 const BiDi = @import("BiDi.zig");
 const remote_value = @import("remote_value.zig");
@@ -112,10 +112,10 @@ pub fn release(cmd: *BiDi.Command) !void {
 
     for (state.sources.items) |*source| {
         switch (source.kind) {
-            .key => while (source.key.pressed.getLastOrNull()) |cp| {
+            .key => while (source.key.pressed.last()) |cp| {
                 dispatch(bidi, frame, source, &.{ .key_up = cp }) catch |err| return dispatchFailed(cmd, err);
             },
-            .pointer => while (source.pointer.pressed.getLastOrNull()) |button| {
+            .pointer => while (source.pointer.pressed.last()) |button| {
                 dispatch(bidi, frame, source, &.{ .pointer_up = button }) catch |err| return dispatchFailed(cmd, err);
             },
             .none, .wheel => {},
@@ -177,12 +177,7 @@ pub const State = struct {
     }
 };
 
-const Modifiers = struct {
-    alt: bool = false,
-    ctrl: bool = false,
-    meta: bool = false,
-    shift: bool = false,
-};
+const Modifiers = user_input.Modifiers;
 
 const Source = struct {
     id: []const u8,
@@ -207,6 +202,7 @@ const Source = struct {
         last_click_ms: u64 = 0,
         last_click_x: f64 = 0,
         last_click_y: f64 = 0,
+        last_click_button: u8 = 0,
         click_count: i32 = 0,
     };
 
@@ -465,15 +461,7 @@ fn keyValue(obj: std.json.ObjectMap) ParseError!u21 {
         .string => |s| s,
         else => return error.InvalidField,
     };
-    // one code point, no more, no less
-    if (str.len == 0) {
-        return error.InvalidKeyValue;
-    }
-    const len = std.unicode.utf8ByteSequenceLength(str[0]) catch return error.InvalidKeyValue;
-    if (str.len != len) {
-        return error.InvalidKeyValue;
-    }
-    return std.unicode.utf8Decode(str) catch return error.InvalidKeyValue;
+    return keyboard.singleCodepoint(str) orelse error.InvalidKeyValue;
 }
 
 fn buttonField(obj: std.json.ObjectMap) ParseError!u8 {
@@ -556,33 +544,32 @@ fn dispatch(bidi: *BiDi, frame: *Frame, source: *Source, action: *const Action) 
         .pause => {},
         .key_down => |cp| {
             const key = &source.key;
-            const info = keyInfo(cp, key.modifiers.shift);
-            setModifier(&key.modifiers, info.modifier, true);
-            if (std.mem.indexOfScalar(u21, key.pressed.items, cp) == null) {
+            if (std.mem.findScalar(u21, key.pressed.items, cp) == null) {
                 try key.pressed.append(allocator, cp);
             }
-            try dispatchKey(frame, "keydown", &info, &key.modifiers);
+            try keyboard.keyAction(frame, cp, .down, &key.modifiers);
         },
         .key_up => |cp| {
             const key = &source.key;
-            const info = keyInfo(cp, key.modifiers.shift);
-            setModifier(&key.modifiers, info.modifier, false);
-            if (std.mem.indexOfScalar(u21, key.pressed.items, cp)) |i| {
+            if (std.mem.findScalar(u21, key.pressed.items, cp)) |i| {
                 _ = key.pressed.orderedRemove(i);
             }
-            try dispatchKey(frame, "keyup", &info, &key.modifiers);
+            try keyboard.keyAction(frame, cp, .up, &key.modifiers);
         },
         .pointer_down => |button| {
             const pointer = &source.pointer;
-            if (std.mem.indexOfScalar(u8, pointer.pressed.items, button) != null) {
+            if (std.mem.findScalar(u8, pointer.pressed.items, button) != null) {
                 return; // already down; the spec makes this a no-op
             }
             try pointer.pressed.append(allocator, button);
 
-            // A press near the last click, soon enough after it, counts up
+            // A press of the same button near the last click, soon enough
+            // after it, counts up
             const now = lp.datetime.milliTimestamp(.boot);
             const near = @abs(pointer.x - pointer.last_click_x) <= 2 and @abs(pointer.y - pointer.last_click_y) <= 2;
-            pointer.click_count = if (near and now - pointer.last_click_ms <= 500) pointer.click_count + 1 else 1;
+            const repeat = near and button == pointer.last_click_button and now - pointer.last_click_ms <= 500;
+            pointer.click_count = if (repeat) pointer.click_count + 1 else 1;
+            pointer.last_click_button = button;
             pointer.last_click_ms = now;
             pointer.last_click_x = pointer.x;
             pointer.last_click_y = pointer.y;
@@ -591,7 +578,7 @@ fn dispatch(bidi: *BiDi, frame: *Frame, source: *Source, action: *const Action) 
         },
         .pointer_up => |button| {
             const pointer = &source.pointer;
-            const i = std.mem.indexOfScalar(u8, pointer.pressed.items, button) orelse return;
+            const i = std.mem.findScalar(u8, pointer.pressed.items, button) orelse return;
             _ = pointer.pressed.orderedRemove(i);
             try user_input.triggerMouseRelease(frame, pointer.x, pointer.y, button, pointer.click_count);
         },
@@ -606,6 +593,51 @@ fn dispatch(bidi: *BiDi, frame: *Frame, source: *Source, action: *const Action) 
             const target = try resolveOrigin(bidi, frame, source, scroll.origin, scroll.x, scroll.y);
             try user_input.triggerMouseWheel(frame, target.x, target.y, scroll.delta_x, scroll.delta_y);
         },
+    }
+}
+
+// WebDriver's Element Send Keys, into whatever has focus. Every code point is a
+// press and release, except a modifier, which stays down until it's typed
+// again, U+E000 releases everything, or the text ends. It's a keyboard of its
+// own: the actions' held keys don't apply.
+pub fn typeText(frame: *Frame, text: []const u8) !void {
+    const view = std.unicode.Utf8View.init(text) catch return error.InvalidUtf8;
+
+    var modifiers: Modifiers = .{};
+    // there are 8 modifier code points, and each is held at most once
+    var held_buf: [8]u21 = undefined;
+    var held: std.ArrayList(u21) = .initBuffer(&held_buf);
+
+    var it = view.iterator();
+    while (it.nextCodepoint()) |c| {
+        // like chromedriver, a newline is the Enter key
+        const cp: u21 = if (c == '\n' or c == '\r') 0xE006 else c;
+        if (cp == 0xE000) {
+            try releaseHeld(frame, &held, &modifiers);
+            continue;
+        }
+
+        if (keyboard.webdriverKey(cp, false).modifier == null) {
+            try keyboard.keyAction(frame, cp, .down, &modifiers);
+            try keyboard.keyAction(frame, cp, .up, &modifiers);
+            continue;
+        }
+
+        if (std.mem.findScalar(u21, held.items, cp)) |i| {
+            _ = held.orderedRemove(i);
+            try keyboard.keyAction(frame, cp, .up, &modifiers);
+        } else {
+            held.appendAssumeCapacity(cp);
+            try keyboard.keyAction(frame, cp, .down, &modifiers);
+        }
+    }
+    try releaseHeld(frame, &held, &modifiers);
+}
+
+// in reverse press order
+fn releaseHeld(frame: *Frame, held: *std.ArrayList(u21), modifiers: *Modifiers) !void {
+    while (held.pop()) |cp| {
+        try keyboard.keyAction(frame, cp, .up, modifiers);
     }
 }
 
@@ -625,217 +657,6 @@ fn resolveOrigin(bidi: *BiDi, frame: *Frame, source: *const Source, origin: Orig
             return .{ .x = rect.x + rect.width / 2 + x, .y = rect.y + rect.height / 2 + y };
         },
     }
-}
-
-fn dispatchKey(frame: *Frame, comptime typ: []const u8, info: *const KeyInfo, modifiers: *const Modifiers) !void {
-    var buf: [4]u8 = undefined;
-    const key: []const u8 = switch (info.key) {
-        .name => |name| name,
-        .char => |cp| buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable],
-    };
-    const event = try KeyboardEvent.initTrusted(comptime .wrap(typ), .{
-        .key = key,
-        .code = info.code,
-        .location = info.location,
-        .altKey = modifiers.alt,
-        .ctrlKey = modifiers.ctrl,
-        .metaKey = modifiers.meta,
-        .shiftKey = modifiers.shift,
-    }, frame);
-    if (comptime std.mem.eql(u8, typ, "keydown")) {
-        _ = try user_input.triggerKeyDown(frame, event, user_input.textForKey(event));
-    } else {
-        try user_input.triggerKeyUp(frame, event);
-    }
-}
-
-fn setModifier(modifiers: *Modifiers, which: ?Modifier, down: bool) void {
-    switch (which orelse return) {
-        .alt => modifiers.alt = down,
-        .ctrl => modifiers.ctrl = down,
-        .meta => modifiers.meta = down,
-        .shift => modifiers.shift = down,
-    }
-}
-
-const Modifier = enum { alt, ctrl, meta, shift };
-
-const KeyInfo = struct {
-    // a named key, or the character itself
-    key: union(enum) { name: []const u8, char: u21 },
-    code: []const u8,
-    location: u32 = 0,
-    modifier: ?Modifier = null,
-};
-
-// WebDriver's key table: the Private Use Area - names the
-// non-printing keys, anything else is the character itself.
-// https://w3c.github.io/webdriver/#keyboard-actions
-fn keyInfo(cp: u21, shift: bool) KeyInfo {
-    if (cp >= 0xE000 and cp <= 0xE05D) {
-        return specialKey(cp);
-    }
-
-    const char: u21 = if (shift and cp < 128) shiftedAscii(@intCast(cp)) else cp;
-    return .{ .key = .{ .char = char }, .code = asciiCode(cp) };
-}
-
-fn specialKey(cp: u21) KeyInfo {
-    const k = struct {
-        fn k(key: []const u8, code: []const u8) KeyInfo {
-            return .{ .key = .{ .name = key }, .code = code };
-        }
-        fn m(key: []const u8, code: []const u8, location: u32, modifier: Modifier) KeyInfo {
-            return .{ .key = .{ .name = key }, .code = code, .location = location, .modifier = modifier };
-        }
-        fn n(key: []const u8, code: []const u8) KeyInfo {
-            return .{ .key = .{ .name = key }, .code = code, .location = 3 };
-        }
-    };
-    return switch (cp) {
-        0xE000 => k.k("Unidentified", ""),
-        0xE001 => k.k("Cancel", "Abort"),
-        0xE002 => k.k("Help", "Help"),
-        0xE003 => k.k("Backspace", "Backspace"),
-        0xE004 => k.k("Tab", "Tab"),
-        0xE005 => k.k("Clear", "NumLock"),
-        0xE006 => k.k("Enter", "Enter"),
-        0xE007 => k.n("Enter", "NumpadEnter"),
-        0xE008 => k.m("Shift", "ShiftLeft", 1, .shift),
-        0xE009 => k.m("Control", "ControlLeft", 1, .ctrl),
-        0xE00A => k.m("Alt", "AltLeft", 1, .alt),
-        0xE00B => k.k("Pause", "Pause"),
-        0xE00C => k.k("Escape", "Escape"),
-        0xE00D => k.k(" ", "Space"),
-        0xE00E => k.k("PageUp", "PageUp"),
-        0xE00F => k.k("PageDown", "PageDown"),
-        0xE010 => k.k("End", "End"),
-        0xE011 => k.k("Home", "Home"),
-        0xE012 => k.k("ArrowLeft", "ArrowLeft"),
-        0xE013 => k.k("ArrowUp", "ArrowUp"),
-        0xE014 => k.k("ArrowRight", "ArrowRight"),
-        0xE015 => k.k("ArrowDown", "ArrowDown"),
-        0xE016 => k.k("Insert", "Insert"),
-        0xE017 => k.k("Delete", "Delete"),
-        0xE018 => k.k(";", "Semicolon"),
-        0xE019 => k.k("=", "Equal"),
-        0xE01A => k.n("0", "Numpad0"),
-        0xE01B => k.n("1", "Numpad1"),
-        0xE01C => k.n("2", "Numpad2"),
-        0xE01D => k.n("3", "Numpad3"),
-        0xE01E => k.n("4", "Numpad4"),
-        0xE01F => k.n("5", "Numpad5"),
-        0xE020 => k.n("6", "Numpad6"),
-        0xE021 => k.n("7", "Numpad7"),
-        0xE022 => k.n("8", "Numpad8"),
-        0xE023 => k.n("9", "Numpad9"),
-        0xE024 => k.n("*", "NumpadMultiply"),
-        0xE025 => k.n("+", "NumpadAdd"),
-        0xE026 => k.n(",", "NumpadComma"),
-        0xE027 => k.n("-", "NumpadSubtract"),
-        0xE028 => k.n(".", "NumpadDecimal"),
-        0xE029 => k.n("/", "NumpadDivide"),
-        0xE031 => k.k("F1", "F1"),
-        0xE032 => k.k("F2", "F2"),
-        0xE033 => k.k("F3", "F3"),
-        0xE034 => k.k("F4", "F4"),
-        0xE035 => k.k("F5", "F5"),
-        0xE036 => k.k("F6", "F6"),
-        0xE037 => k.k("F7", "F7"),
-        0xE038 => k.k("F8", "F8"),
-        0xE039 => k.k("F9", "F9"),
-        0xE03A => k.k("F10", "F10"),
-        0xE03B => k.k("F11", "F11"),
-        0xE03C => k.k("F12", "F12"),
-        0xE03D => k.m("Meta", "MetaLeft", 1, .meta),
-        0xE040 => k.k("ZenkakuHankaku", ""),
-        0xE050 => k.m("Shift", "ShiftRight", 2, .shift),
-        0xE051 => k.m("Control", "ControlRight", 2, .ctrl),
-        0xE052 => k.m("Alt", "AltRight", 2, .alt),
-        0xE053 => k.m("Meta", "MetaRight", 2, .meta),
-        0xE054 => k.n("PageUp", "Numpad9"),
-        0xE055 => k.n("PageDown", "Numpad3"),
-        0xE056 => k.n("End", "Numpad1"),
-        0xE057 => k.n("Home", "Numpad7"),
-        0xE058 => k.n("ArrowLeft", "Numpad4"),
-        0xE059 => k.n("ArrowUp", "Numpad8"),
-        0xE05A => k.n("ArrowRight", "Numpad6"),
-        0xE05B => k.n("ArrowDown", "Numpad2"),
-        0xE05C => k.n("Insert", "Numpad0"),
-        0xE05D => k.n("Delete", "NumpadDecimal"),
-        else => k.k("Unidentified", ""),
-    };
-}
-
-// slices into this literal are always valid
-const key_codes = "KeyAKeyBKeyCKeyDKeyEKeyFKeyGKeyHKeyIKeyJKeyKKeyLKeyMKeyNKeyOKeyPKeyQKeyRKeySKeyTKeyUKeyVKeyWKeyXKeyYKeyZ";
-const digit_codes = "Digit0Digit1Digit2Digit3Digit4Digit5Digit6Digit7Digit8Digit9";
-
-// The `code` of a printable character on a US layout.
-fn asciiCode(cp: u21) []const u8 {
-    if (cp >= 128) {
-        return "";
-    }
-    const c: u8 = @intCast(cp);
-    return switch (c) {
-        'a'...'z' => key_codes[(c - 'a') * 4 ..][0..4],
-        'A'...'Z' => key_codes[(c - 'A') * 4 ..][0..4],
-        '0'...'9' => digit_codes[(c - '0') * 6 ..][0..6],
-        ' ' => "Space",
-        '\n', '\r' => "Enter",
-        '\t' => "Tab",
-        '`', '~' => "Backquote",
-        '-', '_' => "Minus",
-        '=', '+' => "Equal",
-        '[', '{' => "BracketLeft",
-        ']', '}' => "BracketRight",
-        '\\', '|' => "Backslash",
-        ';', ':' => "Semicolon",
-        '\'', '"' => "Quote",
-        ',', '<' => "Comma",
-        '.', '>' => "Period",
-        '/', '?' => "Slash",
-        '!' => "Digit1",
-        '@' => "Digit2",
-        '#' => "Digit3",
-        '$' => "Digit4",
-        '%' => "Digit5",
-        '^' => "Digit6",
-        '&' => "Digit7",
-        '*' => "Digit8",
-        '(' => "Digit9",
-        ')' => "Digit0",
-        else => "",
-    };
-}
-
-// What a held Shift turns a US-layout key into.
-fn shiftedAscii(c: u8) u8 {
-    return switch (c) {
-        'a'...'z' => std.ascii.toUpper(c),
-        '`' => '~',
-        '1' => '!',
-        '2' => '@',
-        '3' => '#',
-        '4' => '$',
-        '5' => '%',
-        '6' => '^',
-        '7' => '&',
-        '8' => '*',
-        '9' => '(',
-        '0' => ')',
-        '-' => '_',
-        '=' => '+',
-        '[' => '{',
-        ']' => '}',
-        '\\' => '|',
-        ';' => ':',
-        '\'' => '"',
-        ',' => '<',
-        '.' => '>',
-        '/' => '?',
-        else => c,
-    };
 }
 
 fn errorCode(err: anyerror) []const u8 {
@@ -938,6 +759,73 @@ test "bidi.input: click via element origin" {
         .type = "string",
         .value = "mousemove@btn mousedown:b2@btn mouseup:b2@btn",
     } }, .{ .id = 7 });
+
+    // A left click right after the right one starts a new count: no dblclick.
+    try ctx.processMessage(.{
+        .id = 8,
+        .method = "input.performActions",
+        .params = .{ .context = context_id, .actions = .{.{
+            .type = "pointer",
+            .id = "mouse",
+            .actions = .{
+                .{ .type = "pointerDown", .button = 0 },
+                .{ .type = "pointerUp", .button = 0 },
+            },
+        }} },
+    });
+    try ctx.expectSentResult(null, .{ .id = 8 });
+    try evaluate(&ctx, 9, context_id, "window.events.slice(11).join(' ')");
+    try ctx.expectSentResult(.{ .type = "success", .result = .{
+        .type = "string",
+        .value = "mousedown@btn mouseup@btn click@btn",
+    } }, .{ .id = 9 });
+}
+
+test "bidi.input: later releases of a three-button chord report detail 0" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const context_id = try ctx.createContext(.{ .url = "bidi/input.html" });
+
+    try evaluate(&ctx, 1, context_id,
+        \\window.releases = [];
+        \\for (const type of ['mouseup', 'click', 'auxclick', 'dblclick']) {
+        \\  document.addEventListener(type, e => releases.push(`${e.type}:${e.button}:${e.buttons}:${e.detail}`));
+        \\}
+        \\'ready'
+    );
+    try ctx.expectSentResult(.{ .type = "success", .result = .{ .type = "string", .value = "ready" } }, .{ .id = 1 });
+
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "browsingContext.locateNodes",
+        .params = .{ .context = context_id, .locator = .{ .type = "css", .value = "#btn" } },
+    });
+    try ctx.expectSentResult(.{ .nodes = .{.{ .sharedId = "1" }} }, .{ .id = 2 });
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "input.performActions",
+        .params = .{ .context = context_id, .actions = .{.{
+            .type = "pointer",
+            .id = "mouse",
+            .actions = .{
+                .{ .type = "pointerMove", .x = 0, .y = 0, .origin = .{ .type = "element", .element = .{ .sharedId = "1" } } },
+                .{ .type = "pointerDown", .button = 0 },
+                .{ .type = "pointerDown", .button = 2 },
+                .{ .type = "pointerDown", .button = 1 },
+                .{ .type = "pointerUp", .button = 2 },
+                .{ .type = "pointerUp", .button = 1 },
+                .{ .type = "pointerUp", .button = 0 },
+            },
+        }} },
+    });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+
+    try evaluate(&ctx, 4, context_id, "window.releases.join(' ')");
+    try ctx.expectSentResult(.{ .type = "success", .result = .{
+        .type = "string",
+        .value = "mouseup:2:5:1 auxclick:2:5:1 mouseup:1:1:0 mouseup:0:0:0",
+    } }, .{ .id = 4 });
 }
 
 test "bidi.input: keys and modifiers" {

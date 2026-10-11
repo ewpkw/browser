@@ -2,7 +2,7 @@
 
 本文档的唯一用途：**让每一次上游同步又快又不出错**。因此只写两类内容——① 当前状态（分支目的、人设取值、fork 增量、已知限制），② 可重放流程（同步 SOP、验收、环境与编译、从零重建）。一次性迁移记录（某次要重抓哪个依赖、上次冲突长什么样）不写，处理完即丢。
 
-> **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `d873e1bd7`。
+> **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `c4b59af21`。
 >
 > **版本类信息一律从仓库读，不在本文档写死**，否则必然过期：
 >
@@ -72,7 +72,7 @@ git diff upstream/main..HEAD --stat -- src   # 必须恰好第 4 节那 8 个文
 | `getHighEntropyValues()` | `architecture=x86`、`bitness=64`、`platform=Windows`、`platformVersion=15.0.0`、`uaFullVersion=151.0.7813.2`、`model=""`、`wow64=false`、`formFactor=[Desktop]` |
 | `navigator.plugins.length` | `5` |
 | CDP `Browser.getVersion` | `userAgent` = 上表那串 Edge 151 UA、`product` = `Edg/151.0.7813.2`（见 5.8） |
-| Intl / `toLocaleString` 默认 locale | `zh-CN`（上游 `Platform.init` 在 `InitializeICU` 前 `setenv("LC_ALL", tag)`） |
+| Intl / `toLocaleString` 默认 locale | `zh-CN`（上游 `Platform.init` 在 `InitializeICU` 后把 `--locale` 传给 `v8__V8__SetDefaultLocale`；`TZ` 仍在初始化前 `setenv`；两个机制都只由 `--locale` 驱动，本分支无需 fork） |
 
 - `--user-agent-suffix` 拼在默认 UA 之后；`--user-agent` 整体覆盖。
 - 运行时可切换人设而不改代码：`--locale en-US`、CDP `Emulation.setUserAgentOverride({ acceptLanguage })` 会同时刷新 `Accept-Language` 头、`navigator.language(s)`、Intl。
@@ -562,6 +562,7 @@ lightpanda fetch --dump html "https://httpbin.org/headers"
 #   Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8   <-- 上游发的
 #   Sec-Fetch-Dest: document / Mode: navigate / Site: none / User: ?1        <-- 上游发的
 #   Upgrade-Insecure-Requests: 1  Priority: u=0, i      <-- 本分支补的（5.3(b)），只在用户发起的顶层导航出现
+#   Accept-Encoding: deflate, gzip, br, zstd            <-- 上游发的（curl 已链 zstd，实测；真实 Edge 顺序略异，见 §9-10）
 
 # 3. JS 侧指纹与 HTTP 头锁得住（核心一致性检查）
 #    脚本必须包在显式 <body> 里：写成 data:text/html,<script>…document.body… 会在 <head>
@@ -583,8 +584,10 @@ lightpanda fetch --load-resources iframe,worker --wait-until networkidle --wait-
 lightpanda fetch --load-resources iframe,worker --wait-until networkidle --wait-ms 15000 --dump markdown "https://abrahamjuliot.github.io/creepjs/"
 
 # 5b. 已实测基准（同一套命令的正常输出长这样，偏离就是回归）
-#     ⚠ 下列值是在旧基线 e8aa75939 上测的；同步后（当前 d873e1bd7）尚未重跑过这三条，
-#       当成"预期大致如此"看，跑完请把实际结果回写本节（第 6 节第 7 条的规矩）。
+#     ✅ 当前基线 c4b59af21（V8 15.5.35.13）已完成实测：第 2 步的完整头集合（含
+#        Accept-Encoding: deflate, gzip, br, zstd）、第 3 步 JS 指纹、第 4 步 --locale 切换、
+#        第 6 步两条 CLI 拦截。下列浏览器特征检测站三条仍是旧基线 e8aa75939 上的记录，
+#        当前基线尚未重跑——当成"预期大致如此"看，跑完请把实际结果回写本节。
 #   browserscan Bot Detection：WebDriver / WebDriver Advance / Selenium / Webdriverio /
 #     NightmareJS / PhantomJS / Awesomium / Cef / CefSharp / Coaches / FMiner / Born /
 #     Phantomas / Rhino / Headless Chrome / CDP / Dev Tool —— 共 17 项全 Normal，0 Abnormal
@@ -741,7 +744,7 @@ ln -sf /usr/local/lib/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 zig version
 ```
 
-### 8.3 预编译 V8 库（约 127 MB）
+### 8.3 预编译 V8 库（两个文件合计约 210 MB，随 V8 版本变动；实测 v0.5.9/15.5.35.13：.a 约 138 MB + .so 约 77 MB）
 
 ```bash
 make download-v8
@@ -775,22 +778,32 @@ ls -l $DIR      # 字节数应与 curl -sIL "$REL/$A" 返回的 content-length �
 
 ### 8.4 依赖离线抓取（大陆网络）
 
-本机直连 GitHub HTTPS 会超时（`HttpConnectionClosing` / `Timeout`），SSH 可用。镜像/SSH 取回的字节与原站一致 → `zig fetch` 算出的 hash 与 `build.zig.zon` 精确匹配 → 落全局缓存 `~/.cache/zig/p/`，`build.zig.zon` 一行都不用改。
+本机直连 GitHub HTTPS 会超时（`HttpConnectionClosing` / `Timeout`），SSH 可用。镜像/SSH 取回的字节与原站一致 → 落全局缓存 `~/.cache/zig/p/`，`build.zig.zon` 一行都不用改。**非 GitHub 源（sqlite.org 的 zip、codeberg.org 的 git 仓库）直连可达，不加镜像前缀**（实测）。
 
 要抓哪些**不凭记忆也不照抄本文档**，直接从仓库读；同步后用 diff 判断哪些项变了：
 
 ```bash
 git diff <旧基线>..HEAD -- build.zig.zon
 
-# 1) tarball 类（.url = https://github.com/…tar.gz）——逐个加镜像前缀
-for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+'); do
+# 1) GitHub tarball 类（.url = https://github.com/…tar.gz）——逐个加镜像前缀
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep github.com); do
   timeout 600 zig fetch "https://ghfast.top/$u" || echo "FAILED: $u"
 done
 
-# 2) git+https 类——GIT_CONFIG 临时把 https 改写成 SSH，不动全局 git 配置
-for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+https'); do
+# 1b) 非 GitHub 的 tarball/zip（如 sqlite.org 的 amalgamation）——直连
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep -v github.com); do
+  timeout 600 zig fetch "$u" || echo "FAILED: $u"
+done
+
+# 2) GitHub git+https 类——GIT_CONFIG 临时把 https 改写成 SSH，不动全局 git 配置
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+https://github.com'); do
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.git@github.com:.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/" \
     timeout 600 zig fetch "$u" || echo "FAILED: $u"
+done
+
+# 2b) 非 GitHub 的 git 源（如 codeberg.org 的 translate-c）——直连
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+' | grep -v github.com); do
+  timeout 600 zig fetch "$u" || echo "FAILED: $u"
 done
 
 # 3) 预编译 V8 .a / .so（裸二进制，不是 zig 包）见 8.3
@@ -798,7 +811,9 @@ done
 zig build --fetch
 ```
 
-> 校验：`zig fetch` 输出的 hash 必须与 `build.zig.zon` 对应 `.hash` 完全一致。备选镜像 `https://gh-proxy.com/`。
+> 校验分两层：① `zig fetch` 输出的 hash 必须与 `build.zig.zon` 对应 `.hash` 完全一致（证明**下载的内容**正确）；② 最终必须用 `zig build --fetch` 通过（证明**缓存**可用），缺一不可——见下面 zig 0.17.0 的坑。备选镜像 `https://gh-proxy.com/`。
+>
+> **zig 0.17.0 坑（实测）**：`zig fetch` 从 URL 抓包后，它在「写入全局缓存」这一步可能丢文件（实测 zig-v8-fork 包 21→12 个文件、zstd 743→639 项、nghttp2 1638→1342 项），但当场打印的 hash 却是正确的。症状：`zig build --fetch` 报 `hash mismatch: manifest declares X but the fetched package has Y`，重抓恒复现。修复：用 `curl -fL --retry 3`（可走 ghfast 镜像）重新下载原始 tarball → 先 `zig fetch <下载文件>` 确认输出的 hash 与 manifest 一致 → 再把原始文件**直接拷成** `~/.cache/zig/p/<manifest 里的 hash>.tar.gz`（跳过 zig fetch 的存储环节）→ 重跑 `zig build --fetch` 即通过。中招包就在 mismatch 报错里点名，其余包走正常流程即可。
 > 注意：即使不传 `-Dprebuilt_v8_path`，`.v8` 依赖 tarball（Zig/C 绑定源码）仍必须能解析，预编译 `.a` 替代不了它。
 > 判定"哪些包是过期的"必须走依赖图闭包（从根 `build.zig.zon` 出发，逐包读各自的 `build.zig.zon` 递归到不动点）——根清单里没有的**传递依赖**照样在用，只看根清单会误删。
 
@@ -819,7 +834,7 @@ make clean                                     # 清理（保留 .lp-cache 里�
 - **`Makefile` 与 `build.zig` 保持与上游零 diff**（第 2 节原则），不要为了 ZIGFLAGS 去恢复 `MAKEOVERRIDES =`。
 - `make build` **不编译 V8 引擎**：第一步编 `snapshot_creator` 生成 `src/snapshot.bin`（做快照，不是编 V8），第二步编主程序并链接预编译 `.a`。改一个 `.zig` 文件只需几分钟（依赖与对象文件全部复用 `.zig-cache`）；只有 `rm -rf .zig-cache` 或 `make clean` 之后才是冷编译。退回源码编 V8（10+ 分钟）只有两种：日志出现 `No prebuilt V8 at …`，或开了 `-Dtsan` / `-Dasan`。
 - 快照对本分支是**必需**的：`PluginArray.length=5` 这类 comptime 常量属性会被烘进 `snapshot.bin`，不重生成快照则运行期仍是旧值。
-- C/Rust 依赖不跟随 `-Doptimize`，固定 ReleaseFast（`-Ddebug_deps` 才转 Debug），debug/release 共用一套依赖对象缓存。
+- C/Rust 依赖不跟随 `-Doptimize`，固定 ReleaseFast（Zig 0.17 里拼作 `.fast`；`-Ddebug_deps` 才转 Debug），debug/release 共用一套依赖对象缓存。
 - 产物：`./zig-out/bin/lightpanda`；安装位置 `~/.local/bin/lightpanda`；快照 `src/snapshot.bin`；V8 缓存 `.lp-cache/prebuilt-v8/<tag>/`。
 - 格式化必须与 CI 一致：`zig fmt --check ./*.zig ./**/*.zig`（`zig build` 依赖 fmt step）。
 
@@ -881,12 +896,16 @@ CARGO_EOF
 
 cd "$PROJECT_DIR"
 make download-v8 || true                      # 直连失败就走 8.3 的镜像法
-for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+'); do
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep github.com); do
   zig fetch "https://ghfast.top/$u" || echo "FAILED: $u"; done
-for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+https'); do
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep -v github.com); do
+  zig fetch "$u" || echo "FAILED: $u"; done
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+https://github.com'); do
   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.git@github.com:.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/" \
     zig fetch "$u" || echo "FAILED: $u"; done
-zig build --fetch
+for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+' | grep -v github.com); do
+  zig fetch "$u" || echo "FAILED: $u"; done
+zig build --fetch                            # 报 hash mismatch 见 8.4 的 zig 0.17.0 坑
 
 export LIGHTPANDA_DISABLE_TELEMETRY=1
 ZIGFLAGS="-Dcpu=skylake_avx512" make build
@@ -910,6 +929,7 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
 | 生产机运行时 `SIGILL` | 编译时没加 `-Dcpu=skylake_avx512`（或改用 `-Dcpu=baseline`） |
 | 个别站点报 SSL 连接错误 | 见第 9 节 ALPN 条目，先试 `--http-version 1.1` |
 | CDP `setExtraHTTPHeaders` 静默无效 | 漏发 `Network.enable`（见第 7 节第七步 C 的说明） |
+| `zig build --fetch` 报 `hash mismatch` 而 `zig fetch` 当场输出过正确 hash | zig 0.17.0 fetch 存储环节丢文件：按 8.4 的坑修复（curl 原始 tarball 直接拷成缓存文件） |
 | `fetch` 报 `unknown argument --url` | URL 是位置参数：`lightpanda fetch [flags] "<url>"` |
 
 ---
@@ -925,7 +945,7 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
 7. **`navigator.plugins` 内容仍为空**（只改了 `length`，见 5.6）。
 8. **CDP 无法运行时改 Intl/Date 的 locale/timezone**：上游 `Emulation.setLocaleOverride` / `setTimezoneOverride` 是 noop（需要 zig-v8-fork 暴露 `Isolate::DateTimeConfigurationChangeNotification` 与 ICU 默认 locale 绑定），只能靠进程参数 `--locale` / `--timezone`。
 9. **`window.chrome`、`navigator.getBattery`、`navigator.getUserMedia`、`window.outerHeight/outerWidth` 未实现**（上游 API 缺失）：bot.sannysoft 上表现为 `Chrome (New) missing (failed)`、`HEADCHR_CHROME_OBJ FAIL`、`CHR_BATTERY FAIL`，creepjs 报 `ReferenceError: outerHeight is not defined`。`window.chrome` 是个很小的空对象桩，getBattery 要实现 Promise 对象——**待决策，未做**。
-10. **Fetch 元数据的覆盖边界**（Sec-Fetch 家族本身已由上游实现，见 5.3(b)）：子资源不发 `Priority`（真实 Chrome 每请求都带，但 urgency 依赖一堆启发式，本分支只在顶层导航补一个 `u=0, i`）；`Accept-Encoding` 仍是 `deflate, gzip, br`，真实 Edge 是 `gzip, deflate, br, zstd`（由 curl 编译选项决定）；`Accept` 缺 `image/avif,image/webp,...` 那一段（上游 `navigation_accept` 的原值，本分支不改）。
+10. **Fetch 元数据的覆盖边界**（Sec-Fetch 家族本身已由上游实现，见 5.3(b)）：子资源不发 `Priority`（真实 Chrome 每请求都带，但 urgency 依赖一堆启发式，本分支只在顶层导航补一个 `u=0, i`）；`Accept-Encoding` 是 `deflate, gzip, br, zstd`（上游 curl 已链接 zstd 依赖，实测；真实 Edge 是 `gzip, deflate, br, zstd`，仅 deflate 位置略异）；`Accept` 缺 `image/avif,image/webp,...` 那一段（上游 `navigation_accept` 的原值，本分支不改）。
     旧版这两条已知不一致已被上游修正，不属本分支了：① 子帧文档自称 `dest: document` + `user: ?1`（现为 `iframe` 且不带 user flag）；② 导航的 `sec-fetch-site` 恒为 `none`（现按 `Request.initiator_origin` 算真值）。
 11. **换 UA 人设时 client hints 不跟着变**：`--user-agent` 只改 UA（实测 UA 变 Chrome/120 而 `Sec-Ch-Ua` 仍是 151），`--http-header` 又拦住 `Sec-Ch-Ua`（见第 6 条）。要换版本人设：走 CDP（`Network.enable` + `setExtraHTTPHeaders`，实测可覆盖），或同时改代码里的 `user_agent_base` + `brands`（第 3 节末尾那**五处**）。注意 `Browser.getVersion` 不会跟着 `--user-agent` 变（它是 5.8 的编译期常量）。
 12. 小噪声（非问题）：httpbin 把请求头名按首字母大写重新格式化，回显成 `Sec-Ch-Ua-Wow64`；实际发出的是 `Sec-Ch-Ua-WoW64`（`baselineHeaders` 可证）。

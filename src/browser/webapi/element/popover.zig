@@ -78,7 +78,7 @@ pub fn show(el: *Element, frame: *Frame) !void {
         }
     }
 
-    try frame.document._open_popovers.append(frame.arena, el);
+    try frame.document._open_popovers.append(frame.page_arena, el);
     frame.domChanged();
     _ = try fireToggle(el, comptime .wrap("toggle"), "closed", "open", false, frame);
 }
@@ -250,12 +250,7 @@ fn fireToggle(
         .newState = new_state,
     }, frame)).asEvent();
 
-    // Keep the event alive while dispatching so we can read _prevent_default.
-    event.acquireRef();
-    defer _ = event.releaseRef(frame.page);
-
-    try frame._event_manager.dispatch(el.asEventTarget(), event);
-    return event._prevent_default;
+    return frame._event_manager.dispatchCancelable(el.asEventTarget(), event);
 }
 
 fn hasChanged(el: *Element, frame: *Frame, original: State) bool {

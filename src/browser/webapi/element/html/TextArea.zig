@@ -16,21 +16,24 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const lp = @import("lightpanda");
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../../js/js.zig");
-const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
 
 const Node = @import("../../Node.zig");
-const Element = @import("../../Element.zig");
-const HtmlElement = @import("../Html.zig");
-const Form = @import("Form.zig");
-const Selection = @import("../../Selection.zig");
 const Event = @import("../../Event.zig");
-const ValidityState = @import("ValidityState.zig");
+const Element = @import("../../Element.zig");
+const Selection = @import("../../Selection.zig");
+
+const HtmlElement = @import("../Html.zig");
 const reflection = @import("../reflection.zig");
 const text_entry = @import("../text_entry.zig");
+
+const Form = @import("Form.zig");
+const ValidityState = @import("ValidityState.zig");
 
 const TextArea = @This();
 
@@ -87,7 +90,7 @@ pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
         self._user_edited = false;
         return;
     }
-    const owned = try frame.arena.dupe(u8, value);
+    const owned = try frame.page_arena.dupe(u8, value);
     self._value = owned;
     self._user_edited = false;
 
@@ -141,8 +144,10 @@ const entry = text_entry.TextEntry(TextArea);
 pub const select = entry.select;
 pub const innerInsert = entry.innerInsert;
 pub const acceptsTextEntry = entry.acceptsTextEntry;
+pub const tracksSelection = entry.tracksSelection;
 pub const innerDelete = entry.innerDelete;
 pub const moveCaret = entry.moveCaret;
+pub const caretToEnd = entry.caretToEnd;
 pub const CaretMove = entry.CaretMove;
 pub const getSelectionDirection = entry.getSelectionDirection;
 pub const setSelectionStart = entry.setSelectionStart;
@@ -294,6 +299,7 @@ pub const JsApi = struct {
     pub const reportValidity = bridge.function(TextArea.reportValidity, .{});
     pub const setCustomValidity = bridge.function(TextArea.setCustomValidity, .{});
     pub const onselectionchange = bridge.accessor(TextArea.getOnSelectionChange, TextArea.setOnSelectionChange, .{});
+    pub const @"type" = bridge.property("textarea", .{ .template = false, .readonly = true });
     pub const value = bridge.accessor(TextArea.getValue, TextArea.setValue, .{});
     pub const defaultValue = bridge.accessor(TextArea.getDefaultValue, TextArea.setDefaultValue, .{ .ce_reactions = true });
     pub const disabled = reflect.boolean("disabled");

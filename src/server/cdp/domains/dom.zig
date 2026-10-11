@@ -92,7 +92,7 @@ fn getDocument(cmd: *CDP.Command) !void {
     const params = try cmd.params(Params) orelse Params{};
 
     if (params.pierce) {
-        log.warn(.not_implemented, "DOM.getDocument", .{ .param = "pierce" });
+        log.debug(.not_implemented, "DOM.getDocument", .{ .param = "pierce" });
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
@@ -137,7 +137,7 @@ fn isXPathQuery(q: []const u8) bool {
     // before it must be one of the 13 named axes. Walk back the run of
     // [a-zA-Z-] characters and look it up in the closed set.
     var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, q, idx, "::")) |hit| : (idx = hit + 1) {
+    while (std.mem.findPos(u8, q, idx, "::")) |hit| : (idx = hit + 1) {
         if (hit == 0) continue;
         var start = hit;
         while (start > 0) {
@@ -365,9 +365,12 @@ fn resolveNode(cmd: *CDP.Command) !void {
     js_context.localScope(&ls);
     defer ls.deinit();
 
+    // The object id is minted on the command's session; only that session can unwrap it later.
+    const inspector_session = try bc.inspectorSession(cmd.input.session_id);
+
     // node._node is a *DOMNode we need this to be able to find its most derived type e.g. Node -> Element -> HTMLElement
     // So we use the Node.Union when retrieve the value from the environment
-    const remote_object = try bc.inspector_session.getRemoteObject(
+    const remote_object = try inspector_session.getRemoteObject(
         &ls.local,
         params.objectGroup orelse "",
         node.dom,
@@ -429,11 +432,11 @@ fn describeNode(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     if (params.pierce) {
-        log.warn(.not_implemented, "DOM.describeNode", .{ .param = "pierce" });
+        log.debug(.not_implemented, "DOM.describeNode", .{ .param = "pierce" });
     }
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
 
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     return cmd.sendResult(.{ .node = bc.nodeWriter(node, .{ .depth = params.depth }) }, .{});
 }
@@ -477,7 +480,7 @@ fn scrollIntoViewIfNeeded(cmd: *CDP.Command) !void {
 
     // We retrieve the node to at least check if it exists and is valid.
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     switch (node.dom._type) {
         .element => {},
@@ -489,7 +492,9 @@ fn scrollIntoViewIfNeeded(cmd: *CDP.Command) !void {
     return cmd.sendResult(null, .{});
 }
 
-pub fn getNode(arena: Allocator, bc: *CDP.BrowserContext, node_id: ?NodeRegistry.Id, backend_node_id: ?NodeRegistry.Id, object_id: ?[]const u8) !*NodeRegistry.Node {
+/// `session_id` belongs to the command; a remote object id only resolves on
+/// the inspector session that minted it.
+pub fn getNode(arena: Allocator, bc: *CDP.BrowserContext, session_id: ?[]const u8, node_id: ?NodeRegistry.Id, backend_node_id: ?NodeRegistry.Id, object_id: ?[]const u8) !*NodeRegistry.Node {
     const input_node_id = node_id orelse backend_node_id;
     if (input_node_id) |input_node_id_| {
         return bc.node_registry.lookup_by_id.get(input_node_id_) orelse return error.NodeNotFound;
@@ -501,7 +506,8 @@ pub fn getNode(arena: Allocator, bc: *CDP.BrowserContext, node_id: ?NodeRegistry
         defer ls.deinit();
 
         // Retrieve the object from which ever context it is in.
-        const parser_node = try bc.inspector_session.getNodePtr(arena, object_id_, &ls.local);
+        const inspector_session = try bc.inspectorSession(session_id);
+        const parser_node = try inspector_session.getNodePtr(arena, object_id_, &ls.local);
         return try bc.node_registry.register(@ptrCast(@alignCast(parser_node)));
     }
     return error.MissingParams;
@@ -519,7 +525,7 @@ fn getContentQuads(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     // TODO likely if the following CSS properties are set the quads should be empty
     // visibility: hidden
@@ -545,7 +551,7 @@ fn getBoxModel(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     // TODO implement for document or text
     const element = node.dom.is(DOMNode.Element) orelse return error.NodeIsNotAnElement;
@@ -621,12 +627,12 @@ fn getOuterHTML(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     if (params.includeShadowDOM) {
-        log.warn(.not_implemented, "DOM.getOuterHTML", .{ .param = "includeShadowDOM" });
+        log.debug(.not_implemented, "DOM.getOuterHTML", .{ .param = "includeShadowDOM" });
     }
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     var aw = std.Io.Writer.Allocating.init(cmd.arena);
     try dump.deep(node.dom, .{}, &aw.writer, frame);
@@ -640,7 +646,7 @@ fn requestNode(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const node = try getNode(cmd.arena, bc, null, null, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, null, null, params.objectId);
 
     return cmd.sendResult(.{ .nodeId = node.id }, .{});
 }
@@ -661,7 +667,7 @@ fn setFileInputFiles(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const root = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
     const element = node.dom.is(DOMNode.Element) orelse return error.NodeIsNotAnElement;
     const input = element.is(Input) orelse return error.NotAnInputElement;
     if (input._input_type != .file) return error.NotAFileInput;
@@ -694,7 +700,7 @@ fn focus(cmd: *CDP.Command) !void {
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    const node = try getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
     const element = node.dom.is(DOMNode.Element) orelse return error.NodeIsNotAnElement;
     if (element.isFocusable(frame) == false) {
         return cmd.sendError(-32000, "Element is not focusable", .{});
@@ -733,7 +739,7 @@ fn fileFromDiskPath(path: []const u8, page: *Page) !*File {
 }
 
 fn mimeFromExtension(name: []const u8) []const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "application/octet-stream";
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return "application/octet-stream";
     if (dot + 1 >= name.len) return "application/octet-stream";
     var buf: [16]u8 = undefined;
     const ext_raw = name[dot + 1 ..];
@@ -974,11 +980,10 @@ test "cdp.dom: setFileInputFiles on file input" {
     try ctx.expectSentResult(.{ .nodeIds = &.{1} }, .{ .id = 2 });
 
     // Drop a temp file we can upload.
-    try std.Io.Dir.cwd().createDirPath(lp.io, ".zig-cache/tmp");
-    var tmp_dir = try std.Io.Dir.cwd().openDir(lp.io, ".zig-cache/tmp", .{});
-    defer tmp_dir.close(lp.io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     {
-        const f = try tmp_dir.createFile(lp.io, "upload.txt", .{ .truncate = true });
+        const f = try tmp.dir.createFile(lp.io, "upload.txt", .{ .truncate = true });
         defer f.close(lp.io);
         try f.writeStreamingAll(lp.io, "hello upload");
     }
@@ -988,7 +993,7 @@ test "cdp.dom: setFileInputFiles on file input" {
         .method = "DOM.setFileInputFiles",
         .params = .{
             .nodeId = 1,
-            .files = &[_][]const u8{".zig-cache/tmp/upload.txt"},
+            .files = &[_][]const u8{try testing.tmpPath(&tmp, "upload.txt")},
         },
     });
     try ctx.expectSentResult(null, .{ .id = 3 });
@@ -1010,14 +1015,13 @@ test "cdp.dom: setFileInputFiles exposes files to JS" {
     try ctx.expectSentResult(.{ .nodeIds = &.{1} }, .{ .id = 2 });
 
     // Two files, so we can assert ordering as well as identity and iteration.
-    try std.Io.Dir.cwd().createDirPath(lp.io, ".zig-cache/tmp");
-    var tmp_dir = try std.Io.Dir.cwd().openDir(lp.io, ".zig-cache/tmp", .{});
-    defer tmp_dir.close(lp.io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     {
-        const a = try tmp_dir.createFile(lp.io, "a.txt", .{ .truncate = true });
+        const a = try tmp.dir.createFile(lp.io, "a.txt", .{ .truncate = true });
         defer a.close(lp.io);
         try a.writeStreamingAll(lp.io, "aaa");
-        const b = try tmp_dir.createFile(lp.io, "b.txt", .{ .truncate = true });
+        const b = try tmp.dir.createFile(lp.io, "b.txt", .{ .truncate = true });
         defer b.close(lp.io);
         try b.writeStreamingAll(lp.io, "bbbb");
     }
@@ -1042,7 +1046,7 @@ test "cdp.dom: setFileInputFiles exposes files to JS" {
         .method = "DOM.setFileInputFiles",
         .params = .{
             .nodeId = 1,
-            .files = &[_][]const u8{ ".zig-cache/tmp/a.txt", ".zig-cache/tmp/b.txt" },
+            .files = &[_][]const u8{ try testing.tmpPath(&tmp, "a.txt"), try testing.tmpPath(&tmp, "b.txt") },
         },
     });
     try ctx.expectSentResult(null, .{ .id = 3 });
@@ -1132,11 +1136,10 @@ test "cdp.dom: setFileInputFiles errors when a path is missing" {
 
     // First path exists, second does not: the first File is created then must be
     // freed when the second read fails (the test runner panics on a leak).
-    try std.Io.Dir.cwd().createDirPath(lp.io, ".zig-cache/tmp");
-    var tmp_dir = try std.Io.Dir.cwd().openDir(lp.io, ".zig-cache/tmp", .{});
-    defer tmp_dir.close(lp.io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     {
-        const f = try tmp_dir.createFile(lp.io, "upload.txt", .{ .truncate = true });
+        const f = try tmp.dir.createFile(lp.io, "upload.txt", .{ .truncate = true });
         defer f.close(lp.io);
         try f.writeStreamingAll(lp.io, "hello upload");
     }
@@ -1146,7 +1149,7 @@ test "cdp.dom: setFileInputFiles errors when a path is missing" {
         .method = "DOM.setFileInputFiles",
         .params = .{
             .nodeId = 1,
-            .files = &[_][]const u8{ ".zig-cache/tmp/upload.txt", ".zig-cache/tmp/does-not-exist.txt" },
+            .files = &[_][]const u8{ try testing.tmpPath(&tmp, "upload.txt"), try testing.tmpPath(&tmp, "does-not-exist.txt") },
         },
     });
     try ctx.expectSentError(-31998, "FileNotFound", .{ .id = 3 });
@@ -1164,11 +1167,10 @@ test "cdp.dom: focus and setFileInputFiles fire in the node's own frame" {
     const text_node = try bc.node_registry.register(text.asNode());
     const upload_node = try bc.node_registry.register(upload.asNode());
 
-    try std.Io.Dir.cwd().createDirPath(lp.io, ".zig-cache/tmp");
-    var tmp_dir = try std.Io.Dir.cwd().openDir(lp.io, ".zig-cache/tmp", .{});
-    defer tmp_dir.close(lp.io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     {
-        const f = try tmp_dir.createFile(lp.io, "upload.txt", .{ .truncate = true });
+        const f = try tmp.dir.createFile(lp.io, "upload.txt", .{ .truncate = true });
         defer f.close(lp.io);
         try f.writeStreamingAll(lp.io, "hello upload");
     }
@@ -1180,7 +1182,7 @@ test "cdp.dom: focus and setFileInputFiles fire in the node's own frame" {
         .method = "DOM.setFileInputFiles",
         .params = .{
             .nodeId = upload_node.id,
-            .files = &[_][]const u8{".zig-cache/tmp/upload.txt"},
+            .files = &[_][]const u8{try testing.tmpPath(&tmp, "upload.txt")},
         },
     });
     try ctx.expectSentResult(null, .{ .id = 2 });
@@ -1400,7 +1402,49 @@ fn mainWorldContextId(bc: *CDP.BrowserContext, frame: *const Frame) !i32 {
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
-    return bc.inspector_session.inspector.getContextId(&ls.local);
+    return bc.inspector().getContextId(&ls.local);
+}
+
+test "cdp.dom: remote object ids belong to the session that minted them" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-RO", .url = "cdp/dom1.html", .target_id = "FID-000000000R".*, .session_id = "SID-PRIMARY" });
+    _ = try bc.attachSession("SID-AUX", null);
+
+    const root = bc.mainFrame() orelse unreachable;
+    const html = root.document.getDocumentElement() orelse unreachable;
+    const html_node = try bc.node_registry.register(html.asNode());
+    const document_node = try bc.node_registry.register(root.document.asNode());
+
+    // The auxiliary session mints an id for <html> and resolves it.
+    try ctx.processMessage(.{ .id = 20, .method = "DOM.resolveNode", .sessionId = "SID-AUX", .params = .{ .backendNodeId = html_node.id } });
+    const aux_object_id = try sentObjectId(&ctx, 20);
+    try ctx.processMessage(.{ .id = 21, .method = "DOM.requestNode", .sessionId = "SID-AUX", .params = .{ .objectId = aux_object_id } });
+    try ctx.expectSentResult(.{ .nodeId = html_node.id }, .{ .id = 21, .session_id = "SID-AUX" });
+
+    // The primary has minted nothing yet: the auxiliary's id is not its.
+    try ctx.processMessage(.{ .id = 22, .method = "Runtime.callFunctionOn", .sessionId = "SID-PRIMARY", .params = .{
+        .objectId = aux_object_id,
+        .functionDeclaration = "function() { return this.localName; }",
+        .returnByValue = true,
+    } });
+    try ctx.expectSentError(-32000, "Could not find object with given id", .{ .id = 22 });
+
+    // Each session numbers its ids by itself, so the primary's first id may
+    // well be the same string as the auxiliary's: the session a command comes
+    // through, not the id, tells the objects apart. Mint a different node on
+    // the primary and check that each id describes its own.
+    try ctx.processMessage(.{ .id = 23, .method = "DOM.resolveNode", .sessionId = "SID-PRIMARY", .params = .{ .backendNodeId = document_node.id } });
+    const primary_object_id = try sentObjectId(&ctx, 23);
+    try ctx.processMessage(.{ .id = 24, .method = "DOM.describeNode", .sessionId = "SID-PRIMARY", .params = .{ .objectId = primary_object_id } });
+    try ctx.expectSentResult(.{ .node = .{ .nodeId = document_node.id, .nodeName = "#document" } }, .{ .id = 24, .session_id = "SID-PRIMARY" });
+    try ctx.processMessage(.{ .id = 25, .method = "DOM.describeNode", .sessionId = "SID-AUX", .params = .{ .objectId = aux_object_id } });
+    try ctx.expectSentResult(.{ .node = .{ .nodeId = html_node.id, .localName = "html" } }, .{ .id = 25, .session_id = "SID-AUX" });
+    try ctx.processMessage(.{ .id = 26, .method = "DOM.requestNode", .sessionId = "SID-PRIMARY", .params = .{ .objectId = primary_object_id } });
+    try ctx.expectSentResult(.{ .nodeId = document_node.id }, .{ .id = 26, .session_id = "SID-PRIMARY" });
+    try ctx.processMessage(.{ .id = 27, .method = "DOM.requestNode", .sessionId = "SID-AUX", .params = .{ .objectId = aux_object_id } });
+    try ctx.expectSentResult(.{ .nodeId = html_node.id }, .{ .id = 27, .session_id = "SID-AUX" });
 }
 
 // The result.object.objectId of the response to command `msg_id`.

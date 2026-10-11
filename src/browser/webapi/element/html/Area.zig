@@ -13,12 +13,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const lp = @import("lightpanda");
 const std = @import("std");
-const js = @import("../../../js/js.zig");
-const Factory = @import("../../../Factory.zig");
-const Frame = @import("../../../Frame.zig");
+const lp = @import("lightpanda");
+
 const URL = @import("../../../URL.zig");
+const js = @import("../../../js/js.zig");
+const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
@@ -26,6 +27,7 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 
 const HtmlElement = @import("../Html.zig");
 
+const String = lp.String;
 const Area = @This();
 
 pub const Proto = HtmlElement;
@@ -197,6 +199,11 @@ pub fn getRelList(self: *Area, frame: *Frame) !?*DOMTokenList {
     return element.getRelList(frame);
 }
 
+fn setRelList(self: *Area, value: String, frame: *Frame) !void {
+    const list = try self.getRelList(frame) orelse return;
+    try list.setValue(value, frame);
+}
+
 fn getResolvedHref(self: *Area, frame: *Frame) !?[:0]const u8 {
     const href = self.asElement().getAttributeInterned("href") orelse return null;
     if (href.len == 0) {
@@ -244,7 +251,7 @@ pub const JsApi = struct {
     pub const rel = reflect.string("rel");
     pub const referrerPolicy = reflect.referrerPolicy();
     pub const toString = bridge.function(Area.getHref, .{});
-    pub const relList = bridge.accessor(Area.getRelList, null, .{ .null_as_undefined = true });
+    pub const relList = bridge.accessor(Area.getRelList, Area.setRelList, .{ .null_as_undefined = true, .ce_reactions = true });
 };
 
 const testing = @import("../../../../testing.zig");

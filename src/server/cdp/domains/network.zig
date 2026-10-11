@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
 const SafeString = @import("../SafeString.zig");
+const Base64Writer = @import("../../../Base64Writer.zig");
 
 const Config = @import("../../../Config.zig");
 const URL = @import("../../../browser/URL.zig");
@@ -105,7 +106,7 @@ fn emulateNetworkConditions(cmd: *CDP.Command) !void {
     }
     // -1 disables a throughput limit.
     if (params.latency > 0 or params.downloadThroughput > 0 or params.uploadThroughput > 0) {
-        log.warn(.not_implemented, "Network.emulateNetworkConditions", .{ .param = "throttling" });
+        log.debug(.not_implemented, "Network.emulateConditions", .{ .param = "throttling" });
     }
     return cmd.sendResult(null, .{});
 }
@@ -182,18 +183,18 @@ fn setExtraHTTPHeaders(cmd: *CDP.Command) !void {
         const value = header.value_ptr.*;
 
         if (Mime.isHttpToken(key) == false) {
-            log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header name must be a non-empty HTTP token" });
+            log.debug(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header name must be a non-empty HTTP token" });
             continue;
         }
 
         if (Mime.isHttpHeaderValue(value) == false) {
-            log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header value must be Latin-1 text without CR, LF or NUL" });
+            log.debug(.cdp, "network.setExtraHTTPHeaders", .{ .param = "header", .value = key, .info = "header value must be Latin-1 text without CR, LF or NUL" });
             continue;
         }
 
         if (std.ascii.eqlIgnoreCase(key, "user-agent")) {
             Config.validateUserAgent(value) catch |err| {
-                log.warn(.cdp, "network.setExtraHTTPHeaders", .{ .param = "userAgent", .value = value, .err = err });
+                log.debug(.cdp, "network.setExtraHTTPHeaders", .{ .param = "userAgent", .value = value, .err = err });
                 continue;
             };
         }
@@ -236,7 +237,7 @@ fn deleteCookies(cmd: *CDP.Command) !void {
     // This allows Puppeteer's frame.setCookie() to work, which sends deleteCookies
     // with partitionKey as part of its cookie-setting workflow.
     if (params.partitionKey != null) {
-        log.warn(.not_implemented, "partition key", .{ .src = "deleteCookies" });
+        log.debug(.not_implemented, "partition key", .{ .src = "deleteCookies" });
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
@@ -291,9 +292,11 @@ fn setCookie(cmd: *CDP.Command) !void {
     )) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    try CdpStorage.setCdpCookie(&bc.session.cookie_jar, params);
+    const stored = CdpStorage.setCdpCookies(&bc.session.cookie_jar, &.{params}) catch |err| {
+        return cmd.sendError(-32602, CdpStorage.refusal(err) orelse return err, .{});
+    };
 
-    try cmd.sendResult(.{ .success = true }, .{});
+    try cmd.sendResult(.{ .success = stored == 1 }, .{});
 }
 
 fn setCookies(cmd: *CDP.Command) !void {
@@ -302,9 +305,10 @@ fn setCookies(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    for (params.cookies) |param| {
-        try CdpStorage.setCdpCookie(&bc.session.cookie_jar, param);
-    }
+    _ = CdpStorage.setCdpCookies(&bc.session.cookie_jar, params.cookies) catch |err| {
+        _ = CdpStorage.refusal(err) orelse return err;
+        return cmd.sendError(-32602, "Invalid cookie fields", .{});
+    };
 
     try cmd.sendResult(null, .{});
 }
@@ -361,18 +365,29 @@ fn getResponseBody(cmd: *CDP.Command) !void {
         return cmd.sendResult(.{
             .body = data.items,
             .base64Encoded = false,
-        }, .{});
+        }, .{ .size_hint = data.items.len });
     }
 
-    const encoded_len = std.base64.standard.Encoder.calcSize(data.items.len);
-    const encoded = try cmd.arena.alloc(u8, encoded_len);
-    _ = std.base64.standard.Encoder.encode(encoded, data.items);
-
     return cmd.sendResult(.{
-        .body = encoded,
+        .body = Base64Body{ .data = data.items },
         .base64Encoded = true,
-    }, .{});
+    }, .{ .size_hint = std.base64.standard.Encoder.calcSize(data.items.len) });
 }
+
+// Encodes straight into the outgoing message, no intermediate buffer.
+const Base64Body = struct {
+    data: []const u8,
+
+    pub fn jsonStringify(self: Base64Body, jws: *std.json.Stringify) std.Io.Writer.Error!void {
+        try jws.beginWriteRaw();
+        try jws.writer.writeByte('"');
+        var b64 = Base64Writer.init(jws.writer, .standard);
+        try b64.writer.writeAll(self.data);
+        try b64.finish();
+        try jws.writer.writeByte('"');
+        jws.endWriteRaw();
+    }
+};
 
 fn getRequestPostData(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
@@ -611,13 +626,15 @@ const ResponseWriter = struct {
             try jws.write(status);
 
             try jws.objectField("statusText");
-            try jws.write(@as(std.http.Status, @enumFromInt(status)).phrase() orelse "Unknown");
+            // The server's own phrase, not a canonical one: Chrome reports the
+            // wire, empty included.
+            try jws.write(transfer.statusText() orelse "");
         }
 
         {
             const mime: Mime = blk: {
                 if (transfer.contentType()) |ct| {
-                    break :blk try Mime.parse(ct);
+                    break :blk Mime.parse(ct) catch .unknown;
                 }
                 break :blk .unknown;
             };
@@ -679,9 +696,8 @@ const ResponseWriter = struct {
             // common to get these from a server (e.g. for Cache-Control), but
             // Chrome joins these. So we have to too.
             const arena = self.arena;
-            var it = transfer.responseHeaderIterator();
             var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-            while (it.next()) |hdr| {
+            for (transfer.responseHeaders()) |hdr| {
                 const gop = try map.getOrPut(arena, hdr.name);
                 if (gop.found_existing) {
                     // yes, chrome joins multi-value headers with a \n
@@ -958,7 +974,7 @@ test "cdp.Network: cookies" {
         .params = .{ .browserContextId = "BID-S" },
     });
     // Just the untouched test4 should be in the result
-    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{.{ .name = "test4", .value = "value4", .domain = ".example.com", .path = "/mango", .size = 11 }} }, .{ .id = 8 });
+    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{.{ .name = "test4", .value = "value4", .domain = "example.com", .path = "/mango", .size = 11 }} }, .{ .id = 8 });
 
     // Empty after clearBrowserCookies
     try ctx.processMessage(.{
@@ -972,6 +988,78 @@ test "cdp.Network: cookies" {
         .params = .{ .browserContextId = "BID-S" },
     });
     try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{} }, .{ .id = 10 });
+}
+
+test "cdp.Network: invalid cookie fields are refused as Chrome does" {
+    const CdpCookie = CdpStorage.CdpCookie;
+    const ResCookie = CdpStorage.ResCookie;
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-INV" });
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Network.setCookie",
+        .params = CdpCookie{ .name = "a;b", .value = "v", .url = "https://example.com/" },
+    });
+    try ctx.expectSentError(-32602, "Sanitizing cookie failed", .{ .id = 1 });
+
+    // One bad cookie fails the whole batch, and nothing is stored.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.setCookies",
+        .params = .{ .cookies = &[_]CdpCookie{
+            .{ .name = "ok", .value = "v", .url = "https://example.com/" },
+            .{ .name = "a", .value = "x\ty", .url = "https://example.com/" },
+        } },
+    });
+    try ctx.expectSentError(-32602, "Invalid cookie fields", .{ .id = 2 });
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Storage.setCookies",
+        .params = .{ .cookies = &[_]CdpCookie{.{ .name = "a", .value = "v" }} },
+    });
+    try ctx.expectSentError(-32602, "Invalid cookie fields", .{ .id = 3 });
+
+    // An https url makes the cookie Secure even when `secure` says otherwise.
+    try ctx.processMessage(.{
+        .id = 4,
+        .method = "Network.setCookie",
+        .params = CdpCookie{ .name = "a", .value = "v", .url = "https://example.com/", .secure = false },
+    });
+    try ctx.expectSentResult(.{ .success = true }, .{ .id = 4 });
+    try ctx.processMessage(.{ .id = 5, .method = "Storage.getCookies", .params = .{ .browserContextId = "BID-INV" } });
+    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{.{ .name = "a", .value = "v", .domain = "example.com", .path = "/", .size = 2, .secure = true }} }, .{ .id = 5 });
+}
+
+test "cdp.Network: a cookie domain overrides the url's host" {
+    const CdpCookie = CdpStorage.CdpCookie;
+    const ResCookie = CdpStorage.ResCookie;
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-DOM" });
+
+    // As in Chrome, the url only makes the cookie Secure; without a leading
+    // dot the domain is host-only.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Network.setCookies",
+        .params = .{ .cookies = &[_]CdpCookie{
+            .{ .name = "a", .value = "v", .url = "https://example.com/", .domain = "other.com" },
+            .{ .name = "b", .value = "v", .url = "https://example.com/", .domain = ".other.com" },
+        } },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Storage.getCookies", .params = .{ .browserContextId = "BID-DOM" } });
+    try ctx.expectSentResult(.{ .cookies = &[_]ResCookie{
+        .{ .name = "a", .value = "v", .domain = "other.com", .path = "/", .size = 2, .secure = true },
+        .{ .name = "b", .value = "v", .domain = ".other.com", .path = "/", .size = 2, .secure = true },
+    } }, .{ .id = 2 });
+
+    try ctx.processMessage(.{ .id = 3, .method = "Network.setCookie", .params = CdpCookie{ .name = "c", .value = "v" } });
+    try ctx.expectSentError(-32602, "At least one of the url or domain needs to be specified", .{ .id = 3 });
 }
 
 test "cdp.Network: clearBrowserCookies accepts empty params object" {
@@ -1196,7 +1284,7 @@ test "cdp.Network: setBlockedURLs blocks requests with inspector reason" {
     error_context.err = null;
 
     var redirect_request_id: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&redirect_request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+    _ = std.mem.print(&redirect_request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
 
     try client.request(.{
         .frame_id = page.frame_id,
@@ -1233,7 +1321,7 @@ test "cdp.Network: POST body exposed as postData" {
     try ctx.expectSentResult(null, .{ .id = 1 });
 
     var request_id: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+    _ = std.mem.print(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
 
     // \xE9 exercises the Latin-1 -> UTF-8 transcode in postData;
     // postDataEntries carry the raw bytes in base64.
@@ -1296,10 +1384,10 @@ const EchoDriver = struct {
         self.err = err;
     }
 
-    fn run(bc: *CDP.BrowserContext, frame_id: u32, body: []const u8) ![14]u8 {
+    fn run(bc: *CDP.BrowserContext, frame_id: u32, body: []const u8, partial: ?u32) ![14]u8 {
         const client = &bc.cdp.browser.http_client;
         var request_id: [14]u8 = undefined;
-        _ = std.fmt.bufPrint(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+        _ = std.mem.print(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
 
         var driver: EchoDriver = .{};
         try client.request(.{
@@ -1308,6 +1396,7 @@ const EchoDriver = struct {
             .method = .POST,
             .url = "http://127.0.0.1:9582/echo_body",
             .body = body,
+            .partial = partial,
             .origin = bc.security_origin,
             .request_mode = .no_cors,
             .credentials_mode = .same_origin,
@@ -1343,8 +1432,8 @@ test "cdp.Network: enable maxResourceBufferSize evicts oversized bodies" {
     });
     try ctx.expectSentResult(null, .{ .id = 1 });
 
-    const big = try EchoDriver.run(bc, page.frame_id, "12345678");
-    const small = try EchoDriver.run(bc, page.frame_id, "123");
+    const big = try EchoDriver.run(bc, page.frame_id, "12345678", null);
+    const small = try EchoDriver.run(bc, page.frame_id, "123", null);
 
     try ctx.processMessage(.{
         .id = 2,
@@ -1377,6 +1466,45 @@ test "cdp.Network: enable maxResourceBufferSize evicts oversized bodies" {
     try testing.expectEqual(0, bc.captured_responses_size);
 }
 
+test "cdp.Network: getResponseBody omits a partial body" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-PRT", .session_id = "SID-PRT" });
+    const page = try bc.session.createPage();
+
+    try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+
+    const request_id = try EchoDriver.run(bc, page.frame_id, "12345678", 4);
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.getResponseBody",
+        .params = .{ .requestId = &request_id },
+    });
+    try ctx.expectSentResult(.{ .body = "", .base64Encoded = false }, .{ .id = 2 });
+    try testing.expectEqual(0, bc.captured_responses_size);
+}
+
+test "cdp.Network: getResponseBody base64-encodes a non-UTF-8 body" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-B64", .session_id = "SID-B64" });
+    const page = try bc.session.createPage();
+
+    try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+
+    const request_id = try EchoDriver.run(bc, page.frame_id, "\xffab\xfe", null);
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.getResponseBody",
+        .params = .{ .requestId = &request_id },
+    });
+    try ctx.expectSentResult(.{ .body = "/2Fi/g==", .base64Encoded = true }, .{ .id = 2 });
+}
+
 test "cdp.Network: enable maxTotalBufferSize evicts oldest bodies first" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -1391,8 +1519,8 @@ test "cdp.Network: enable maxTotalBufferSize evicts oldest bodies first" {
     });
     try ctx.expectSentResult(null, .{ .id = 1 });
 
-    const first = try EchoDriver.run(bc, page.frame_id, "aaaaaa");
-    const second = try EchoDriver.run(bc, page.frame_id, "bbbbbb");
+    const first = try EchoDriver.run(bc, page.frame_id, "aaaaaa", null);
+    const second = try EchoDriver.run(bc, page.frame_id, "bbbbbb", null);
 
     try ctx.processMessage(.{
         .id = 2,
@@ -1437,7 +1565,7 @@ test "cdp.Network: enable maxPostDataSize omits inline postData" {
     try ctx.expectSentResult(null, .{ .id = 1 });
 
     const body = "{\"source\":\"xhr\",\"pageSize\":100}";
-    const request_id = try EchoDriver.run(bc, page.frame_id, body);
+    const request_id = try EchoDriver.run(bc, page.frame_id, body, null);
 
     try ctx.expectSentEvent("Network.requestWillBeSent", .{
         .requestId = &request_id,
@@ -1505,7 +1633,7 @@ test "cdp.Network: redirect hop precedes Fetch pause and carries redirectRespons
     const start_url = "http://127.0.0.1:9582/redirect-cross-origin-x-hop";
     const target_url = "http://localhost:9582/echo-x-hop";
     var request_id: [14]u8 = undefined;
-    _ = std.fmt.bufPrint(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+    _ = std.mem.print(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
 
     try client.request(.{
         .frame_id = page.frame_id,
@@ -1591,7 +1719,7 @@ test "cdp.Network: worker requests emit network events" {
     _ = try cdp.createBrowserContext();
     var bc = &cdp.browser_context.?;
     bc.id = "BID-NW";
-    bc.session_id = "SID-NW";
+    _ = try bc.attachPrimarySession("SID-NW");
     bc.target_id = "TID-NW-0000000".*;
 
     try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });

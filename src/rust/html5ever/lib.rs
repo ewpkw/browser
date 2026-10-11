@@ -38,7 +38,6 @@ pub extern "C" fn html5ever_parse_document(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -67,7 +66,6 @@ pub extern "C" fn html5ever_parse_document(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -101,7 +99,6 @@ pub extern "C" fn html5ever_parse_document_with_encoding(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -141,7 +138,6 @@ pub extern "C" fn html5ever_parse_document_with_encoding(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -465,7 +461,6 @@ pub extern "C" fn html5ever_parse_fragment(
     ctx: Ref,
     create_element_callback: CreateElementCallback,
     create_context_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -494,7 +489,6 @@ pub extern "C" fn html5ever_parse_fragment(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -606,7 +600,6 @@ pub extern "C" fn html5ever_streaming_parser_create(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -637,7 +630,6 @@ pub extern "C" fn html5ever_streaming_parser_create(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -739,7 +731,6 @@ pub extern "C" fn xml5ever_parse_document(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -768,7 +759,6 @@ pub extern "C" fn xml5ever_parse_document(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -874,6 +864,17 @@ impl<'arena> xml5ever::tokenizer::TokenSink for UnclosedTagSink<'arena> {
                         .parse_error(std::borrow::Cow::Borrowed("Unclosed element at EOF"));
                 }
             }
+            // The XML declaration isn't a processing instruction, so no node
+            // is created for it. xml5ever doesn't validate it.
+            Token::ProcessingInstruction(pi) if &*pi.target == "xml" => {
+                if !is_valid_xml_declaration(&pi.data) {
+                    use xml5ever::tree_builder::TreeSink;
+                    self.tb
+                        .sink
+                        .parse_error(std::borrow::Cow::Borrowed("Invalid XML declaration"));
+                }
+                return xml5ever::tokenizer::ProcessResult::Continue;
+            }
             _ => {}
         }
         self.tb.process_token(token)
@@ -881,6 +882,30 @@ impl<'arena> xml5ever::tokenizer::TokenSink for UnclosedTagSink<'arena> {
 
     fn end(&self) {
         self.tb.end()
+    }
+}
+
+// The declaration must start with `version="1.x"`: browsers accept any 1.x
+// (XML 1.0 5th edition's VersionNum is `1.[0-9]+`) and reject everything else.
+fn is_valid_xml_declaration(data: &str) -> bool {
+    fn trim(s: &str) -> &str {
+        s.trim_start_matches([' ', '\t', '\r', '\n'])
+    }
+    let Some(rest) = trim(data).strip_prefix("version").map(trim) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('=').map(trim) else {
+        return false;
+    };
+    let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return false;
+    };
+    let Some((version, _)) = rest[1..].split_once(quote) else {
+        return false;
+    };
+    match version.strip_prefix("1.") {
+        Some(minor) => !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
     }
 }
 

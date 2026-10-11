@@ -52,7 +52,7 @@ const RegisterOptions = struct {
 };
 
 pub fn init(frame: *Frame) !*ServiceWorkerContainer {
-    const self = try frame._factory.eventTargetWithAllocator(frame.arena, ServiceWorkerContainer{
+    const self = try frame._factory.eventTargetWithAllocator(frame.page_arena, ServiceWorkerContainer{
         ._proto = undefined,
         ._frame = frame,
     });
@@ -88,7 +88,7 @@ pub fn workerActivated(self: *ServiceWorkerContainer) void {
     }
 
     self.scheduleReady() catch |err| {
-        log.warn(.browser, "SWC ready", .{ .err = err });
+        log.debug(.browser, "SWC ready", .{ .err = err });
     };
 }
 
@@ -128,7 +128,7 @@ pub fn register(self: *ServiceWorkerContainer, url: []const u8, options: ?Regist
     const scope_url = blk: {
         const raw = opts.scope orelse blk2: {
             // A registration's default scope is the script's own directory.
-            const end = std.mem.lastIndexOfScalar(u8, script_url, '/') orelse break :blk2 script_url;
+            const end = std.mem.findScalarLast(u8, script_url, '/') orelse break :blk2 script_url;
             break :blk2 script_url[0 .. end + 1];
         };
 
@@ -139,7 +139,7 @@ pub fn register(self: *ServiceWorkerContainer, url: []const u8, options: ?Regist
     };
 
     const scope = ServiceWorkerGlobalScope.getOrCreate(frame, script_url, scope_url, opts.type) catch |err| {
-        log.err(.browser, "SWC register", .{ .url = script_url, .err = err });
+        log.debug(.browser, "SWC register", .{ .url = script_url, .err = err });
         resolver.rejectError("ServiceWorkerContainer.register", .{ .type_error = "Failed to register a ServiceWorker" });
         return resolver.promise();
     };
@@ -159,7 +159,7 @@ fn track(self: *ServiceWorkerContainer, scope: *ServiceWorkerGlobalScope) !*Serv
     const frame = self._frame;
     const registration = try ServiceWorkerRegistration.init(scope, self, &frame.js.execution);
     errdefer registration.detach();
-    try self._registrations.append(frame.arena, registration);
+    try self._registrations.append(frame.page_arena, registration);
 
     if (scope.hasActiveWorker()) {
         self.workerActivated();

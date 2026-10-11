@@ -27,6 +27,7 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 
 const HtmlElement = @import("../Html.zig");
 
+const String = lp.String;
 const Output = @This();
 
 pub const Proto = HtmlElement;
@@ -53,6 +54,11 @@ fn getHtmlFor(self: *Output, frame: *Frame) !?*DOMTokenList {
     return element.getTokenList(.@"for", frame);
 }
 
+fn setHtmlFor(self: *Output, value: String, frame: *Frame) !void {
+    const list = try self.getHtmlFor(frame) orelse return;
+    try list.setValue(value, frame);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Output);
 
@@ -64,7 +70,13 @@ pub const JsApi = struct {
 
     const reflect = Element.Reflect(Output);
     pub const name = reflect.string("name");
+    pub const @"type" = bridge.property("output", .{ .template = false, .readonly = true });
 
     pub const labels = bridge.accessor(Output.getLabels, null, .{});
-    pub const htmlFor = bridge.accessor(Output.getHtmlFor, null, .{ .null_as_undefined = true });
+    pub const htmlFor = bridge.accessor(Output.getHtmlFor, Output.setHtmlFor, .{ .null_as_undefined = true, .ce_reactions = true });
 };
+
+const testing = @import("../../../../testing.zig");
+test "WebApi: HTML.Output" {
+    try testing.htmlRunner("element/html/output.html", .{});
+}

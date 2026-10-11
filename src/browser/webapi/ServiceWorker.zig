@@ -64,7 +64,7 @@ pub const State = enum {
 };
 
 pub fn init(scope: *ServiceWorkerGlobalScope, exec: *Execution) !*ServiceWorker {
-    return exec._factory.eventTargetWithAllocator(exec.arena, ServiceWorker{
+    return exec._factory.eventTargetWithAllocator(exec.page_arena, ServiceWorker{
         ._proto = undefined,
         ._exec = exec,
         ._scope = scope,
@@ -101,7 +101,7 @@ pub fn stateChanged(self: *ServiceWorker) void {
     }
 
     self.scheduleStateChange() catch |err| {
-        log.warn(.browser, "SW statechange", .{ .err = err });
+        log.debug(.browser, "SW statechange", .{ .err = err });
     };
 }
 

@@ -46,6 +46,12 @@ pub const State = struct {
 
 state: State,
 frame: *Frame,
+skipped: ?Skipped = null,
+
+pub const Skipped = struct {
+    allocator: std.mem.Allocator,
+    set: *PruneSet,
+};
 
 pub const Child = struct {
     node: *Node,
@@ -68,7 +74,10 @@ const Children = struct {
     pub fn next(self: *Children) ?Child {
         while (self.next_node) |node| {
             self.next_node = node.nextSibling();
-            var child = self.tree.classify(node, .{ .boxed = self.boxed }) orelse continue;
+            var child = self.tree.classify(node, .{ .boxed = self.boxed }) orelse {
+                self.tree.recordSkipped(node);
+                continue;
+            };
             child.separated = self.boxed and self.yielded;
             self.yielded = true;
             return child;
@@ -83,15 +92,32 @@ pub const Slotted = struct {
     assigned: []const *Node,
     fallback: Children,
 
+    pub fn init(children_: Children) Slotted {
+        return .{ .tree = children_.tree, .assigned = &.{}, .fallback = children_ };
+    }
+
     pub fn next(self: *Slotted) ?Child {
         while (self.assigned.len > 0) {
             const node = self.assigned[0];
             self.assigned = self.assigned[1..];
-            return self.tree.classify(node, .{ .slotted = true }) orelse continue;
+            return self.tree.classify(node, .{ .slotted = true }) orelse {
+                self.tree.recordSkipped(node);
+                continue;
+            };
         }
         return self.fallback.next();
     }
 };
+
+fn recordSkipped(self: *const RenderTree, node: *Node) void {
+    const skipped = self.skipped orelse return;
+    const el = node.is(Element) orelse return;
+    if (el.getTag() == .head) {
+        // <head> renders nothing, but we still need its title & base
+        return;
+    }
+    skipped.set.put(skipped.allocator, node, {}) catch {};
+}
 
 pub fn children(self: *const RenderTree, parent: *Node, boxed: bool) Children {
     return .{ .tree = self, .next_node = parent.firstChild(), .boxed = boxed };
@@ -339,7 +365,7 @@ fn measureChild(self: *const RenderTree, child: Child, where: Measure.Where, m: 
             const el = child.node.subtype(Element);
             const inner: Measure.Where = .{
                 .shell = where.shell or dump_html.isShellElement(el),
-                .link = where.link or el.getTag() == .anchor,
+                .link = where.link or (el.getTag() == .anchor and el.getAttributeInterned("href") != null),
             };
             if (el.is(Slot)) |slot| {
                 var it = self.slotted(slot);

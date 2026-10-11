@@ -25,6 +25,7 @@ const Frame = @import("Frame.zig");
 const Session = @import("Session.zig");
 const Factory = @import("Factory.zig");
 const Viewport = @import("Viewport.zig");
+const EventManagerBase = @import("EventManagerBase.zig");
 
 const Blob = @import("webapi/Blob.zig");
 const Node = @import("webapi/Node.zig");
@@ -40,6 +41,7 @@ const AnimatedTransformList = @import("webapi/svg/AnimatedTransformList.zig");
 const ServiceWorkerGlobalScope = @import("webapi/ServiceWorkerGlobalScope.zig");
 const AnimatedPreserveAspectRatio = @import("webapi/svg/AnimatedPreserveAspectRatio.zig");
 
+const log = lp.log;
 const Allocator = std.mem.Allocator;
 
 // A Page is the container for a root Frame and all of its descendants
@@ -80,13 +82,16 @@ broadcast_sequence: u64 = 0,
 // Not exhaustive: some swallowed-callback paths aren't routed here.
 js_error_count: usize = 0,
 
+// Entered (logScope) around any work done on this Page's behalf.
+log_context: log.PageContext,
+
 // DOM object factory scoped to this Page's documents.
 factory: Factory,
 
 // The arena for this Page's lifetime. Document / Frame / Factory / DOM
 // objects allocate out of this.
-_frame_arena: *lp.Arena,
-frame_arena: Allocator,
+_arena: *lp.Arena,
+arena: Allocator,
 
 // Lazily-created per-node state, kept out of the nodes themselves because
 // few nodes ever need it. Keyed by node pointer and held by the Page, not a
@@ -159,6 +164,11 @@ identity: js.Identity = .{},
 // Browser.fc_identity_pool so they outlive the Page (and the Session) for v8
 // weak-callback safety.
 finalizer_callbacks: std.AutoHashMapUnmanaged(usize, js.FinalizerCallback) = .empty,
+
+// Event listener registration for every Frame in the Page. This used to be
+// per-frame, but a listener belongs to the target, e.g. a Node, and the Node
+// can be reached and live beyond its Frame.
+event_listeners: EventManagerBase,
 
 // Persisted v8 handles owned by this Page. Handles that outlive the Page are
 // reset on teardown; handles that can be released early are dropped
@@ -247,25 +257,36 @@ pub fn viewportChanged(self: *Page) void {
 
 // Initialize a Page and its root Frame.
 pub fn init(self: *Page, session: *Session, frame_id: u32) !void {
-    const frame_arena = try session.arena_pool.acquire(.large, "Page.frame_arena");
-    errdefer frame_arena.release();
+    const arena = try session.arena_pool.acquire(.large, "Page.arena");
+    errdefer arena.release();
 
     self.* = .{
         .session = session,
         .frame = undefined,
-        ._frame_arena = frame_arena,
-        .frame_arena = frame_arena.allocator(),
-        .factory = Factory.init(self, frame_arena.allocator(), &session.browser.documents),
+        ._arena = arena,
+        .arena = arena.allocator(),
+        .factory = Factory.init(self, arena.allocator(), &session.browser.documents),
         .globals = .init(session.browser.app.allocator),
+        .event_listeners = .init(arena.allocator()),
+        .log_context = .{ .id = log.nextPageId(), .url = &self.frame.url },
     };
     self.queued_navigation = &self.queued_navigation_1;
 
     try Frame.init(&self.frame, frame_id, self, .{});
 }
 
+pub fn logScope(self: *Page) log.PageScope {
+    return log.enterPage(&self.log_context);
+}
+
 // Tear down the Page and its root Frame. Equivalent to the old
 // Session.removePage + Session.resetFrameResources.
 pub fn deinit(self: *Page) void {
+    const page_scope = self.logScope();
+    defer page_scope.exit();
+
+    log.log(.frame, self.log_context.max_level, "navigation done", .{ .url = self.frame.url });
+
     for (self.popups.items) |popup| {
         popup.deinit();
     }
@@ -346,7 +367,7 @@ pub fn deinit(self: *Page) void {
     }
 
     self.factory.deinit();
-    self._frame_arena.release();
+    self._arena.release();
 }
 
 pub fn recordJsError(self: *Page, err: anyerror) void {
@@ -392,8 +413,8 @@ pub fn createBlobUrl(self: *Page, blob: *Blob, origin: ?[]const u8, creator_fram
     var uuid: [36]u8 = undefined;
     @import("../id.zig").uuidv4(&uuid);
 
-    const url = try std.fmt.allocPrint(self.frame_arena, "blob:{s}/{s}", .{ origin orelse "null", uuid });
-    try self.blob_urls.put(self.frame_arena, url, .{ .blob = blob, .creator = creator_frame_id });
+    const url = try self.arena.print("blob:{s}/{s}", .{ origin orelse "null", uuid });
+    try self.blob_urls.put(self.arena, url, .{ .blob = blob, .creator = creator_frame_id });
     blob.acquireRef();
     return url;
 }
@@ -523,7 +544,6 @@ fn appendFrameExecutions(frame: *Frame, origin: []const u8, arena: Allocator, li
 const testing = @import("../testing.zig");
 
 test "Page: js_error_count" {
-    testing.expectLog(&.{ .js, .js, .js });
 
     // One uncaught top-level script exception, one uncaught timer-callback
     // exception.

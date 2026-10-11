@@ -24,7 +24,6 @@ const URL = @import("../../URL.zig");
 const HttpClient = @import("../../../network/HttpClient.zig");
 
 const AbortSignal = @import("../AbortSignal.zig");
-const DOMException = @import("../DOMException.zig");
 
 const Request = @import("Request.zig");
 const Response = @import("Response.zig");
@@ -43,9 +42,11 @@ _buf: std.ArrayList(u8),
 _response: *Response,
 _owns_response: bool,
 _signal: ?*AbortSignal,
+_abort_reason: ?AbortSignal.Reason = null,
 _manual_redirect: bool,
 _no_cors: bool,
 _null_body: bool,
+_headers_done: bool = false,
 _sink: Sink,
 
 pub const Input = Request.Input;
@@ -93,7 +94,7 @@ pub fn init(input: Input, options: ?InitOpts, exec: *const Execution) !js.Promis
 
     if (request._signal) |signal| {
         if (signal._aborted) {
-            resolver.reject("fetch aborted", DOMException.init("The operation was aborted.", "AbortError"));
+            resolver.reject("fetch aborted", try AbortSignal.reasonJsValue(signal._reason, exec.js.local.?));
             return resolver.promise();
         }
     }
@@ -160,6 +161,7 @@ fn submit(request: *Request, body: ?[]const u8, sink: Sink, exec: *const Executi
             .manual => .manual,
             .@"error" => .@"error",
         },
+        .header_before_body_error = true,
         .header_callback = httpHeaderDoneCallback,
         .data_callback = httpDataCallback,
         .done_callback = httpDoneCallback,
@@ -190,6 +192,10 @@ fn submit(request: *Request, body: ?[]const u8, sink: Sink, exec: *const Executi
                 transfer.req.referrer_policy = policy;
             }
         }
+
+        if (fetch._signal) |signal| {
+            try signal._dependents.append(exec.page_arena, .{ .fetch = fetch });
+        }
     }
 
     // Held for Response.deinit's abort; the error, shutdown and done
@@ -206,12 +212,6 @@ fn submit(request: *Request, body: ?[]const u8, sink: Sink, exec: *const Executi
 fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
     const self: *Fetch = @ptrCast(@alignCast(transfer.req.ctx));
     const is_opaque = self._no_cors and transfer.client.obey_cors and transfer._cors_cross_origin;
-
-    if (self._signal) |signal| {
-        if (signal._aborted) {
-            return error.TransferCanceled;
-        }
-    }
 
     const status = transfer.responseStatus().?;
     if (is_opaque or Response.isNullBodyStatus(status) or (self._manual_redirect and HttpClient.isRedirectStatus(status))) {
@@ -234,8 +234,11 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
     }
 
     res._status = status;
-    res._status_text = std.http.Status.phrase(@enumFromInt(status)) orelse "";
-    res._url = try arena.dupeZ(u8, transfer.req.url);
+    res._status_text = if (transfer.statusText()) |st|
+        try arena.allocator().dupe(u8, st)
+    else
+        std.http.Status.phrase(@fromBackingInt(@intCast(status))) orelse "";
+    res._url = try arena.dupeSentinel(u8, transfer.req.url, 0);
     res._is_redirected = transfer.redirectCount().? > 0;
 
     // no-cors mode: regardless of what the server returned, JS only ever sees
@@ -246,6 +249,7 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
         res._url = "";
         res._type = .@"opaque";
         res._is_redirected = false;
+        self._headers_done = true;
         return .proceed;
     }
 
@@ -257,6 +261,7 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
         res._url = "";
         res._type = .opaqueredirect;
         res._is_redirected = false;
+        self._headers_done = true;
         return .proceed;
     }
 
@@ -279,23 +284,16 @@ fn httpHeaderDoneCallback(transfer: *Transfer) !Transfer.HeaderResult {
         res._type = .basic;
     }
 
-    var it = transfer.responseHeaderIterator();
-    while (it.next()) |hdr| {
+    for (transfer.responseHeaders()) |hdr| {
         try res._headers.append(hdr.name, hdr.value, exec);
     }
 
+    self._headers_done = true;
     return .proceed;
 }
 
 fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
     const self: *Fetch = @ptrCast(@alignCast(transfer.req.ctx));
-
-    // Check if aborted
-    if (self._signal) |signal| {
-        if (signal._aborted) {
-            return error.TransferCanceled;
-        }
-    }
 
     if (self._null_body) {
         return;
@@ -306,6 +304,9 @@ fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
 
 fn httpDoneCallback(ctx: *anyopaque) !void {
     const self: *Fetch = @ptrCast(@alignCast(ctx));
+    const signal = self._signal;
+    self.detachSignal();
+
     var response = self._response;
     response._http_transfer = null;
     response._body = if (self._null_body) .empty else .{ .bytes = self._buf.items };
@@ -330,6 +331,7 @@ fn httpDoneCallback(ctx: *anyopaque) !void {
     self._exec.js.localScope(&ls);
     defer ls.deinit();
 
+    response._signal = signal;
     const js_val = try ls.local.zigValueToJs(self._response, .{});
     self._owns_response = false;
     response._arena.report();
@@ -338,6 +340,7 @@ fn httpDoneCallback(ctx: *anyopaque) !void {
 
 fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
     const self: *Fetch = @ptrCast(@alignCast(ctx));
+    self.detachSignal();
 
     log.info(.http, "request error", .{
         .source = "fetch",
@@ -352,7 +355,7 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
     // Capture this before we reject. Rejection could trigger httpShutdownCallback
     // (via a microtask callback). But if we're here, then we'll take care of
     // cleaning up when we're done.
-    const owns_response = self._owns_response;
+    var owns_response = self._owns_response;
     self._owns_response = false;
 
     // the response is only passed on v8 on success, if we're here, it's safe to
@@ -371,12 +374,50 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
     self._exec.js.localScope(&ls);
     defer ls.deinit();
 
+    if (self._abort_reason) |reason| {
+        if (AbortSignal.reasonJsValue(reason, &ls.local)) |js_val| {
+            return ls.toLocal(resolver).reject("fetch aborted", js_val);
+        } else |_| {}
+    }
+
+    if (owns_response and self._headers_done) {
+        // Once we have the headers, the promise should resolve. A later error,
+        // like libcurl returning a BadContentEncoding errors at the body, not
+        // the fetch.
+        if (self._null_body == false) {
+            response._body = .errored;
+        }
+        if (ls.local.zigValueToJs(response, .{})) |js_val| {
+            owns_response = false;
+            response._arena.report();
+            return ls.toLocal(resolver).resolve("fetch done", js_val);
+        } else |_| {}
+    }
+
     // fetch() must reject with a TypeError on network errors per spec
     ls.toLocal(resolver).rejectError("fetch error", .{ .type_error = "fetch error" });
 }
 
+// Called by _signal when it aborts. Synchronously fires httpErrorCallback
+// which frees self.
+pub fn abort(self: *Fetch, reason: AbortSignal.Reason) void {
+    // detach first so we don't try to remove ourselves from the signal, the
+    // signal will take care of that.
+    self._signal = null;
+    self._abort_reason = reason;
+    const transfer = self._response._http_transfer orelse return;
+    transfer.cancel();
+}
+
+fn detachSignal(self: *Fetch) void {
+    const signal = self._signal orelse return;
+    self._signal = null;
+    signal.removeDependent(.{ .fetch = self });
+}
+
 fn httpShutdownCallback(ctx: *anyopaque) void {
     const self: *Fetch = @ptrCast(@alignCast(ctx));
+    self.detachSignal();
 
     if (self._owns_response) {
         const sink = self._sink;
@@ -394,7 +435,6 @@ fn httpShutdownCallback(ctx: *anyopaque) void {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: fetch" {
-    testing.expectLog(&.{.http});
     try testing.htmlRunner("net/fetch.html", .{});
     try testing.htmlRunner("net/fetch_hash_route.html", .{});
 }

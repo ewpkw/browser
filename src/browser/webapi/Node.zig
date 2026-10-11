@@ -249,7 +249,7 @@ fn validateNodeInsertion(parent: *Node, node: *Node) !void {
     }
 
     // Check if node contains parent (would create a cycle)
-    if (node.contains(parent)) {
+    if (node.isHostIncludingInclusiveAncestorOf(parent)) {
         return error.HierarchyError;
     }
 
@@ -274,7 +274,7 @@ fn ensurePreInsertValidity(parent: *Node, node: *Node, child: ?*Node, comptime m
         else => return error.HierarchyError,
     }
 
-    if (node.contains(parent)) {
+    if (node.isHostIncludingInclusiveAncestorOf(parent)) {
         return error.HierarchyError;
     }
 
@@ -700,6 +700,20 @@ pub fn contains(self: *const Node, child_: ?*const Node) bool {
     return false;
 }
 
+// Like contains(), but also climbs from a shadow root or template contents.
+pub fn isHostIncludingInclusiveAncestorOf(self: *const Node, other: *Node) bool {
+    var node = other;
+    while (node != self) {
+        if (node._parent) |parent| {
+            node = parent;
+        } else {
+            const fragment = node.is(DocumentFragment) orelse return false;
+            node = (fragment.getHost() orelse return false).asNode();
+        }
+    }
+    return true;
+}
+
 pub fn ownerDocument(self: *const Node, frame: *const Frame) ?*Document {
     // A document node does not have an owner.
     if (self._type == .document) {
@@ -967,7 +981,7 @@ pub fn moveBefore(self: *Node, node_val: js.Value, child_val: js.Value, frame: *
         else => return error.HierarchyError,
     }
 
-    if (node.contains(self)) {
+    if (node.isHostIncludingInclusiveAncestorOf(self)) {
         return error.HierarchyError;
     }
 
@@ -1444,7 +1458,7 @@ pub fn getElementsByTagName(self: *Node, tag_name: []const u8, frame: *Frame) !G
         };
     }
 
-    const arena = frame.arena;
+    const arena = frame.page_arena;
     const filter = try String.init(arena, tag_name, .{});
     return .{ .tag_name = collections.NodeLive(.tag_name).init(self, filter, frame) };
 }
@@ -1463,13 +1477,13 @@ pub fn getElementsByTagNameNS(self: *Node, namespace: ?[]const u8, local_name: [
 
     return collections.NodeLive(.tag_name_ns).init(self, .{
         .namespace = ns,
-        .local_name = try String.init(frame.arena, local_name, .{}),
+        .local_name = try String.init(frame.page_arena, local_name, .{}),
     }, frame);
 }
 
 // Not exposed in the WebAPI, but used by both Element and Document
 pub fn getElementsByClassName(self: *Node, class_name: []const u8, frame: *Frame) !collections.NodeLive(.class_name) {
-    const arena = frame.arena;
+    const arena = frame.page_arena;
 
     // Parse space-separated class names
     var class_names: std.ArrayList([]const u8) = .empty;
@@ -1613,6 +1627,28 @@ pub fn setHTML(self: *Node, html: []const u8, opts: Frame.parse.FragmentParseOpt
     }
 }
 
+pub fn replaceAllWithFragment(self: *Node, fragment: *Node, frame: *Frame) !void {
+    frame.domChanged();
+
+    const notify = Frame.observers.hasMutationObservers(frame);
+    var added: std.ArrayList(*Node) = .empty;
+    if (notify) {
+        var it = fragment.childrenIterator();
+        while (it.next()) |child| {
+            try added.append(frame.call_arena, child);
+        }
+    }
+
+    const removed = try self.removeAllChildrenCollecting(notify, frame);
+    try frame.moveAllChildren(fragment, self, null, .silent_parent);
+
+    if (notify and (removed.items.len > 0 or added.items.len > 0)) {
+        // The point here is to batch all of the adds/remove and get a combined
+        // mutation record
+        Frame.observers.notifyChildListChange(frame, self, added.items, removed.items, null, null);
+    }
+}
+
 // Writes a JSON representation of the node and its children
 pub fn jsonStringify(self: *const Node, writer: *std.json.Stringify) !void {
     // stupid json api requires this to be const,
@@ -1699,6 +1735,42 @@ pub fn assignedSlot(self: *Node, frame: *const Frame) ?*Element.Html.Slot {
     return frame.page._assigned_slots.get(self);
 }
 
+/// Inert applies to the whole subtree, so any inert flat-tree ancestor counts.
+pub fn isInert(self: *Node, frame: *const Frame) bool {
+    var current: ?*Node = self;
+    while (current) |node| : (current = node.flatTreeParent(frame)) {
+        if (node.is(Element)) |el| {
+            if (el._namespace == .html and el.hasAttributeSafe(comptime .wrap("inert"))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The parent in the flat tree: an assigned slottable's slot, a shadow root's
+/// host, else the DOM parent.
+pub fn flatTreeParent(self: *Node, frame: *const Frame) ?*Node {
+    if (self.assignedSlot(frame)) |slot| {
+        return slot.asNode();
+    }
+    if (self.is(ShadowRoot)) |shadow| {
+        return shadow._host.asNode();
+    }
+    return self._parent;
+}
+
+/// The flat-tree parent element: shadow content inherits from its host, a
+/// slotted node from its slot.
+pub fn flatTreeParentElement(self: *Node, frame: *const Frame) ?*Element {
+    const parent = self.flatTreeParent(frame) orelse return null;
+    if (parent.is(Element)) |el| {
+        return el;
+    }
+    // A shadow root's flat-tree parent is its host
+    return (parent.flatTreeParent(frame) orelse return null).is(Element);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Node);
 
@@ -1735,7 +1807,11 @@ pub const JsApi = struct {
     }.wrap, null, .{});
     pub const nodeType = bridge.accessor(Node.getNodeType, null, .{});
 
-    pub const textContent = bridge.accessor(_textContext, Node.setTextContent, .{ .ce_reactions = true });
+    pub const textContent = bridge.accessor(_textContext, _setTextContent, .{ .ce_reactions = true });
+    // textContent is a nullable DOMString: null (and undefined) mean the empty string.
+    fn _setTextContent(self: *Node, data: ?[]const u8, frame: *Frame) !void {
+        return self.setTextContent(data orelse "", frame);
+    }
     fn _textContext(self: *Node, frame: *const Frame) !?[]const u8 {
         // cdata and attributes can return value directly, avoiding the copy
         switch (self._type) {

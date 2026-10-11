@@ -362,9 +362,8 @@ pub fn deliverRecords(self: *MutationObserver, frame: *Frame) !void {
     frame.js.localScope(&ls);
     defer ls.deinit();
 
-    var caught: js.TryCatch.Caught = .{};
-    ls.toLocal(self._callback).tryCallWithThis(void, self, .{ records, self }, &caught) catch |err| {
-        log.err(.frame, "MutObserver.deliverRecords", .{ .err = err, .caught = caught });
+    ls.toLocal(self._callback).callWithThisReport(self, .{ records, self }) catch |err| {
+        log.debug(.frame, "MutObserver.deliverRecords", .{ .err = err });
         return err;
     };
 }
@@ -481,7 +480,6 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: MutationObserver" {
-    testing.expectLog(&.{ .frame, .frame });
     try testing.htmlRunner("mutation_observer", .{});
 }
 
@@ -527,7 +525,6 @@ test "WebApi: runaway MutationObserver delivery is disconnected" {
 // and leave the observer machinery usable after a top-level cancel.
 test "WebApi: MutationObserver requested termination unwinds delivery" {
     const v8 = js.v8;
-    testing.expectLog(&.{ .frame, .frame });
 
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
@@ -588,8 +585,6 @@ test "WebApi: MutationObserver requested termination unwinds delivery" {
 }
 
 test "WebApi: MutationObserver terminate requested between observers releases records" {
-    testing.expectLog(&.{ .frame, .frame });
-
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
@@ -627,8 +622,6 @@ test "WebApi: MutationObserver terminate requested between observers releases re
 }
 
 test "WebApi: MutationObserver terminated page tears down" {
-    testing.expectLog(&.{ .frame, .frame });
-
     const frame = try testing.createFrame();
     const env = frame.js.env;
     defer env.cancelTerminate();

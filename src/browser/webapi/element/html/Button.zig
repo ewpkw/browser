@@ -24,13 +24,14 @@ const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
-const Element = @import("../../Element.zig");
-const HtmlElement = @import("../Html.zig");
-const Form = @import("Form.zig");
 const Event = @import("../../Event.zig");
-const ValidityState = @import("ValidityState.zig");
+const Element = @import("../../Element.zig");
 
+const HtmlElement = @import("../Html.zig");
 const popover = @import("../popover.zig");
+
+const Form = @import("Form.zig");
+const ValidityState = @import("ValidityState.zig");
 
 const Button = @This();
 
@@ -52,7 +53,14 @@ pub fn asNode(self: *Button) *Node {
 }
 
 pub fn getType(self: *const Button) []const u8 {
-    return self.asConstElement().getAttributeInterned("type") orelse "submit";
+    const value = self.asConstElement().getAttributeInterned("type") orelse return "submit";
+    if (std.ascii.eqlIgnoreCase(value, "reset")) {
+        return "reset";
+    }
+    if (std.ascii.eqlIgnoreCase(value, "button")) {
+        return "button";
+    }
+    return "submit";
 }
 
 pub fn getForm(self: *Button, frame: *Frame) ?*Form {

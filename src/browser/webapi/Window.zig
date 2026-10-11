@@ -94,6 +94,7 @@ _on_unhandled_rejection: ?js.Function.Global = null,
 _reporting_error: bool = false,
 _current_event: ?*Event = null,
 _location: *Location,
+_history: History = .{},
 _timers: Timers = .{},
 _scheduler: Scheduler = .{},
 _custom_elements: CustomElementRegistry = .{},
@@ -170,7 +171,7 @@ pub fn getName(self: *const Window) []const u8 {
 
 pub fn setName(self: *Window, name: []const u8, frame: *Frame) !void {
     // Store in the Page's frame arena so the slice outlives any call_arena.
-    self._name = try frame.arena.dupe(u8, name);
+    self._name = try frame.page_arena.dupe(u8, name);
 }
 
 pub fn getTop(self: *Window, frame: *Frame) Access {
@@ -356,12 +357,13 @@ pub fn getLocation(self: *const Window) *Location {
     return self._location;
 }
 
+// [PutForwards=href]: window.location = url is location.href = url.
 fn setLocation(self: *Window, url: [:0]const u8, frame: *Frame) !void {
-    return frame.scheduleNavigation(url, .{ .reason = .script, .kind = .{ .push = null } }, .{ .script = self._frame });
+    return self._location.assign(url, frame);
 }
 
-pub fn getHistory(_: *Window, frame: *Frame) *History {
-    return &frame._session.history;
+pub fn getHistory(self: *Window) *History {
+    return &self._history;
 }
 
 fn getNavigation(_: *Window, frame: *Frame) *Navigation {
@@ -457,7 +459,7 @@ fn getOnClick(self: *Window) ?js.Function.Global {
 
 fn setOnClick(self: *Window, setter: ?FunctionSetter) !void {
     if (getFunctionFromSetter(setter)) |cb| {
-        try self._frame._event_target_attr_listeners.put(self._frame.arena, .{ .target = self.asEventTarget(), .handler = .onclick }, cb);
+        try self._frame._event_target_attr_listeners.put(self._frame.page_arena, .{ .target = self.asEventTarget(), .handler = .onclick }, cb);
     } else {
         _ = self._frame._event_target_attr_listeners.remove(.{ .target = self.asEventTarget(), .handler = .onclick });
     }
@@ -488,7 +490,7 @@ pub fn setWindowReflectingHandlerFromAttribute(self: *Window, name: lp.String, v
     if (frame.js.stringToPersistedFunction(expr, &.{"event"}, &.{})) |func| {
         slot.* = func;
     } else |err| {
-        log.err(.js, "window reflecting handler", .{ .err = err, .str = expr });
+        log.debug(.js, "window reflecting handler", .{ .err = err, .str = expr });
         slot.* = null;
     }
 }
@@ -521,29 +523,21 @@ pub fn fetch(_: *const Window, input: Fetch.Input, options: ?Fetch.InitOpts, exe
     return Fetch.init(input, options, exec);
 }
 
-pub fn setTimeout(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?u32, params: []js.Value.Global, exec: *js.Execution) !u32 {
+pub fn setTimeout(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []js.Value.Global, exec: *js.Execution) !u32 {
     const cb = try handler.resolve(exec);
-    return self._timers.schedule(exec, cb, delay_ms orelse 0, .{
+    return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = false,
         .params = params,
         .name = "window.setTimeout",
     });
 }
 
-pub fn setInterval(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?u32, params: []js.Value.Global, exec: *js.Execution) !u32 {
+pub fn setInterval(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []js.Value.Global, exec: *js.Execution) !u32 {
     const cb = try handler.resolve(exec);
-    return self._timers.schedule(exec, cb, delay_ms orelse 0, .{
+    return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = true,
         .params = params,
         .name = "window.setInterval",
-    });
-}
-
-pub fn setImmediate(self: *Window, cb: js.Function.Global, params: []js.Value.Global, exec: *js.Execution) !u32 {
-    return self._timers.schedule(exec, cb, 0, .{
-        .repeat = false,
-        .params = params,
-        .name = "window.setImmediate",
     });
 }
 
@@ -565,10 +559,6 @@ fn clearTimeout(self: *Window, id: u32) void {
 }
 
 fn clearInterval(self: *Window, id: u32) void {
-    self._timers.clear(id);
-}
-
-fn clearImmediate(self: *Window, id: u32) void {
     self._timers.clear(id);
 }
 
@@ -602,12 +592,19 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
         return;
     }
 
+    // Reporting calls back into Zig (e.g. a DOMException's message accessor).
+    // At call_depth 0 that call resets the call_arena, which the code reporting
+    // the error may still be using (e.g. a dispatch's snapshot of its targets).
+    const call_depth = frame.js.call_depth;
+    frame.js.call_depth = call_depth + 1;
+    defer frame.js.call_depth = call_depth;
+
     frame.page.recordJsError(error.JsException);
 
     const target = self.asEventTarget();
     if (!frame._event_manager.hasDirectListeners(target, "error", self._on_error)) {
         if (comptime lp.IS_TEST == false) {
-            log.warn(.js, "window.reportError", .{
+            log.debug(.js, "window.reportError", .{
                 .message = err.toStringSlice() catch "Unknown error",
             });
         }
@@ -662,7 +659,7 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
 
     if (comptime lp.IS_TEST == false) {
         if (!event._prevent_default) {
-            log.warn(.js, "window.reportError", .{
+            log.debug(.js, "window.reportError", .{
                 .message = error_event._message,
                 .filename = error_event._filename,
                 .line_number = error_event._line_number,
@@ -682,10 +679,10 @@ pub fn getComputedStyle(_: *const Window, element: *Element, pseudo_element: ?[]
     // common probes
     const pseudo = Element.PseudoElement.parse(pseudo_element orelse "");
     const page = frame.page;
-    const gop = try page.element_computed_styles.getOrPut(page.frame_arena, .{ .element = element, .pseudo = pseudo });
+    const gop = try page.element_computed_styles.getOrPut(page.arena, .{ .element = element, .pseudo = pseudo });
     if (!gop.found_existing) {
         if (pseudo == .other) {
-            log.warn(.not_implemented, "window.GetComputedStyle", .{ .pseudo_element = pseudo_element.? });
+            log.debug(.not_implemented, "window.GetComputedStyle", .{ .pseudo_element = pseudo_element.? });
         }
         gop.value_ptr.* = try CSSStyleProperties.init(element, true, frame);
     }
@@ -823,7 +820,7 @@ pub fn close(self: *Window) void {
     // freeing workers and iframes), but, for now, we don't have the
     // infrastructure to do this safely so doing it on page tear down is our
     // only option.
-    page.closed_frames.append(page.frame_arena, frame) catch @panic("OOM");
+    page.closed_frames.append(page.arena, frame) catch @panic("OOM");
 }
 
 pub fn focus(_: *Window) void {}
@@ -951,8 +948,11 @@ fn getDevicePixelRatio(_: *const Window, frame: *Frame) f32 {
 
 pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Frame) !void {
     const o = opts.offsets(y);
-    const new_x: u32 = if (o.left) |left| @intCast(@max(0, left)) else self._scroll_pos.x;
-    const new_y: u32 = if (o.top) |top| @intCast(@max(0, top)) else self._scroll_pos.y;
+    const size = self._frame.document.scrollSize();
+    const max_x = scrollLimit(size.width, self.getInnerWidth(self._frame));
+    const max_y = scrollLimit(size.height, self.getInnerHeight(self._frame));
+    const new_x: u32 = if (o.left) |left| @min(@as(u32, @intCast(@max(0, left))), max_x) else self._scroll_pos.x;
+    const new_y: u32 = if (o.top) |top| @min(@as(u32, @intCast(@max(0, top))), max_y) else self._scroll_pos.y;
 
     if (new_x == self._scroll_pos.x and new_y == self._scroll_pos.y) {
         return;
@@ -1014,10 +1014,17 @@ pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Fram
     );
 }
 
+fn scrollLimit(size: f64, visible: u32) u32 {
+    const limit = size - @as(f64, @floatFromInt(visible));
+    return @intFromFloat(std.math.clamp(limit, 0, std.math.maxInt(u32)));
+}
+
 pub fn scrollBy(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Frame) !void {
     const o = opts.offsets(y);
-    const absx = @as(i32, @intCast(self._scroll_pos.x)) +| (o.left orelse 0);
-    const absy = @as(i32, @intCast(self._scroll_pos.y)) +| (o.top orelse 0);
+    // The viewport has no honest extent, so a stored offset can sit above
+    // maxInt(i32): widen before saturating back down.
+    const absx: i32 = @intCast(@min(@as(i64, self._scroll_pos.x) + (o.left orelse 0), std.math.maxInt(i32)));
+    const absy: i32 = @intCast(@min(@as(i64, self._scroll_pos.y) + (o.top orelse 0), std.math.maxInt(i32)));
     return self.scrollTo(.{ .x = absx }, absy, frame);
 }
 
@@ -1157,7 +1164,7 @@ fn hasFeatureToken(features: []const u8, token: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, features, " \t\r\n,");
     while (it.next()) |raw| {
         // Trim a trailing =value if present — we only need the key.
-        const key = if (std.mem.indexOfScalarPos(u8, raw, 0, '=')) |eq| raw[0..eq] else raw;
+        const key = if (std.mem.findScalarPos(u8, raw, 0, '=')) |eq| raw[0..eq] else raw;
         if (std.ascii.eqlIgnoreCase(key, token)) return true;
     }
     return false;
@@ -1216,8 +1223,6 @@ pub const JsApi = struct {
     pub const clearTimeout = bridge.function(Window.clearTimeout, .{});
     pub const setInterval = bridge.function(Window.setInterval, .{});
     pub const clearInterval = bridge.function(Window.clearInterval, .{});
-    pub const setImmediate = bridge.function(Window.setImmediate, .{});
-    pub const clearImmediate = bridge.function(Window.clearImmediate, .{});
     pub const requestAnimationFrame = bridge.function(Window.requestAnimationFrame, .{});
     pub const cancelAnimationFrame = bridge.function(Window.cancelAnimationFrame, .{});
     pub const requestIdleCallback = bridge.function(Window.requestIdleCallback, .{});
@@ -1377,7 +1382,6 @@ const CrossOriginWindow = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: Window" {
-    testing.expectLog(&.{.http}); // stop aborts
     try testing.htmlRunner("window", .{});
 }
 

@@ -53,7 +53,7 @@ _arena: *lp.Arena,
 _rc: lp.RC = .{},
 _items: std.ArrayList(*DataTransferItem) = .empty,
 _item_list: *DataTransferItemList,
-// FileList lives on the factory slab and is frame-tracked, so each File ref it
+// FileList lives on the factory allocator and is frame-tracked, so each File ref it
 // holds is released at frame teardown (same path as `<input type=file>`).
 _files: *FileList,
 _drop_effect: []const u8 = "none",
@@ -201,10 +201,10 @@ fn rebuildFiles(self: *DataTransfer, frame: *Frame) !void {
     var files: std.ArrayList(*File) = .empty;
     for (self._items.items) |it| {
         if (it._kind == .file) {
-            try files.append(frame.arena, it._payload.file);
+            try files.append(frame.page_arena, it._payload.file);
         }
     }
-    self._files._files = try files.toOwnedSlice(frame.arena);
+    self._files._files = try files.toOwnedSlice(frame.page_arena);
 }
 
 // --- accessors ---

@@ -53,11 +53,11 @@ _node: std.DoublyLinkedList.Node = .{},
 _on_update_found: ?js.Function.Global = null,
 
 pub fn init(scope: *ServiceWorkerGlobalScope, container: ?*ServiceWorkerContainer, exec: *Execution) !*ServiceWorkerRegistration {
-    const self = try exec._factory.eventTargetWithAllocator(exec.arena, ServiceWorkerRegistration{
+    const self = try exec._factory.eventTargetWithAllocator(exec.page_arena, ServiceWorkerRegistration{
         ._proto = undefined,
         ._exec = exec,
         ._scope = scope,
-        ._scope_url = try exec.arena.dupe(u8, scope._scope_url),
+        ._scope_url = try exec.page_arena.dupe(u8, scope._scope_url),
         ._container = container,
     });
     scope._registrations.append(&self._node);
@@ -119,7 +119,7 @@ pub fn getUpdateViaCache(_: *const ServiceWorkerRegistration) []const u8 {
 }
 
 pub fn update(_: *ServiceWorkerRegistration, exec: *const Execution) !js.Promise {
-    log.warn(.not_implemented, "SWR.update", .{});
+    log.debug(.not_implemented, "SWR.update", .{});
     const resolver = exec.js.local.?.createPromiseResolver();
     resolver.resolve("ServiceWorkerRegistration.update", {});
     return resolver.promise();

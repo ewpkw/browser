@@ -67,6 +67,10 @@ allocator: Allocator,
 // when true, any target creation must be attached.
 target_auto_attach: bool = false,
 
+// Target.setDiscoverTargets: when true, page target changes are reported
+// via Target.targetInfoChanged.
+target_discover: bool = false,
+
 session_id_gen: SessionIdGen = .{},
 browser_session_id_gen: BrowserSessionIdGen = .{},
 browser_context_id_gen: BrowserContextIdGen = .{},
@@ -169,8 +173,14 @@ pub fn processMessage(self: *CDP, msg: []const u8) !void {
     return self.dispatch(arena.allocator(), .{ .cdp = self }, msg);
 }
 
-pub fn sendJSON(self: *CDP, message: anytype) !void {
-    try self.link.sendJSON(message, .{ .emit_null_optional_fields = false });
+pub const SendJSONOpts = struct {
+    size_hint: usize = 0,
+};
+pub fn sendJSON(self: *CDP, message: anytype, opts: SendJSONOpts) !void {
+    try self.link.sendJSON(message, .{
+        .size_hint = opts.size_hint,
+        .stringify = .{ .emit_null_optional_fields = false },
+    });
 }
 
 // Parse-then-dispatch entry point. Used by:
@@ -229,7 +239,7 @@ fn dispatchParsed(self: *CDP, arena: Allocator, sender: Command.Sender, str: []c
                 error.InvalidMethod, error.UnknownDomain, error.UnknownMethod => {
                     lp.metrics.serve_unknown_commands.incr(.cdp);
                     // Chrome's code and wording; drivers feature-detect on it.
-                    const message = std.fmt.allocPrint(command.arena, "'{s}' wasn't found", .{input.method}) catch return err;
+                    const message = command.arena.print("'{s}' wasn't found", .{input.method}) catch return err;
                     command.sendError(-32601, message, .{}) catch return err;
                 },
                 else => command.sendError(-31998, @errorName(err), .{}) catch return err,
@@ -256,12 +266,19 @@ fn dispatchStartupCommand(command: *Command, method: []const u8) !void {
         return dispatchCommand(command, method);
     }
 
+    // The placeholder session has no page behind it: an empty
+    // result would look like success while nothing happened.
+    // Say so, and point at the way to get a real target.
+    if (std.mem.eql(u8, method, "Page.navigate")) {
+        return command.sendError(-32000, "No page on the STARTUP session; create a real target with Target.createTarget", .{});
+    }
+
     return command.sendResult(null, .{});
 }
 
 fn dispatchCommand(command: *Command, method: []const u8) !void {
     const domain = blk: {
-        const i = std.mem.indexOfScalarPos(u8, method, 0, '.') orelse {
+        const i = std.mem.findScalarPos(u8, method, 0, '.') orelse {
             return error.InvalidMethod;
         };
         command.input.action = method[i + 1 ..];
@@ -333,18 +350,8 @@ pub fn resolveSessionId(self: *const CDP, input_session_id: []const u8) ?[]const
             return browser_session_id;
         }
     }
-    const browser_context = &(self.browser_context orelse return null);
-    if (browser_context.session_id) |session_id| {
-        if (std.mem.eql(u8, session_id, input_session_id)) {
-            return session_id;
-        }
-    }
-    for (browser_context.attached_sessions.items) |session| {
-        if (std.mem.eql(u8, session.id, input_session_id)) {
-            return session.id;
-        }
-    }
-    return null;
+    const browser_context = if (self.browser_context) |*bc| bc else return null;
+    return browser_context.attached_sessions.getKey(input_session_id);
 }
 
 fn isValidSessionId(self: *const CDP, input_session_id: []const u8) bool {
@@ -364,16 +371,12 @@ pub fn createBrowserContext(self: *CDP) ![]const u8 {
     return id;
 }
 
-pub fn disposeBrowserContext(self: *CDP, browser_context_id: []const u8) bool {
-    const bc = &(self.browser_context orelse return false);
-    if (std.mem.eql(u8, bc.id, browser_context_id) == false) {
-        return false;
-    }
+pub fn disposeBrowserContext(self: *CDP) void {
+    const bc = &(self.browser_context orelse return);
     bc.deinit();
     self.browser.closeSession();
     self.browser_context = null;
     _ = self.browser_context_arena.reset(.{ .retain_with_limit = 1024 * 16 });
-    return true;
 }
 
 const SendEventOpts = struct {
@@ -384,7 +387,7 @@ pub fn sendEvent(self: *CDP, method: []const u8, p: anytype, opts: SendEventOpts
         .method = method,
         .params = if (comptime @typeInfo(@TypeOf(p)) == .null) struct {}{} else p,
         .sessionId = opts.session_id,
-    });
+    }, .{});
 }
 
 pub const BrowserContext = struct {
@@ -411,9 +414,41 @@ pub const BrowserContext = struct {
         id: u32,
     };
 
-    const AttachedSession = struct {
+    // A CDP session attached to this context's page target. Each owns a V8
+    // inspector session; V8 keeps `Runtime.enable` state and remote object ids
+    // per session, so a command is answered on the session it was sent
+    // through and a session only gets the inspector events it enabled.
+    pub const AttachedSession = struct {
         id: []const u8,
         parent_id: ?[]const u8,
+        bc: *BrowserContext,
+        inspector_session: js.Inspector.Session,
+
+        /// V8 -> this session. Stamp OUR id on responses and events.
+        pub fn onInspectorResponse(ctx: *anyopaque, _: u32, msg: []const u8) void {
+            const self: *AttachedSession = @ptrCast(@alignCast(ctx));
+            self.bc.sendInspectorMessage(msg, self.id) catch |err| {
+                log.debug(.cdp, "send inspector response", .{ .err = err });
+            };
+        }
+
+        pub fn onInspectorEvent(ctx: *anyopaque, msg: []const u8) void {
+            const self: *AttachedSession = @ptrCast(@alignCast(ctx));
+            if (log.enabled(.cdp, .debug)) {
+                // msg should be {"method":<method>,...
+                lp.assert(std.mem.startsWith(u8, msg, "{\"method\":"), "onInspectorEvent prefix", .{});
+                const method_end = std.mem.findScalar(u8, msg, ',') orelse {
+                    log.err(.cdp, "invalid inspector event", .{ .msg = msg });
+                    return;
+                };
+                const method = msg[10..method_end];
+                log.debug(.cdp, "inspector event", .{ .method = method, .session_id = self.id });
+            }
+
+            self.bc.sendInspectorMessage(msg, self.id) catch |err| {
+                log.debug(.cdp, "send inspector event", .{ .err = err });
+            };
+        }
     };
     id: []const u8,
     cdp: *CDP,
@@ -448,16 +483,18 @@ pub const BrowserContext = struct {
     // it). null until the first page is created.
     page_handle: ?Session.PageHandle = null,
 
-    // The CDP session_id. After the target/page is created, the client
-    // "attaches" to it (either explicitly or automatically). We return a
-    // "sessionId" which identifies this link. `sessionId` is the how
-    // the CDP client informs us what it's trying to manipulate. Because we
-    // only support 1 BrowserContext at a time, and 1 page at a time, this
-    // is all pretty straightforward, but it still needs to be enforced, i.e.
-    // if we get a request with a sessionId that doesn't match the current one
-    // we should reject it.
+    // The primary CDP session's id. After the target/page is created, the
+    // client "attaches" to it (either explicitly or automatically). We return
+    // a "sessionId" which identifies this link. `sessionId` is the how the
+    // CDP client informs us what it's trying to manipulate. Also included in
+    // `attached_sessions`.
     session_id: ?[]const u8,
-    attached_sessions: std.ArrayList(AttachedSession) = .empty,
+
+    // Every session attached to the page target, the primary included, by
+    // session id. Insertion-ordered so detach events come out in attach order.
+    //
+    // Request with a session id that isn't there is rejected.
+    attached_sessions: std.StringArrayHashMapUnmanaged(*AttachedSession) = .empty,
 
     // A cancelled text-less keyDown drops the char message that follows it
     // (chromedp's keyDown/char/keyUp split), as Chrome does.
@@ -474,7 +511,6 @@ pub const BrowserContext = struct {
     // entries evicted by resetFrame can linger harmlessly until reset.
     set_child_nodes_sent: std.AutoHashMapUnmanaged(NodeRegistry.Id, void) = .empty,
 
-    inspector_session: *js.Inspector.Session,
     isolated_worlds: std.ArrayList(*IsolatedWorld),
 
     // True when Runtime.evaluate has been run in the main world. Optimization
@@ -537,10 +573,6 @@ pub const BrowserContext = struct {
             lp.cookies.loadFromFile(session, cookie_path);
         }
 
-        const browser = &cdp.browser;
-        const inspector_session = browser.env.inspector.?.startSession(self);
-        errdefer browser.env.inspector.?.stopSession();
-
         var registry = NodeRegistry.init(allocator);
         errdefer registry.deinit();
 
@@ -556,7 +588,6 @@ pub const BrowserContext = struct {
             .node_registry = registry,
             .node_search_list = undefined,
             .isolated_worlds = .empty,
-            .inspector_session = inspector_session,
             .frame_arena = cdp.frame_arena.allocator(),
             .arena = cdp.browser_context_arena.allocator(),
             .notification_arena = cdp.notification_arena.allocator(),
@@ -589,7 +620,7 @@ pub const BrowserContext = struct {
         // It appends async tasks, so we make sure we run the message loop
         // before deinit it.
         env.inspector.?.resetContextGroup();
-        env.inspector.?.stopSession();
+        self.detachAllSessions();
 
         // abort all intercepted requests before closing the session/page
         // since some of these might callback into the page/scriptmanager.
@@ -626,6 +657,7 @@ pub const BrowserContext = struct {
         self.node_registry.deinit();
         self.node_search_list.deinit();
         self.set_child_nodes_sent.deinit(self.cdp.allocator);
+        self.attached_sessions.deinit(self.cdp.allocator);
 
         // Session.deinit (called via closeSession above) already cleared this
         // notification off any ownerless CorsGate/RobotsGate transfers.
@@ -668,7 +700,7 @@ pub const BrowserContext = struct {
     pub fn createIsolatedWorld(self: *BrowserContext, world_name: []const u8, grant_universal_access: bool) !GetOrPutIsolatedWorld {
         if (self.findIsolatedWorld(world_name)) |world| {
             if (world.grant_universal_access != grant_universal_access) {
-                log.warn(.cdp, "isolated world mismatch", .{ .name = world_name, .gua = grant_universal_access });
+                log.debug(.cdp, "isolated world mismatch", .{ .name = world_name, .gua = grant_universal_access });
             }
             return .{ .world = world, .found_existing = true };
         }
@@ -838,6 +870,38 @@ pub const BrowserContext = struct {
         if (authRequests) {
             try self.notification.register(.http_request_auth_required, self, onHttpRequestAuthRequired);
         }
+    }
+
+    // Shared by Target.closeTarget, Page.close and Target.disposeBrowserContext.
+    // Drivers settle page.close() on detachedFromTarget and drop the target
+    // on targetDestroyed, so both are sent even when nothing was attached.
+    pub fn closeTarget(self: *BrowserContext) !void {
+        const target_id = self.target_id orelse return;
+        const cdp = self.cdp;
+        for (self.attached_sessions.values()) |session| {
+            self.fetchDisableForSession(session.id);
+            try cdp.sendEvent("Inspector.detached", .{
+                .reason = "Render process gone.",
+            }, .{ .session_id = session.id });
+            try cdp.sendEvent("Target.detachedFromTarget", .{
+                .targetId = target_id,
+                .sessionId = session.id,
+                .reason = "Render process gone.",
+            }, .{ .session_id = session.parent_id });
+        }
+        self.detachAllSessions();
+
+        try cdp.sendEvent("Target.targetDestroyed", .{ .targetId = target_id }, .{});
+
+        if (self.page_handle) |handle| {
+            handle.close();
+            self.page_handle = null;
+        }
+        for (self.isolated_worlds.items) |world| {
+            world.deinit();
+        }
+        self.isolated_worlds.clearRetainingCapacity();
+        self.target_id = null;
     }
 
     pub fn fetchDisableForSession(self: *BrowserContext, session_id: []const u8) void {
@@ -1050,8 +1114,7 @@ pub const BrowserContext = struct {
                 // for well known content-type.
                 .must_encode = blk: {
                     if (msg.transfer.contentType()) |ct| {
-                        const mime = try Mime.parse(ct);
-
+                        const mime = Mime.parse(ct) catch break :blk true;
                         if (!mime.isText()) {
                             break :blk true;
                         }
@@ -1132,44 +1195,85 @@ pub const BrowserContext = struct {
         }
     }
 
-    pub fn callInspector(self: *const BrowserContext, msg: []const u8) void {
-        self.inspector_session.send(msg);
+    pub inline fn inspector(self: *const BrowserContext) *js.Inspector {
+        return self.cdp.browser.env.inspector.?;
+    }
+
+    /// Attaches `session_id` to the page target with its own inspector
+    /// session. The id is copied into the context's arena.
+    pub fn attachSession(self: *BrowserContext, session_id: []const u8, parent_id: ?[]const u8) !*AttachedSession {
+        if (self.attached_sessions.contains(session_id)) {
+            return error.SessionAlreadyAttached;
+        }
+        const allocator = self.cdp.allocator;
+
+        const attached = try allocator.create(AttachedSession);
+        errdefer allocator.destroy(attached);
+
+        attached.* = .{
+            .id = try self.arena.dupe(u8, session_id),
+            .parent_id = parent_id,
+            .bc = self,
+            .inspector_session = undefined,
+        };
+        attached.inspector_session.init(self.inspector(), attached);
+        errdefer attached.inspector_session.deinit();
+
+        try self.attached_sessions.put(allocator, attached.id, attached);
+        return attached;
+    }
+
+    /// The first session attached to the target.
+    pub fn attachPrimarySession(self: *BrowserContext, session_id: []const u8) !*AttachedSession {
+        lp.assert(self.session_id == null, "CDP.BrowserContext.attachPrimarySession already attached", .{});
+        const attached = try self.attachSession(session_id, null);
+        self.session_id = attached.id;
+        return attached;
+    }
+
+    /// Stops the session's inspector session and forgets it.
+    /// Returns false when no such session is attached.
+    pub fn detachSession(self: *BrowserContext, session_id: []const u8) bool {
+        const kv = self.attached_sessions.fetchOrderedRemove(session_id) orelse return false;
+        if (self.session_id) |primary| {
+            if (std.mem.eql(u8, primary, session_id)) {
+                self.session_id = null;
+            }
+        }
+        self.destroySession(kv.value);
+        return true;
+    }
+
+    pub fn detachAllSessions(self: *BrowserContext) void {
+        for (self.attached_sessions.values()) |attached| {
+            self.destroySession(attached);
+        }
+        self.attached_sessions.clearRetainingCapacity();
+        self.session_id = null;
+    }
+
+    fn destroySession(self: *BrowserContext, attached: *AttachedSession) void {
+        attached.inspector_session.deinit();
+        self.cdp.allocator.destroy(attached);
+    }
+
+    pub fn inspectorSession(self: *const BrowserContext, session_id: ?[]const u8) !*js.Inspector.Session {
+        const id = session_id orelse self.session_id orelse return error.SessionNotAttached;
+        const attached = self.attached_sessions.get(id) orelse return error.SessionNotAttached;
+        return &attached.inspector_session;
+    }
+
+    /// Forwards `cmd`'s raw JSON to the inspector session of the session it was sent through.
+    pub fn callInspector(self: *BrowserContext, cmd: *const Command) !void {
+        const inspector_session = try self.inspectorSession(cmd.input.session_id);
+        inspector_session.send(cmd.input.json);
         self.session.browser.env.runMicrotasks();
     }
 
-    pub fn onInspectorResponse(ctx: *anyopaque, _: u32, msg: []const u8) void {
-        sendInspectorMessage(@ptrCast(@alignCast(ctx)), msg) catch |err| {
-            log.err(.cdp, "send inspector response", .{ .err = err });
-        };
-    }
-
-    pub fn onInspectorEvent(ctx: *anyopaque, msg: []const u8) void {
-        if (log.enabled(.cdp, .debug)) {
-            // msg should be {"method":<method>,...
-            lp.assert(std.mem.startsWith(u8, msg, "{\"method\":"), "onInspectorEvent prefix", .{});
-            const method_end = std.mem.indexOfScalar(u8, msg, ',') orelse {
-                log.err(.cdp, "invalid inspector event", .{ .msg = msg });
-                return;
-            };
-            const method = msg[10..method_end];
-            log.debug(.cdp, "inspector event", .{ .method = method });
-        }
-
-        sendInspectorMessage(@ptrCast(@alignCast(ctx)), msg) catch |err| {
-            log.err(.cdp, "send inspector event", .{ .err = err });
-        };
-    }
-
-    // This is hacky x 2. First, we create the JSON payload by gluing our
+    // This is hacky x 2. First, we create the JSON payload by gluing the
     // session_id onto it. Second, we're much more client/websocket aware than
     // we should be.
-    fn sendInspectorMessage(self: *BrowserContext, msg: []const u8) !void {
-        const session_id = self.session_id orelse {
-            // We no longer have an active session. What should we do
-            // in this case?
-            return;
-        };
-
+    fn sendInspectorMessage(self: *BrowserContext, msg: []const u8, session_id: []const u8) !void {
         const cdp = self.cdp;
         const allocator = cdp.link.acquireSendArena();
         defer cdp.link.releaseSendArena();
@@ -1261,7 +1365,7 @@ pub const IsolatedWorld = struct {
     }
 
     pub fn isSeeded(self: *const IsolatedWorld, frame_id: u32) bool {
-        return std.mem.indexOfScalar(u32, self.seeded_frames.items, frame_id) != null;
+        return std.mem.findScalar(u32, self.seeded_frames.items, frame_id) != null;
     }
 
     // Keyed by Frame, not frame id: a retired root Page keeps its frame id
@@ -1329,10 +1433,6 @@ pub const IsolatedWorld = struct {
     }
 
     fn destroyFrameContext(self: *IsolatedWorld, fc: FrameContext) void {
-        // A re-navigating child frame keeps its Window, and the identity map
-        // keeps the window's global proxy; detach it from this context so the
-        // frame's next context can reattach it (as the main world does).
-        fc.context.detachGlobal();
         self.browser.env.destroyContext(fc.context);
         fc.call_arena.release();
         fc.local_arena.release();
@@ -1367,9 +1467,9 @@ pub const Command = struct {
         cdp: *CDP,
         capture: *std.Io.Writer,
 
-        pub fn sendJSON(self: Sender, message: anytype) !void {
+        pub fn sendJSON(self: Sender, message: anytype, opts: SendJSONOpts) !void {
             switch (self) {
-                .cdp => |cdp| return cdp.sendJSON(message),
+                .cdp => |cdp| return cdp.sendJSON(message, opts),
                 .capture => |writer| {
                     return std.json.Stringify.value(message, .{
                         .emit_null_optional_fields = false,
@@ -1397,13 +1497,15 @@ pub const Command = struct {
         return self.browser_context.?;
     }
 
-    const SendResultOpts = struct {};
-    pub fn sendResult(self: *Command, result: anytype, _: SendResultOpts) !void {
+    const SendResultOpts = struct {
+        size_hint: usize = 0, // hint about the final serialized size
+    };
+    pub fn sendResult(self: *Command, result: anytype, opts: SendResultOpts) !void {
         return self.sender.sendJSON(.{
             .id = self.input.id,
             .result = if (comptime @typeInfo(@TypeOf(result)) == .null) struct {}{} else result,
             .sessionId = self.input.session_id,
-        });
+        }, .{ .size_hint = opts.size_hint });
     }
 
     pub fn sendEvent(self: *Command, method: []const u8, p: anytype, opts: SendEventOpts) !void {
@@ -1417,7 +1519,7 @@ pub const Command = struct {
             .id = self.input.id,
             .@"error" = .{ .code = code, .message = message },
             .sessionId = self.input.session_id,
-        });
+        }, .{});
     }
 
     const Input = struct {
@@ -1556,6 +1658,19 @@ test "cdp: STARTUP sessionId" {
     }
 }
 
+test "cdp: Page.navigate on the STARTUP session returns -32000" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Page.navigate",
+        .sessionId = "STARTUP",
+        .params = .{ .url = "https://example.com" },
+    });
+    try ctx.expectSentError(-32000, "No page on the STARTUP session; create a real target with Target.createTarget", .{ .id = 1 });
+}
+
 test "cdp: disconnect latches so the worker keeps exiting" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -1629,5 +1744,5 @@ test "cdp: syncRequest short-circuits after disconnect" {
         .resource_type = .fetch,
         .shutdown_callback = HttpClient.noopShutdown,
     }, null);
-    try testing.expectError(error.ClientDisconnected, transfer.submitSync());
+    try testing.expectError(error.ClientDisconnected, transfer.submitSync(.{}));
 }

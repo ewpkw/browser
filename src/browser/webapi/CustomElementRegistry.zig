@@ -78,8 +78,8 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
             var js_arr = observed_attrs.toArray();
             for (0..js_arr.len()) |i| {
                 const attr_val = js_arr.get(@intCast(i)) catch continue;
-                const attr_name = attr_val.toStringSliceWithAlloc(frame.arena) catch continue;
-                definition.observed_attributes.put(frame.arena, attr_name, {}) catch continue;
+                const attr_name = attr_val.toStringSliceWithAlloc(frame.page_arena) catch continue;
+                definition.observed_attributes.put(frame.page_arena, attr_name, {}) catch continue;
             }
         }
     }
@@ -98,7 +98,7 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
         }
     }
 
-    const gop = try self._definitions.getOrPut(frame.arena, owned_name);
+    const gop = try self._definitions.getOrPut(frame.page_arena, owned_name);
     if (gop.found_existing) {
         return error.NotSupported;
     }
@@ -149,6 +149,9 @@ pub fn getName(self: *CustomElementRegistry, constructor: js.Function) ?[]const 
 }
 
 pub fn upgrade(self: *CustomElementRegistry, root: *Node, frame: *Frame) !void {
+    if (root.getDocument(frame)._frame == null) {
+        return;
+    }
     try upgradeNode(self, root, frame);
 }
 
@@ -160,7 +163,7 @@ pub fn whenDefined(self: *CustomElementRegistry, name: []const u8, frame: *Frame
 
     try validateName(name);
 
-    const gop = try self._when_defined.getOrPut(frame.arena, name);
+    const gop = try self._when_defined.getOrPut(frame.page_arena, name);
     if (gop.found_existing) {
         return local.toLocal(gop.value_ptr.*).promise();
     }
@@ -246,7 +249,7 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
             custom._definition = null;
             return err;
         }
-        log.warn(.js, "custom element upgrade", .{ .name = definition.name, .err = err });
+        log.debug(.js, "custom element upgrade", .{ .name = definition.name, .err = err });
         upgradeFailed(custom);
         if (try_catch.exceptionValue()) |exc| {
             frame.window.reportError(exc, frame) catch {};
@@ -257,7 +260,7 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
     const same = if (object.toZig(*Node)) |result| result == node else |_| false;
     if (!same) {
         // the construction result must be the element being upgraded.
-        log.warn(.js, "custom element upgrade", .{ .name = definition.name, .reason = "constructor returned another value" });
+        log.debug(.js, "custom element upgrade", .{ .name = definition.name, .reason = "constructor returned another value" });
         upgradeFailed(custom);
         const exc: js.Value = .{
             .local = local,
@@ -284,7 +287,7 @@ fn validateName(name: []const u8) !void {
         return error.SyntaxError;
     }
 
-    if (std.mem.indexOf(u8, name, "-") == null) {
+    if (std.mem.find(u8, name, "-") == null) {
         return error.SyntaxError;
     }
 
@@ -341,6 +344,5 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: CustomElementRegistry" {
-    testing.expectLog(&.{ .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js });
     try testing.htmlRunner("custom_elements", .{});
 }

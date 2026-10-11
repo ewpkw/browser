@@ -58,9 +58,69 @@ pub const Opts = struct {
     }
 };
 
+// The --render-font files, mapped read-only for the life of the App.
+pub const Fonts = struct {
+    maps: []std.Io.File.MemoryMap,
+    files: []LpFontFile,
+
+    pub fn load(allocator: Allocator, paths: []const []const u8) !Fonts {
+        if (paths.len == 0) {
+            return .{ .maps = &.{}, .files = &.{} };
+        }
+        const maps = try allocator.alloc(std.Io.File.MemoryMap, paths.len);
+        errdefer allocator.free(maps);
+
+        const files = try allocator.alloc(LpFontFile, paths.len);
+        errdefer allocator.free(files);
+
+        var loaded: usize = 0;
+        errdefer for (maps[0..loaded]) |*m| unmap(m);
+
+        for (paths, maps, files) |path, *m, *f| {
+            m.* = mapFile(path) catch |err| {
+                log.fatal(.app, "failed to load font", .{ .arg = "--render-font", .path = path, .err = err });
+                return error.InvalidArgument;
+            };
+            loaded += 1;
+            f.* = .{ .data = m.memory.ptr, .data_len = m.memory.len };
+        }
+        return .{ .maps = maps, .files = files };
+    }
+
+    pub fn deinit(self: *Fonts, allocator: Allocator) void {
+        for (self.maps) |*m| unmap(m);
+        allocator.free(self.maps);
+        allocator.free(self.files);
+    }
+
+    fn mapFile(path: []const u8) !std.Io.File.MemoryMap {
+        const file = try std.Io.Dir.cwd().openFile(lp.io, path, .{});
+        errdefer file.close(lp.io);
+        const len = try file.length(lp.io);
+        if (len == 0) {
+            return error.EmptyFile;
+        }
+        return file.createMemoryMap(lp.io, .{
+            .len = @intCast(len),
+            .populate = false,
+            .protection = .{ .read = true },
+        });
+    }
+
+    fn unmap(m: *std.Io.File.MemoryMap) void {
+        const file = m.file;
+        m.destroy(lp.io);
+        file.close(lp.io);
+    }
+};
+
 // Parsed fonts, shaping scratch and the glyph cache, on the Rust side. One
 // per Browser, created on the first screenshot.
 pub const Renderer = opaque {
+    pub fn init(fonts: []const LpFontFile) !*Renderer {
+        return lp_render_new(fonts.ptr, fonts.len) orelse error.RendererInit;
+    }
+
     pub fn deinit(self: *Renderer) void {
         lp_render_free(self);
     }
@@ -111,7 +171,7 @@ pub fn rendererFor(frame: *Frame) !*Renderer {
     if (browser.renderer) |r| {
         return r;
     }
-    const r = lp_render_new() orelse return error.RendererInit;
+    const r = try Renderer.init(browser.app.render_fonts.files);
     browser.renderer = r;
     return r;
 }
@@ -155,7 +215,7 @@ pub fn collect(arena: Allocator, state: RenderTree.State, frame: *Frame) ![]cons
 // Any non-zero rc means nothing usable was written, so the caller has to fail
 // rather than hand back a truncated file. WriteFailed is the only error
 // jsonStringify's signature can carry, hence the log line.
-fn renderFailed(what: []const u8, rc: i32) error{WriteFailed} {
+fn renderFailed(comptime what: []const u8, rc: i32) error{WriteFailed} {
     log.err(.browser, what, .{ .reason = switch (rc) {
         RC_WRITE_REFUSED => "write refused",
         RC_INVALID => "invalid options",
@@ -372,7 +432,7 @@ const LpGlyph = extern struct {
     advance: f32,
 };
 
-const LpCluster = extern struct {
+pub const LpCluster = extern struct {
     font: u32,
     glyph: u32,
     text_start: u32,
@@ -392,6 +452,12 @@ pub const LpFont = extern struct {
     name: [*]const u8,
     name_len: usize,
     mono: u8,
+};
+
+/// A --render-font file; the bytes outlive every Renderer.
+pub const LpFontFile = extern struct {
+    data: [*]const u8,
+    data_len: usize,
 };
 
 const RC_OK: i32 = 0;
@@ -545,7 +611,7 @@ const LpAbi = extern struct {
 const LINK_COLOR: u32 = 0x1a0dab;
 const MUTED_COLOR: u32 = 0x6b6b6b;
 
-extern "c" fn lp_render_new() ?*Renderer;
+extern "c" fn lp_render_new(fonts: [*]const LpFontFile, fonts_len: usize) ?*Renderer;
 extern "c" fn lp_render_free(r: *Renderer) void;
 extern "c" fn lp_render_png(
     r: *Renderer,
@@ -567,10 +633,14 @@ extern "c" fn lp_layout_new(
 extern "c" fn lp_layout_free(h: *LayoutHandle) void;
 extern "c" fn lp_render_abi(out: *LpAbi) void;
 
+// Iterative else large trees will stackoverflow
 const Builder = struct {
     frame: *Frame,
     arena: Allocator,
     tree: RenderTree,
+
+    // Content still to render, followed by what closes the element.
+    stack: std.ArrayList(Open) = .empty,
 
     blocks: std.ArrayList(LpBlock) = .empty,
 
@@ -616,6 +686,30 @@ const Builder = struct {
     const ListState = struct {
         ordered: bool,
         index: u32,
+    };
+
+    const Open = struct {
+        iter: RenderTree.Slotted,
+        epilogue: Epilogue,
+    };
+
+    // what follows after the children
+    const Epilogue = union(enum) {
+        none,
+        block,
+        pre: ?*Node,
+        list: bool,
+        list_item: bool,
+        blockquote,
+        anchor: Anchor,
+        cell: bool,
+        element: Element.Tag,
+
+        const Anchor = struct {
+            linked: bool,
+            prev_href: []const u8,
+            standalone: bool,
+        };
     };
 
     const Error = Allocator.Error;
@@ -758,9 +852,23 @@ const Builder = struct {
 
     fn render(self: *Builder, node: *Node) Error!void {
         switch (node._type) {
-            .document, .document_fragment => try self.renderChildren(node, false),
+            .document, .document_fragment => try self.open(.init(self.tree.children(node, false)), .none),
             else => if (self.tree.classify(node, .{})) |child| try self.renderChild(child),
         }
+
+        while (self.stack.items.len > 0) {
+            // renderChild can grow the stack, so we can't re-use top on continue
+            const top = &self.stack.items[self.stack.items.len - 1];
+            if (top.iter.next()) |child| {
+                try self.renderChild(child);
+                continue;
+            }
+            try self.close(self.stack.pop().?.epilogue);
+        }
+    }
+
+    fn open(self: *Builder, iter: RenderTree.Slotted, epilogue: Epilogue) Error!void {
+        return self.stack.append(self.arena, .{ .iter = iter, .epilogue = epilogue });
     }
 
     fn renderChild(self: *Builder, child: RenderTree.Child) Error!void {
@@ -769,21 +877,6 @@ const Builder = struct {
             .element => |display| try self.renderElement(child.node.subtype(Node.Element), display),
             .text => |text| try self.renderText(text),
         }
-    }
-
-    fn renderChildren(self: *Builder, parent: *Node, boxed: bool) Error!void {
-        var it = self.tree.children(parent, boxed);
-        while (it.next()) |child| try self.renderChild(child);
-    }
-
-    fn renderContent(self: *Builder, el: *Element, boxed: bool) Error!void {
-        var it = self.tree.content(el, boxed);
-        while (it.next()) |child| try self.renderChild(child);
-    }
-
-    fn renderSlotContent(self: *Builder, slot: *Slot) Error!void {
-        var it = self.tree.slotted(slot);
-        while (it.next()) |child| try self.renderChild(child);
     }
 
     fn renderText(self: *Builder, text: []const u8) Error!void {
@@ -824,16 +917,13 @@ const Builder = struct {
                     else => 6,
                 };
                 try self.openBlock(.heading, level);
-                try self.renderContent(el, boxed);
-                return self.closeBlock();
+                return self.open(.init(self.tree.content(el, boxed)), .block);
             },
             .pre => {
                 try self.openBlock(.pre, 0);
                 const prev = self.pre_node;
                 self.pre_node = el.asNode();
-                try self.renderContent(el, boxed);
-                self.pre_node = prev;
-                return self.closeBlock();
+                return self.open(.init(self.tree.content(el, boxed)), .{ .pre = prev });
             },
             .hr => {
                 try self.openBlock(.rule, 0);
@@ -854,10 +944,7 @@ const Builder = struct {
                     self.list_stack[self.list_depth] = .{ .ordered = tag == .ol, .index = 1 };
                     self.list_depth += 1;
                 }
-                try self.renderContent(el, boxed);
-                try self.closeBlock();
-                if (pushed) self.list_depth -= 1;
-                return;
+                return self.open(.init(self.tree.content(el, boxed)), .{ .list = pushed });
             },
             .li => {
                 try self.closeBlock();
@@ -866,24 +953,17 @@ const Builder = struct {
                 if (stray) self.list_depth = 1;
                 if (!stray and self.list_stack[self.list_depth - 1].ordered) {
                     const state = &self.list_stack[self.list_depth - 1];
-                    self.pending_marker = try std.fmt.allocPrint(self.arena, "{d}.", .{state.index});
+                    self.pending_marker = try self.arena.print("{d}.", .{state.index});
                     state.index += 1;
                 } else {
                     self.pending_marker = "•";
                 }
-                try self.renderContent(el, boxed);
-                try self.closeBlock();
-                self.pending_marker = "";
-                if (stray) self.list_depth = 0;
-                return;
+                return self.open(.init(self.tree.content(el, boxed)), .{ .list_item = stray });
             },
             .blockquote => {
                 try self.closeBlock();
                 self.quote_depth +|= 1;
-                try self.renderContent(el, boxed);
-                try self.closeBlock();
-                self.quote_depth -= 1;
-                return;
+                return self.open(.init(self.tree.content(el, boxed)), .blockquote);
             },
             .img => {
                 const alt = el.getAttributeInterned("alt") orelse return;
@@ -926,24 +1006,19 @@ const Builder = struct {
                     // point outside the document.
                     self.href = URL.resolve(self.arena, self.frame.base(), h, .{ .encoding = self.frame.charset }) catch h;
                 }
+
+                const epilogue: Epilogue = .{ .anchor = .{
+                    .linked = href != null,
+                    .prev_href = prev_href,
+                    .standalone = standalone,
+                } };
                 if (info.has_visible) {
-                    try self.renderContent(el, boxed);
-                } else {
-                    try self.renderText(label.?);
+                    return self.open(.init(self.tree.content(el, boxed)), epilogue);
                 }
-                if (href != null) {
-                    self.link -= 1;
-                    self.href = prev_href;
-                }
-                if (standalone) {
-                    try self.closeBlock();
-                    self.tight -= 1;
-                } else {
-                    self.after_anchor = true;
-                }
-                return;
+                try self.renderText(label.?);
+                return self.close(epilogue);
             },
-            .slot => return self.renderSlotContent(el.as(Slot)),
+            .slot => return self.open(self.tree.slotted(el.as(Slot)), .none),
             .td, .th => {
                 if (self.has_content) {
                     self.pending_space = true;
@@ -953,19 +1028,12 @@ const Builder = struct {
                     self.pending_space = true;
                 }
                 if (tag == .th) self.bold += 1;
-                try self.renderContent(el, boxed);
-                if (tag == .th) self.bold -= 1;
-                self.pending_space = true;
-                return;
+                return self.open(.init(self.tree.content(el, boxed)), .{ .cell = tag == .th });
             },
             else => {},
         }
 
-        const block = tag.isBlock() or switch (tag) {
-            .tr, .dt, .dd, .details, .summary, .caption, .legend, .option, .textarea => true,
-            else => false,
-        };
-        if (block) try self.closeBlock();
+        if (isBlockTag(tag)) try self.closeBlock();
 
         switch (tag) {
             .b, .strong => self.bold += 1,
@@ -975,21 +1043,69 @@ const Builder = struct {
             .code => self.mono += 1,
             else => {},
         }
-        try self.renderContent(el, boxed);
-        switch (tag) {
-            .b, .strong => self.bold -= 1,
-            .i, .em, .dfn => self.italic -= 1,
-            .ins => self.underline -= 1,
-            .s, .del => self.strike -= 1,
-            .code => self.mono -= 1,
-            else => {},
-        }
+        return self.open(.init(self.tree.content(el, boxed)), .{ .element = tag });
+    }
 
-        if (block) {
-            try self.closeBlock();
+    // Finish the element after renderElement has written the children
+    fn close(self: *Builder, epilogue: Epilogue) Error!void {
+        switch (epilogue) {
+            .none => {},
+            .block => try self.closeBlock(),
+            .pre => |prev| {
+                self.pre_node = prev;
+                try self.closeBlock();
+            },
+            .list => |pushed| {
+                try self.closeBlock();
+                if (pushed) self.list_depth -= 1;
+            },
+            .list_item => |stray| {
+                try self.closeBlock();
+                self.pending_marker = "";
+                if (stray) self.list_depth = 0;
+            },
+            .blockquote => {
+                try self.closeBlock();
+                self.quote_depth -= 1;
+            },
+            .anchor => |anchor| {
+                if (anchor.linked) {
+                    self.link -= 1;
+                    self.href = anchor.prev_href;
+                }
+                if (anchor.standalone) {
+                    try self.closeBlock();
+                    self.tight -= 1;
+                } else {
+                    self.after_anchor = true;
+                }
+            },
+            .cell => |header| {
+                if (header) self.bold -= 1;
+                self.pending_space = true;
+            },
+            .element => |tag| {
+                switch (tag) {
+                    .b, .strong => self.bold -= 1,
+                    .i, .em, .dfn => self.italic -= 1,
+                    .ins => self.underline -= 1,
+                    .s, .del => self.strike -= 1,
+                    .code => self.mono -= 1,
+                    else => {},
+                }
+                if (isBlockTag(tag)) try self.closeBlock();
+            },
         }
     }
 };
+
+// Tags that get a block of their own, beyond the ones CSS calls blocks.
+fn isBlockTag(tag: Element.Tag) bool {
+    return tag.isBlock() or switch (tag) {
+        .tr, .dt, .dd, .details, .summary, .caption, .legend, .option, .textarea => true,
+        else => false,
+    };
+}
 
 const testing = @import("../testing.zig");
 test "browser.screenshot: rust abi matches" {
@@ -1121,9 +1237,9 @@ test "browser.screenshot: rust abi matches" {
         .span_strike = SPAN_STRIKE,
         .span_has_color = SPAN_HAS_COLOR,
 
-        .block_heading = @intFromEnum(LpBlock.Kind.heading),
-        .block_pre = @intFromEnum(LpBlock.Kind.pre),
-        .block_rule = @intFromEnum(LpBlock.Kind.rule),
+        .block_heading = @backingInt(LpBlock.Kind.heading),
+        .block_pre = @backingInt(LpBlock.Kind.pre),
+        .block_rule = @backingInt(LpBlock.Kind.rule),
         .block_tight = BLOCK_TIGHT,
 
         .render_measure_only = RENDER_MEASURE_ONLY,
@@ -1139,9 +1255,9 @@ test "browser.screenshot: rust abi matches" {
     // Size first: a field present on only one side of LpAbi itself shifts
     // everything after it, and the per-field loop would just report noise.
     try testing.expectEqual(expected.size, got.size);
-    inline for (@typeInfo(LpAbi).@"struct".fields) |f| {
-        testing.expectEqual(@field(expected, f.name), @field(got, f.name)) catch |err| {
-            std.debug.print("rust/zig abi mismatch on {s}\n", .{f.name});
+    inline for (@typeInfo(LpAbi).@"struct".field_names) |field_name| {
+        testing.expectEqual(@field(expected, field_name), @field(got, field_name)) catch |err| {
+            std.debug.print("rust/zig abi mismatch on {s}\n", .{field_name});
             return err;
         };
     }
@@ -1418,7 +1534,7 @@ test "browser.screenshot: shadow dom and slots" {
     const div = try doc.createElement("div", null, frame);
     try div.setHTMLUnsafe(
         \\<x-host><template shadowrootmode="open"><p>shadow <slot></slot></p></template>light</x-host>
-    , frame);
+    , null, frame);
 
     var builder: Builder = .{ .arena = testing.arena_allocator, .frame = frame, .tree = .{ .frame = frame, .state = .{ .root = div.asNode() } } };
     try builder.render(div.asNode());
@@ -1534,4 +1650,195 @@ test "browser.screenshot: collect honours strip flags" {
     const stripped = try collect(arena, .{ .root = div.asNode(), .strip = .{ .shell = true, .ui = true } }, frame);
     try testing.expectEqual(1, stripped.len);
     try testing.expectEqual("Body text", try S.text(stripped[0], arena));
+}
+
+test "browser.screenshot: deep nesting doesn't overflow the native stack" {
+    defer testing.test_session.closeAllPages();
+    const frame = try testing.createFrame();
+
+    // <div>, not an inline tag: the inline style counters are u8, and nesting
+    // one 256 deep overflows them long before the walk is the problem.
+    const depth = 50_000;
+    const doc = frame.window._document;
+    const innermost = (try doc.createElement("div", null, frame)).asNode();
+    _ = try innermost.appendChild(try doc.createTextNode("deep"), frame);
+
+    var top = innermost;
+    for (1..depth) |_| {
+        const parent = (try doc.createElement("div", null, frame)).asNode();
+        _ = try parent.appendChild(top, frame);
+        top = parent;
+    }
+
+    const blocks = try collect(testing.arena_allocator, .{ .root = top }, frame);
+    try testing.expectEqual(1, blocks.len);
+    try testing.expectEqual(1, blocks[0].spans_len);
+    try testing.expectEqual("deep", blocks[0].spans[0].text[0..blocks[0].spans[0].len]);
+}
+
+test "browser.screenshot: --render-font faces fill what DejaVu lacks" {
+    defer testing.test_session.closeAllPages();
+    const frame = try testing.createFrame();
+    const doc = frame.window._document;
+    const div = try doc.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<p>A日</p>");
+
+    const font = try testFallbackFont(testing.arena_allocator);
+    const files = [_]LpFontFile{.{ .data = font.ptr, .data_len = font.len }};
+    const r = try Renderer.init(&files);
+    defer r.deinit();
+
+    const blocks = try collect(testing.arena_allocator, .{ .root = div.asNode() }, frame);
+    var l = try layout(r, blocks, 400, 0);
+    defer l.deinit();
+
+    // "A" stays DejaVu; 日 goes to the fallback, named for the PDF.
+    const clusters = l.clusters();
+    try testing.expectEqual(2, clusters.len);
+    const fonts = l.fonts();
+    const dejavu = fonts[clusters[0].font];
+    try testing.expectEqual("DejaVuSans", dejavu.name[0..dejavu.name_len]);
+    const fallback = fonts[clusters[1].font];
+    try testing.expectEqual("LPTest-Regular", fallback.name[0..fallback.name_len]);
+    try testing.expectEqual(@intFromPtr(font.ptr), @intFromPtr(fallback.data));
+    try testing.expectEqual(1, clusters[1].glyph);
+}
+
+test "browser.screenshot: Fonts maps --render-font files" {
+    testing.silenceLog(&.{.app});
+    try testing.expectError(error.InvalidArgument, Fonts.load(testing.allocator, &.{"src/rust/render/fonts/missing.ttf"}));
+
+    var fonts: Fonts = try .load(testing.allocator, &.{ "src/rust/render/fonts/DejaVuSans.ttf", "src/rust/render/fonts/DejaVuSansMono.ttf" });
+    defer fonts.deinit(testing.allocator);
+    try testing.expectEqual(2, fonts.files.len);
+    const data = fonts.files[0].data[0..fonts.files[0].data_len];
+    try testing.expectEqual(759720, data.len);
+    try testing.expectEqual(0x00010000, std.mem.readInt(u32, data[0..4], .big));
+}
+
+/// A minimal TrueType font: one square glyph, mapped from U+65E5 (日),
+/// which DejaVu doesn't cover. Family "LPTest", PostScript "LPTest-Regular".
+pub fn testFallbackFont(arena: Allocator) ![]const u8 {
+    const Table = struct { tag: *const [4]u8, data: []const u8 };
+    const B = struct {
+        fn build(a: Allocator, comptime f: fn (*std.Io.Writer) anyerror!void) ![]const u8 {
+            var aw: std.Io.Writer.Allocating = .init(a);
+            try f(&aw.writer);
+            return aw.written();
+        }
+        fn u16s(w: *std.Io.Writer, values: []const u16) !void {
+            for (values) |v| try w.writeInt(u16, v, .big);
+        }
+    };
+
+    const os2 = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            // version 4: avg width, weight 400, width 5, then zeros up to the
+            // typo/win metrics and the cap height.
+            try B.u16s(w, &.{ 4, 1000, 400, 5 });
+            try w.splatByteAll(0, 68 - 8);
+            try B.u16s(w, &.{ 800, @bitCast(@as(i16, -200)), 0, 800, 200 });
+            try w.splatByteAll(0, 88 - 78);
+            try B.u16s(w, &.{ 800, 0, 0, 0 });
+        }
+    }.f);
+    const cmap = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            // One (3, 1) format 4 subtable: 0x65E5 → gid 1, then the 0xFFFF
+            // terminator segment.
+            try B.u16s(w, &.{ 0, 1, 3, 1, 0, 12 });
+            try B.u16s(w, &.{ 4, 32, 0, 4, 4, 1, 0 });
+            try B.u16s(w, &.{ 0x65E5, 0xFFFF, 0, 0x65E5, 0xFFFF });
+            try B.u16s(w, &.{ 1 -% @as(u16, 0x65E5), 1, 0, 0 });
+        }
+    }.f);
+    const glyf = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            // gid 0 is empty; gid 1 a 800x800 square, four on-curve points
+            // as 16-bit deltas, padded to 36.
+            try B.u16s(w, &.{ 1, 100, 0, 900, 800, 3, 0 });
+            try w.splatByteAll(1, 4);
+            try B.u16s(w, &.{ 100, 0, 800, 0 });
+            try B.u16s(w, &.{ 0, 800, 0, @bitCast(@as(i16, -800)) });
+            try w.splatByteAll(0, 2);
+        }
+    }.f);
+    const head = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            try B.u16s(w, &.{ 1, 0, 1, 0, 0, 0, 0x5F0F, 0x3CF5, 0x000B, 1000 });
+            try w.splatByteAll(0, 16);
+            // bbox, macStyle, lowestRecPPEM, direction hint, long loca, format
+            try B.u16s(w, &.{ 0, 0, 1000, 800, 0, 8, 2, 1, 0 });
+        }
+    }.f);
+    const hhea = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            try B.u16s(w, &.{ 1, 0, 800, @bitCast(@as(i16, -200)), 0, 1000, 0, 0, 1000, 1, 0, 0 });
+            try w.splatByteAll(0, 10);
+            try B.u16s(w, &.{2});
+        }
+    }.f);
+    const hmtx = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            try B.u16s(w, &.{ 500, 0, 1000, 100 });
+        }
+    }.f);
+    const loca = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            for ([_]u32{ 0, 0, 36 }) |o| try w.writeInt(u32, o, .big);
+        }
+    }.f);
+    const maxp = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            try B.u16s(w, &.{ 1, 0, 2, 4, 1, 0, 0, 2 });
+            try w.splatByteAll(0, 16);
+        }
+    }.f);
+    const name = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            // Family (1) and PostScript (6) names, UTF-16BE.
+            const family = "LPTest";
+            const ps = "LPTest-Regular";
+            try B.u16s(w, &.{ 0, 2, 6 + 2 * 12 });
+            try B.u16s(w, &.{ 3, 1, 0x409, 1, family.len * 2, 0 });
+            try B.u16s(w, &.{ 3, 1, 0x409, 6, ps.len * 2, family.len * 2 });
+            for (family ++ ps) |c| try w.writeInt(u16, c, .big);
+        }
+    }.f);
+    const post = try B.build(arena, struct {
+        fn f(w: *std.Io.Writer) !void {
+            try B.u16s(w, &.{ 3, 0, 0, 0, @bitCast(@as(i16, -100)), 50 });
+            try w.splatByteAll(0, 20);
+        }
+    }.f);
+
+    // Sorted by tag, as the directory requires.
+    const tables = [_]Table{
+        .{ .tag = "OS/2", .data = os2 },
+        .{ .tag = "cmap", .data = cmap },
+        .{ .tag = "glyf", .data = glyf },
+        .{ .tag = "head", .data = head },
+        .{ .tag = "hhea", .data = hhea },
+        .{ .tag = "hmtx", .data = hmtx },
+        .{ .tag = "loca", .data = loca },
+        .{ .tag = "maxp", .data = maxp },
+        .{ .tag = "name", .data = name },
+        .{ .tag = "post", .data = post },
+    };
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try B.u16s(w, &.{ 1, 0, tables.len, 128, 3, tables.len * 16 - 128 });
+    var offset: u32 = 12 + tables.len * 16;
+    for (tables) |t| {
+        try w.writeAll(t.tag);
+        try w.writeInt(u32, 0, .big);
+        try w.writeInt(u32, offset, .big);
+        try w.writeInt(u32, @intCast(t.data.len), .big);
+        offset += @intCast(std.mem.alignForward(usize, t.data.len, 4));
+    }
+    for (tables) |t| {
+        try w.writeAll(t.data);
+        try w.splatByteAll(0, std.mem.alignForward(usize, t.data.len, 4) - t.data.len);
+    }
+    return aw.written();
 }

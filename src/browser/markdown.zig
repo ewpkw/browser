@@ -29,12 +29,15 @@ const Slot = @import("webapi/element/html/Slot.zig");
 
 const LimitedWriter = @import("../LimitedWriter.zig");
 const isAllWhitespace = @import("../string.zig").isAllWhitespace;
+const repeat = @import("../string.zig").repeat;
 
 pub const Opts = struct {
     max_bytes: ?u32 = null,
 };
 
 const truncation_marker = LimitedWriter.truncation_marker;
+
+const Error = error{ WriteFailed, OutOfMemory };
 
 const State = struct {
     const ListType = enum { ordered, unordered };
@@ -63,11 +66,56 @@ fn getAnchorLabel(el: *Element) ?[]const u8 {
     return el.getAttributeInterned("aria-label") orelse el.getAttributeInterned("title");
 }
 
+/// The fence info string for a `<pre>`: the `language-*` (or `lang-*`) class
+/// on the `<pre>` itself or on a `<code>` that is its first element child.
+fn codeLanguage(pre: *Element) ?[]const u8 {
+    if (classLanguage(pre)) |lang| return lang;
+    const child = pre.firstElementChild() orelse return null;
+    if (child.getTag() != .code) return null;
+    return classLanguage(child);
+}
+
+fn classLanguage(el: *Element) ?[]const u8 {
+    const class = el.getClassName() orelse return null;
+    var it = std.mem.tokenizeAny(u8, class, &std.ascii.whitespace);
+    while (it.next()) |token| {
+        for ([_][]const u8{ "language-", "lang-" }) |prefix| {
+            if (!std.mem.startsWith(u8, token, prefix)) continue;
+            const lang = token[prefix.len..];
+            // A backtick would end the fence's info string early.
+            if (lang.len > 0 and std.mem.findScalar(u8, lang, '`') == null) return lang;
+        }
+    }
+    return null;
+}
+
+// Iterative else large trees will stackoverflow
 const Context = struct {
     state: State,
     writer: *std.Io.Writer,
     frame: *Frame,
     tree: RenderTree,
+    stack: std.ArrayList(Open) = .empty,
+
+    // Content still to render, followed by what closes the element.
+    const Open = struct {
+        iter: RenderTree.Slotted,
+        epilogue: Epilogue,
+    };
+
+    // what follows after the children
+    const Epilogue = union(enum) {
+        none,
+        // A standalone anchor without href: its own line, but no link syntax.
+        standalone_text,
+        element: Element.Tag,
+        block_anchor: struct { href: []const u8, label: ?[]const u8 },
+        inline_anchor: struct { href: []const u8, standalone: bool },
+    };
+
+    fn deinit(self: *Context) void {
+        self.stack.deinit(self.frame.local_arena);
+    }
 
     fn ensureNewline(self: *Context) !void {
         if (!self.state.last_char_was_newline) {
@@ -76,18 +124,32 @@ const Context = struct {
         }
     }
 
-    fn render(self: *Context, node: *Node) error{WriteFailed}!void {
+    fn render(self: *Context, node: *Node) Error!void {
         switch (node._type) {
-            .document, .document_fragment => try self.renderChildren(node, false),
+            .document, .document_fragment => try self.open(.init(self.tree.children(node, false)), .none),
             else => {
                 if (self.tree.classify(node, .{})) |child| {
                     try self.renderChild(child);
                 }
             },
         }
+
+        while (self.stack.items.len > 0) {
+            // renderChild can grow the stack, so we can't re-use top on continue
+            const top = &self.stack.items[self.stack.items.len - 1];
+            if (top.iter.next()) |child| {
+                try self.renderChild(child);
+                continue;
+            }
+            try self.close(self.stack.pop().?.epilogue);
+        }
     }
 
-    fn renderChild(self: *Context, child: RenderTree.Child) error{WriteFailed}!void {
+    fn open(self: *Context, iter: RenderTree.Slotted, epilogue: Epilogue) Error!void {
+        return self.stack.append(self.frame.local_arena, .{ .iter = iter, .epilogue = epilogue });
+    }
+
+    fn renderChild(self: *Context, child: RenderTree.Child) Error!void {
         switch (child.what) {
             .element => |display| {
                 const el = child.node.subtype(Node.Element);
@@ -105,28 +167,8 @@ const Context = struct {
         }
     }
 
-    fn renderChildren(self: *Context, parent: *Node, boxed: bool) error{WriteFailed}!void {
-        var it = self.tree.children(parent, boxed);
-        while (it.next()) |child| {
-            try self.renderChild(child);
-        }
-    }
-
-    fn renderContent(self: *Context, el: *Element, boxed: bool) error{WriteFailed}!void {
-        var it = self.tree.content(el, boxed);
-        while (it.next()) |child| {
-            try self.renderChild(child);
-        }
-    }
-
-    fn renderSlotContent(self: *Context, slot: *Slot) error{WriteFailed}!void {
-        var it = self.tree.slotted(slot);
-        while (it.next()) |child| {
-            try self.renderChild(child);
-        }
-    }
-
-    fn renderElement(self: *Context, el: *Element, display: StyleManager.Display) !void {
+    // write the element's opening markers and push its contents
+    fn renderElement(self: *Context, el: *Element, display: StyleManager.Display) Error!void {
         const tag = el.getTag();
         const boxed = display == .flex or display == .grid;
 
@@ -190,7 +232,9 @@ const Context = struct {
                 self.state.last_char_was_newline = false;
             },
             .pre => {
-                try self.writer.writeAll("```\n");
+                try self.writer.writeAll("```");
+                if (codeLanguage(el)) |lang| try self.writer.writeAll(lang);
+                try self.writer.writeByte('\n');
                 self.state.pre_node = el.asNode();
                 self.state.last_char_was_newline = true;
             },
@@ -243,26 +287,24 @@ const Context = struct {
             },
             .anchor => {
                 const frame = self.frame;
+                // Without href, <a> is a placeholder, not a hyperlink.
+                const href_raw = el.getAttributeInterned("href") orelse {
+                    if (!RenderTree.isStandaloneAnchor(el, frame)) {
+                        return self.open(.init(self.tree.content(el, boxed)), .none);
+                    }
+                    try self.ensureNewline();
+                    return self.open(.init(self.tree.content(el, boxed)), .standalone_text);
+                };
+
                 const info = RenderTree.analyzeContent(el.asNode(), frame);
                 const label = getAnchorLabel(el);
-                const href_raw = el.getAttributeInterned("href");
-
-                if (!info.has_visible and label == null and href_raw == null) return;
-
-                const href = if (href_raw) |h| URL.resolve(frame.local_arena, frame.base(), h, .{ .encoding = frame.charset }) catch h else null;
+                const href = URL.resolve(frame.local_arena, frame.base(), href_raw, .{ .encoding = frame.charset }) catch href_raw;
 
                 if (info.has_block) {
-                    try self.renderContent(el, boxed);
-                    if (href) |h| {
-                        if (!self.state.last_char_was_newline) try self.writer.writeByte('\n');
-                        try self.writer.writeByte('[');
-                        try self.writer.writeAll(label orelse h);
-                        try self.writer.writeAll("](");
-                        try self.writer.writeAll(h);
-                        try self.writer.writeAll(")\n");
-                        self.state.last_char_was_newline = true;
-                    }
-                    return;
+                    return self.open(.init(self.tree.content(el, boxed)), .{ .block_anchor = .{
+                        .href = href,
+                        .label = label,
+                    } });
                 }
 
                 const standalone = RenderTree.isStandaloneAnchor(el, frame);
@@ -270,23 +312,13 @@ const Context = struct {
                     if (!self.state.last_char_was_newline) try self.writer.writeByte('\n');
                 }
                 try self.writer.writeByte('[');
+
+                const epilogue: Epilogue = .{ .inline_anchor = .{ .href = href, .standalone = standalone } };
                 if (info.has_visible) {
-                    try self.renderContent(el, boxed);
-                } else {
-                    try self.writer.writeAll(label orelse "");
+                    return self.open(.init(self.tree.content(el, boxed)), epilogue);
                 }
-                try self.writer.writeAll("](");
-                if (href) |h| {
-                    try self.writer.writeAll(h);
-                }
-                try self.writer.writeByte(')');
-                if (standalone) {
-                    try self.writer.writeByte('\n');
-                    self.state.last_char_was_newline = true;
-                } else {
-                    self.state.last_char_was_newline = false;
-                }
-                return;
+                try self.writer.writeAll(label orelse "");
+                return self.close(epilogue);
             },
             .input => {
                 const type_attr = el.getAttributeInterned("type") orelse return;
@@ -297,20 +329,50 @@ const Context = struct {
                 }
                 return;
             },
-            .slot => return self.renderSlotContent(el.as(Slot)),
+            .slot => return self.open(self.tree.slotted(el.as(Slot)), .none),
             else => {},
         }
 
-        try self.renderContent(el, boxed);
+        return self.open(.init(self.tree.content(el, boxed)), .{ .element = tag });
+    }
+
+    // Finish the element after renderElement has written the children
+    fn close(self: *Context, epilogue: Epilogue) Error!void {
+        const tag = switch (epilogue) {
+            .none => return,
+            .standalone_text => {
+                try self.ensureNewline();
+                return;
+            },
+            .element => |t| t,
+            .block_anchor => |anchor| {
+                try self.ensureNewline();
+                try self.writer.writeByte('[');
+                try self.writer.writeAll(anchor.label orelse anchor.href);
+                try self.writer.writeAll("](");
+                try self.writer.writeAll(anchor.href);
+                try self.writer.writeAll(")\n");
+                return;
+            },
+            .inline_anchor => |anchor| {
+                try self.writer.writeAll("](");
+                try self.writer.writeAll(anchor.href);
+                try self.writer.writeByte(')');
+                if (anchor.standalone) {
+                    try self.writer.writeByte('\n');
+                    self.state.last_char_was_newline = true;
+                } else {
+                    self.state.last_char_was_newline = false;
+                }
+                return;
+            },
+        };
 
         switch (tag) {
             .pre => {
-                if (!self.state.last_char_was_newline) {
-                    try self.writer.writeByte('\n');
-                }
+                try self.ensureNewline();
                 try self.writer.writeAll("```\n");
                 self.state.pre_node = null;
-                self.state.last_char_was_newline = true;
             },
             .code => {
                 if (self.state.pre_node == null) {
@@ -425,7 +487,9 @@ pub fn dump(state: RenderTree.State, opts: Opts, writer: *std.Io.Writer, frame: 
             .frame = frame,
             .tree = .{ .frame = frame, .state = state },
         };
+        defer ctx.deinit();
         ctx.render(node) catch |err| switch (err) {
+            error.OutOfMemory => return err,
             error.WriteFailed => {
                 if (!lw.truncated) return err;
                 try writer.writeAll(truncation_marker);
@@ -444,6 +508,7 @@ pub fn dump(state: RenderTree.State, opts: Opts, writer: *std.Io.Writer, frame: 
         .frame = frame,
         .tree = .{ .frame = frame, .state = state },
     };
+    defer ctx.deinit();
     try ctx.render(node);
     if (!ctx.state.last_char_was_newline) {
         try writer.writeByte('\n');
@@ -589,6 +654,30 @@ test "browser.markdown: code" {
     );
 }
 
+test "browser.markdown: code fence keeps the language" {
+    try testMarkdownHTML("<pre><code class=\"hljs language-zig\">const x = 1;</code></pre>",
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+        \\
+    );
+    try testMarkdownHTML("<pre class=\"lang-sh\">ls</pre>",
+        \\
+        \\```sh
+        \\ls
+        \\```
+        \\
+    );
+    try testMarkdownHTML("<pre class=\"language-\">x</pre>",
+        \\
+        \\```
+        \\x
+        \\```
+        \\
+    );
+}
+
 test "browser.markdown: block link" {
     try testMarkdownHTML(
         \\<a href="https://example.com">
@@ -723,6 +812,20 @@ test "browser.markdown: anchor fallback label" {
     , "[](http://localhost/no-label)\n");
 }
 
+test "browser.markdown: anchor without href is plain text" {
+    try testMarkdownHTML(
+        \\<p>Read the <a class="term">glossary</a> first.</p>
+    , "\nRead the glossary first.\n");
+
+    try testMarkdownHTML(
+        \\<nav><a class="x">Home</a><a class="x"><b>About</b></a></nav>
+    , "Home\n**About**\n");
+
+    try testMarkdownHTML(
+        \\<a aria-label="Menu"><svg></svg></a>
+    , "");
+}
+
 test "browser.markdown: hidden elements are skipped" {
     try testMarkdownHTML(
         \\<p>before</p>
@@ -842,7 +945,7 @@ test "browser.markdown: max_bytes truncates with marker" {
 
     const doc = frame.window._document;
     const div = try doc.createElement("div", null, frame);
-    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<p>" ++ ("AAAA " ** 100) ++ "</p>");
+    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<p>" ++ (repeat("AAAA ", 100)) ++ "</p>");
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
@@ -919,11 +1022,33 @@ test "browser.markdown: declarative shadow DOM renders through piercing" {
     const host = try doc.createElement("div", null, frame);
     try host.setHTMLUnsafe(
         \\<div><template shadowrootmode="open"><p>shadow content</p></template></div>
-    , frame);
+    , null, frame);
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     try dump(.{ .root = host.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString("\nshadow content\n", aw.written());
+}
+
+test "browser.markdown: deep nesting doesn't overflow the native stack" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const depth = 50_000;
+    const doc = frame.window._document;
+    var top = (try doc.createElement("i", null, frame)).asNode();
+    for (1..depth) |_| {
+        const parent = (try doc.createElement("i", null, frame)).asNode();
+        _ = try parent.appendChild(top, frame);
+        top = parent;
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try dump(.{ .root = top }, .{}, &aw.writer, frame);
+
+    // Every <i> opens and closes with a '*', then dump's trailing newline.
+    try testing.expectEqual(depth * 2 + 1, aw.written().len);
+    try testing.expectString("**", aw.written()[0..2]);
 }

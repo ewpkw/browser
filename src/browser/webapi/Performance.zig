@@ -46,6 +46,8 @@ pub const Proto = EventTarget;
 
 _proto: *EventTarget,
 _time_origin: u64,
+// Wall-clock (Unix epoch) microseconds at the same moment, exposed as timeOrigin.
+_time_origin_unix: u64,
 _arena: Allocator,
 _factory: *Factory,
 // Marks and measures. Kept in startTime order (see insertOrdered), as the
@@ -54,6 +56,9 @@ _entries: std.ArrayList(*Entry) = .empty,
 // resources has its own cap, so it's split from entries (it's also potentially
 // polled more)
 _resources: std.ArrayList(*Entry) = .empty,
+// Entries that arrive while the buffer is full. Get copied into _resources
+// if a handler makes room.
+_secondary_resources: std.ArrayList(*Entry) = .empty,
 _timing: PerformanceTiming = .{},
 _navigation: PerformanceNavigation = .{},
 _event_counts: EventCounts = .{},
@@ -78,10 +83,12 @@ _delivering: bool = false,
 /// Get high-resolution timestamp in microseconds, rounded to 5μs increments
 /// to match browser behavior (prevents fingerprinting)
 pub fn highResTimestamp() u64 {
-    const micros = lp.datetime.microTimestamp(.boot);
-    // Round to nearest 5 microseconds (like Firefox default)
-    const rounded = @divTrunc(micros + 2, 5) * 5;
-    return rounded;
+    return roundMicros(lp.datetime.microTimestamp(.boot));
+}
+
+// Round to nearest 5 microseconds (like Firefox default)
+fn roundMicros(micros: u64) u64 {
+    return @divTrunc(micros + 2, 5) * 5;
 }
 
 pub fn init(factory: *Factory, arena: Allocator) !*Performance {
@@ -90,6 +97,7 @@ pub fn init(factory: *Factory, arena: Allocator) !*Performance {
         ._arena = arena,
         ._factory = factory,
         ._time_origin = highResTimestamp(),
+        ._time_origin_unix = roundMicros(lp.datetime.microTimestamp(.real)),
     });
 }
 
@@ -115,7 +123,7 @@ pub fn now(self: *const Performance) f64 {
 
 fn getTimeOrigin(self: *const Performance) f64 {
     // Return as milliseconds
-    return @as(f64, @floatFromInt(self._time_origin)) / 1000.0;
+    return @as(f64, @floatFromInt(self._time_origin_unix)) / 1000.0;
 }
 
 fn getNavigation(self: *Performance) *PerformanceNavigation {
@@ -284,10 +292,13 @@ const ResourceInfo = struct {
 };
 
 pub fn addResource(self: *Performance, info: ResourceInfo) !void {
-    const buffer_full = self._resources.items.len >= self._resource_buffer_size;
-    if (buffer_full) {
+    var buffer: ?*std.ArrayList(*Entry) = &self._resources;
+    if (self._buffer_full_pending or self.canAddResource() == false) {
         try self.scheduleBufferFull();
-        if (self.hasObserverFor(.resource) == false) {
+        buffer = if (self._buffer_full_pending) &self._secondary_resources else null;
+        if (buffer == null and self.hasObserverFor(.resource) == false) {
+            // There's no listener, so nothing can copy from our secondary, so
+            // we just drop it
             return;
         }
     }
@@ -333,9 +344,13 @@ pub fn addResource(self: *Performance, info: ResourceInfo) !void {
     rt._proto._type = .{ .resource = rt };
     // Observers see every entry; only the buffer has a cap.
     try self.notifyObservers(rt._proto);
-    if (!buffer_full) {
-        try self.insertOrdered(&self._resources, rt._proto);
+    if (buffer) |b| {
+        try self.insertOrdered(b, rt._proto);
     }
+}
+
+fn canAddResource(self: *const Performance) bool {
+    return self._resources.items.len < self._resource_buffer_size;
 }
 
 fn gated(self: *const Performance, allow: bool, micros: u64) f64 {
@@ -345,7 +360,7 @@ fn gated(self: *const Performance, allow: bool, micros: u64) f64 {
 // https://mimesniff.spec.whatwg.org/#minimize-a-supported-mime-type
 fn minimizeMimeType(header: []const u8) []const u8 {
     var buf: [255]u8 = undefined;
-    const raw = std.mem.trim(u8, header[0 .. std.mem.indexOfScalar(u8, header, ';') orelse header.len], " \t");
+    const raw = std.mem.trim(u8, header[0 .. std.mem.findScalar(u8, header, ';') orelse header.len], " \t");
     if (raw.len > buf.len) {
         return "";
     }
@@ -430,7 +445,7 @@ fn contentEncoding(header: []const u8) []const u8 {
     if (header.len == 0) {
         return "";
     }
-    if (std.mem.indexOfScalar(u8, header, ',') != null) {
+    if (std.mem.findScalar(u8, header, ',') != null) {
         return "multiple";
     }
     var buf: [8]u8 = undefined;
@@ -576,7 +591,7 @@ fn notifyObservers(self: *Performance, entry: *Entry) !void {
     for (self._observers.items) |observer| {
         if (observer.interested(entry)) {
             observer._entries.append(observer._arena, entry) catch |err| {
-                lp.log.err(.frame, "Performance.notifyObservers", .{ .err = err });
+                lp.log.debug(.frame, "Performance.notifyObservers", .{ .err = err });
             };
         }
     }
@@ -593,11 +608,8 @@ fn hasObserverFor(self: *const Performance, kind: Entry.Type.Enum) bool {
     return false;
 }
 
-// https://w3c.github.io/resource-timing/#dfn-fire-a-buffer-full-event
 // The event is queued rather than fired inline: addResource runs from the
-// HTTP layer, with no JS on the stack. We have no secondary buffer, so an
-// entry that overflows is dropped instead of being copied back in by a
-// handler that calls clearResourceTimings.
+// HTTP layer, with no JS on the stack.
 fn scheduleBufferFull(self: *Performance) !void {
     if (self._buffer_full_pending) {
         return;
@@ -612,19 +624,45 @@ fn scheduleBufferFull(self: *Performance) !void {
         struct {
             fn run(_self: *anyopaque) anyerror!?u32 {
                 const perf: *Performance = @ptrCast(@alignCast(_self));
-                perf._buffer_full_pending = false;
-
-                const exec = perf._exec;
-                const event = try Event.initTrusted(.wrap(BUFFER_FULL), .{}, exec.page);
-                try exec.dispatch(perf.asEventTarget(), event, perf._on_buffer_full, .{
-                    .context = "Performance.resourcetimingbufferfull",
-                });
+                // only reset _after_ the handler runs, so that entries that get
+                // added go to the secondary buffer
+                defer perf._buffer_full_pending = false;
+                try perf.fireBufferFull();
                 return null;
             }
         }.run,
         0,
         .{ .name = "Performance.bufferFull" },
     );
+}
+
+// https://w3c.github.io/resource-timing/#dfn-fire-a-buffer-full-event
+fn fireBufferFull(self: *Performance) !void {
+    const secondary = &self._secondary_resources;
+    while (secondary.items.len > 0) {
+        const excess_before = secondary.items.len;
+        if (self.canAddResource() == false) {
+            const exec = self._exec;
+            const event = try Event.initTrusted(.wrap(BUFFER_FULL), .{}, exec.page);
+            try exec.dispatch(self.asEventTarget(), event, self._on_buffer_full, .{
+                .context = "Performance.bufferfull",
+            });
+        }
+        {
+            // copy the secondary buffers
+            var copied: usize = 0;
+            while (copied < secondary.items.len and self.canAddResource()) : (copied += 1) {
+                try self.insertOrdered(&self._resources, secondary.items[copied]);
+            }
+            secondary.replaceRangeAssumeCapacity(0, copied, &.{});
+        }
+
+        if (secondary.items.len >= excess_before) {
+            // The handler didn't make room for any of them, give up
+            secondary.clearRetainingCapacity();
+            return;
+        }
+    }
 }
 
 // The property handler for a JS-side dispatchEvent (see EventManager.dispatch).
@@ -674,7 +712,11 @@ pub fn scheduleDelivery(self: *Performance) !void {
                 while (i < perf._observers.items.len) : (i += 1) {
                     const observer = perf._observers.items[i];
                     if (observer.hasRecords()) {
-                        try observer.dispatch();
+                        observer.dispatch() catch |err| {
+                            if (err == error.ExecutionTerminated) {
+                                return err;
+                            }
+                        };
                     }
                 }
                 return null;
