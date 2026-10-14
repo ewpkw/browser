@@ -1,6 +1,43 @@
 # CHROME.md —— chrome 分支的当前状态与上游同步手册
 
-本文档的唯一用途：**让每一次上游同步又快又不出错**。因此只写两类内容——① 当前状态（分支目的、人设取值、fork 增量、已知限制），② 可重放流程（同步 SOP、验收、环境与编译、从零重建）。一次性迁移记录（某次要重抓哪个依赖、上次冲突长什么样）不写，处理完即丢。
+## 0. AI 执行指令（提示词：每次动手前先读本节）
+
+你是本仓库 `chrome` 分支的**全自动同步代理**。收到“同步上游”（或同义）指令后，自动完成整套流程：**同步上游 → 按需求合并 → 编译 → 替换二进制到 `/root/.local/bin/lightpanda` → 验收 → 回写文档 → 推送**；默认一路做到完、分段汇报，不要逐步征求确认。
+
+**开工前先通读**：§1（目的与不变量）、§2（裁决原则）、§4/§5（fork 重贴清单）、§6（SOP）、§7（验收）、§8（环境与编译）、§9（“明确不做”清单）、§10（测试纪律）。用户当次指令优先于本文件；用户只说“同步”时，按本文件全套流程执行。
+
+**执行方式**：严格照 §6.2 的 0 → 7 步走，一步不跳。不可跳过的关键点：
+
+1. **解冲突**：冲突文件一律 `git checkout --theirs` 取上游原版，再照 §5.x 逐项重贴 fork 行；**禁止在 fork 旧结构上手工缝合**。
+2. **语义冲突检查（3b）**：即使 git 报无冲突也必须做——上游可能已在别处实现同一机制，命中就按 §2 原则 1 删掉 fork 那一份。
+3. **核对**：`git diff upstream/main..HEAD --stat -- src` 恰好 = §4 的 8 个文件；`zig fmt --check ./*.zig ./**/*.zig` 全绿；`zig build --fetch` EXIT=0 且无输出。
+4. **编译 + 部署**：`ZIGFLAGS="-Dcpu=skylake_avx512" make build`（编译机是 Zen 5，缺此参数在 Intel 生产机会 SIGILL；日志须出现两次 `Using prebuilt V8:`）→ `cp -f zig-out/bin/lightpanda /root/.local/bin/lightpanda && lightpanda version`。
+5. **验收**：按 §7 执行（第 2、3 步锁链校验必做；CDP 四项、Sec-Fetch 逐资源类型、`javascript:` 单测试文件逐项跑）；偏离按 §7 的判定表归因。
+6. **回写 + 提交**：按 §6.4 清单更新本文档；`git commit && git push origin chrome`。
+
+**纪律（硬性）**：
+
+- 裁决依据只认本文档：§1 不变量、§2 原则、§9 “明确不做”；**fork 增量只许收缩不许扩张**，`Makefile`、`build.zig`、`build.zig.zon` 必须与上游零 diff。
+- 测试文件零改动（§10）；一次性迁移内容（本次重抓了哪个依赖、冲突长什么样）不写回文档，当场处理、在汇报里说明。
+- **只有以下情况停下请示**：需要扩大 fork（如新增第 9 个文件）或遇到文档未覆盖的新情况；命中 §9 待决策/待核实项；验收出现结构性偏离且无法按文档归因；无法自动修复的失败。
+
+**收尾必须输出结构化汇报**：
+
+```text
+同步：<旧基线> → <新基线>（N 个上游提交）
+冲突：<文件清单 + 每个文件按 §5.x 重贴了什么>
+语义检查：<3b 结论；上游有无同类机制>
+核对：diff=8 文件 OK / fmt OK / fetch OK
+编译：make build OK（prebuilt V8 ×2）
+部署：/root/.local/bin/lightpanda 已更新，version=...
+验收：§7 各步通过情况与偏离项
+文档：§6.4 已更新 <章节>
+遗留：<无 / 待用户决策项>
+```
+
+---
+
+本文档是 AI 全自动完成「同步上游 → 按需求合并 → 编译 → 替换二进制」整套作业的唯一依据，只写两类内容——① 当前状态（分支目的、人设取值、fork 增量、已知限制），② 可重放流程（同步 SOP、验收、环境与编译、从零重建）。一次性迁移记录（某次要重抓哪个依赖、上次冲突长什么样）不写，处理完即丢。
 
 > **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `94d324136`。
 >
@@ -94,7 +131,6 @@ git diff upstream/main..HEAD --stat -- src   # 必须恰好第 4 节那 8 个文
 | 8 | `src/server/cdp/domains/browser.zig` | 8 / 2 | `CDP_USER_AGENT` + `PRODUCT` 对齐人设（2 个常量） |
 
 > 「逻辑改动点」不等于 `git diff` 的 hunk 数（相邻改动会被并成一个 hunk，例如 Navigator 7 行取值只构成 4 个 hunk）。核对以第 5 节的逐项列表为准。
-> 历史上 `src/browser/webapi/WorkerNavigator.zig` 曾多占一个 fork 名额（被迫跟随 `Navigator.getLanguages` 返回类型）。语言人设改由 `default_locale` 驱动后它已回归上游原样，不再是冲突点。
 
 ---
 
@@ -719,7 +755,7 @@ node --check /tmp/cdp_secfetch.mjs && node /tmp/cdp_secfetch.mjs
 | Worker | `dest: worker`、`mode: …`、`site: …` | 全上游（本分支旧版选择不发，现已交上游） |
 | 任何 `http://`（非安全上下文）请求 | **不发 `sec-fetch-*` 整族**；但顶层导航仍发 U-I-R / priority | 上游裁剪 + 本分支补 |
 
-> 前三行是本轮同步的重点：旧版本它们全坏在同一个位置（本分支按 `resource_type == .document` 判顶层），现在全部由上游拿真实发起方算。跑这一步时只要看到子帧或页内跳转带上了 `user: ?1`，或 `site` 永远是 `none`，说明上游的 `initiator_origin` 链路被改坏了。
+> 前三行是每次同步的重点：旧版本它们全坏在同一个位置（本分支按 `resource_type == .document` 判顶层），现在全部由上游拿真实发起方算。跑这一步时只要看到子帧或页内跳转带上了 `user: ?1`，或 `site` 永远是 `none`，说明上游的 `initiator_origin` 链路被改坏了。
 
 ### 第九步：`javascript:` URL 导航回归（验 §9-16/18 依赖的上游机制没被同步改坏）
 
@@ -968,11 +1004,11 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
     旧版这两条已知不一致已被上游修正，不属本分支了：① 子帧文档自称 `dest: document` + `user: ?1`（现为 `iframe` 且不带 user flag）；② 导航的 `sec-fetch-site` 恒为 `none`（现按 `Request.initiator_origin` 算真值）。
 11. **换 UA 人设时 client hints 不跟着变**：`--user-agent` 只改 UA（实测 UA 变 Chrome/120 而 `Sec-Ch-Ua` 仍是 151），`--http-header` 又拦住 `Sec-Ch-Ua`（见第 6 条）。要换版本人设：走 CDP（`Network.enable` + `setExtraHTTPHeaders`，实测可覆盖），或同时改代码里的 `user_agent_base` + `brands`（第 3 节末尾那**五处**）。注意 `Browser.getVersion` 不会跟着 `--user-agent` 变（它是 5.8 的编译期常量）。
 12. 小噪声（非问题）：httpbin 把请求头名按首字母大写重新格式化，回显成 `Sec-Ch-Ua-Wow64`；实际发出的是 `Sec-Ch-Ua-WoW64`（`baselineHeaders` 可证）。
-13. **`Browser.getVersion` 的 `jsVersion` / `revision` / `protocolVersion` 仍是上游硬编码值**（`JS_VERSION = "12.4.254.8"`、`REVISION = "@9e6ded5ac…"`）：5.8 只对齐了 `userAgent` 与 `product`，V8 版本与 Edge 151 不自洽。**本轮决定不改**（按第 2 节原则 6：没有站点拿 jsVersion 去交叉比对 UA，改动只会多两个无谓的 delta）；若以后要改，就在 5.8 那节里多贴两个常量。
-14. **⚠ 待你核实的存疑值（本次未改）**：真实 Edge 的 `Sec-Ch-Ua-Full-Version-List` 里，`Microsoft Edge` 应该用 **Edge 自己的构建号**（形如 `15x.0.4xxx.x`），`Chromium` 才用 Chrome 底座的构建号（形如 `15x.0.8xxx.x`）。当前 `Config.HttpHeaders.brands` 两项都写的是同一个 `151.0.7813.2`（Chrome 风格的号）。影响范围：`Sec-Ch-Ua-Full-Version-List`、`getHighEntropyValues().fullVersionList` / `uaFullVersion`、`Browser.getVersion` 的 `product`（5.8 故意与它们同源，所以改要一起改）。**需你先用真机 Edge 151 抄一份真实头再定**，本轮按你的要求保持 151 与现有取值不动。
+13. **`Browser.getVersion` 的 `jsVersion` / `revision` / `protocolVersion` 仍是上游硬编码值**（`JS_VERSION = "12.4.254.8"`、`REVISION = "@9e6ded5ac…"`）：5.8 只对齐了 `userAgent` 与 `product`，V8 版本与 Edge 151 不自洽。**决定不改**（按第 2 节原则 6：没有站点拿 jsVersion 去交叉比对 UA，改动只会多两个无谓的 delta）；若以后要改，就在 5.8 那节里多贴两个常量。
+14. **⚠ 待你核实的存疑值（暂未改）**：真实 Edge 的 `Sec-Ch-Ua-Full-Version-List` 里，`Microsoft Edge` 应该用 **Edge 自己的构建号**（形如 `15x.0.4xxx.x`），`Chromium` 才用 Chrome 底座的构建号（形如 `15x.0.8xxx.x`）。当前 `Config.HttpHeaders.brands` 两项都写的是同一个 `151.0.7813.2`（Chrome 风格的号）。影响范围：`Sec-Ch-Ua-Full-Version-List`、`getHighEntropyValues().fullVersionList` / `uaFullVersion`、`Browser.getVersion` 的 `product`（5.8 故意与它们同源，所以改要一起改）。**需你先用真机 Edge 151 抄一份真实头再定**，核实前保持 151 与现有取值不动。
 15. **`/json/version` 明文自报 `Lightpanda/1.0`**（`src/server/http.zig` 的 `buildJSONVersionResponse()`：`"Browser"` 与 `"User-Agent"` 两个值都是硬编码的 `Lightpanda/1.0`，另有一个键名就叫 `Lightpanda-Version`）。**决定：不改**，fork 保持 8 个文件。**理由：页面脚本读不到** —— 该响应不带任何 `Access-Control-*` 头（已在 `http.zig` 全文核实），跨源的 `fetch`/`XHR` 打 `127.0.0.1:9222/json/version` 会被 CORS 拦住拿不到响应体（只能探测到端口存活，真 Chrome 的 DevTools 端点也一样），WS 升级路径另有 `ForbiddenOrigin` / `ForbiddenHost` 校验。所以 bot.sannysoft / browserscan / creepjs 这类**站点侧**检测看不到它，与第 1 节不变量 2 不冲突。
     **失效条件（必须守住）**：跨源只拦浏览器，拦不住直连客户端。上面那个结论仅在 **CDP 端口不出 loopback** 时成立 —— CLI 默认 `--host 127.0.0.1`（`Config.zig` 的 `serve.host`），一旦改成 `0.0.0.0`/对外暴露，同网段任何能连上端口的对端 curl 一次就拿走明文 `Lightpanda/1.0`（含版本号）。如果部署形态必须对外，再回来把这一条改成 fork（届时两个值跟 5.8 同源，`Lightpanda-Version` 键名要一并换）。
-    **运维口径（本轮已定）**：本文档所有启动示例统一写 `--host 127.0.0.1`（含 8.7 一键脚本的收尾提示），与 CLI 默认一致；反爬站点的威胁模型里“监听地址”不是对外特征（它进不了内网端口），所以该泄露面属于运维问题，不归本分支的伪造特征范围。真需要跨机访问 CDP 时再评估上面那句 fork。
+    **运维口径**：本文档所有启动示例统一写 `--host 127.0.0.1`（含 8.7 一键脚本的收尾提示），与 CLI 默认一致；反爬站点的威胁模型里“监听地址”不是对外特征（它进不了内网端口），所以该泄露面属于运维问题，不归本分支的伪造特征范围。真需要跨机访问 CDP 时再评估上面那句 fork。
 16. **`javascript:` URL 按 HTML 规范执行脚本（上游机制，本分支零 fork，见第 7 节第九步）**
     上游在 `Frame.zig` 的 `scheduleNavigationWithArena` 里加了早退块：`javascript:` URL 不再当文档请求，而是交给 `user_input.runJavascriptUrl`（queued task + 百分号解码），且只在 `target == originator` 或两者同源时执行；`URL.isJavascriptUrl` 容忍前导 C0 控制符/空格与大小写；表单 `action` 是 `javascript:` 时不再拼 query 串。
     **决定：不 fork、不覆盖**（第 2 节原则 1）。把 `javascript:` 改成"静默忽略"会同时踩三个坑：① 弄坏上游测试 `src/browser/tests/window/location_javascript_url.html`（href / assign / replace / form action 四条路径）；② 把 fork 增量压到 `Frame.zig`——上游最热的文件之一（4400+ 行，导航/历史/生命周期类改动频繁落在它上面），每次同步都要重贴；③ 偏离真实浏览器行为，与本分支立身之本（第 1 节）相反。
@@ -988,7 +1024,7 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
     `Frame.zig` 的 `errorPageNavigated()` 里 `try self.js.setOrigin(null)` 与 `try Location.init(self.url, self)` 都是可失败的；任一抛错就让函数提前返回，**后面的 `frame_navigated` 通知不会 dispatch**，`self.window._location` 也仍指向已被替换掉的旧文档。`frameErrorCallback` 只把它打成一行 `log.err(.frame, "error page navigated", …)` 就继续往下走。
     触发条件是"导航失败 + `self.url` 无法被 `URL.init` 重新解析"这个组合。`javascript:` 已被上游消除（§9-16），页面侧非可导航 scheme 也被上游守卫覆盖（§9-17）；剩余入口是绕过 `scheduleNavigationWithArena` 的 CDP / BiDi 直连导航（`Page.navigate` 等）——失败导航的 URL 往往解析不出合法 host/port。
     危害等级高于普通缺陷：故障形态是**静默、无超时、无上报的永久挂起**（`page.evaluate` 永不返回），调用侧只能靠外层超时兜底，容易演变成批量任务的无限重试。
-    **决定：本轮不改 fork，优先向上游提 issue / PR。** 理由：① 它是通用稳健性缺陷，不是本分支的伪造特征需求，归属上游最合适（上游明显接受外部 PR：`git log --format='%an' <旧基线>..upstream/main` 里非核心维护者的提交占相当比例，`javascript:` 那个修复本身就是外部贡献者提的）；② 上游收下 → fork 保持 8 个文件零增量；③ 落点仍是 `Frame.zig`。
+    **决定：不改 fork，优先向上游提 issue / PR。** 理由：① 它是通用稳健性缺陷，不是本分支的伪造特征需求，归属上游最合适（上游明显接受外部 PR：`git log --format='%an' <旧基线>..upstream/main` 里非核心维护者的提交占相当比例，`javascript:` 那个修复本身就是外部贡献者提的）；② 上游收下 → fork 保持 8 个文件零增量；③ 落点仍是 `Frame.zig`。
     补丁要点（约 6 行，**未编译验证**；真要贴时按第 5 节的流程走，贴完 `zig fmt --check` + `zig build check`）：把 `js.setOrigin` 与 `Location.init` 两处从 `try` 降级为 `catch |e| { log.err(...) }`；`Location.init` 失败时保留旧 `_location` 不动；**保证函数末尾的 `frame_navigated` dispatch 无条件执行**。这样"失败导航 → 错误文档恢复"这条路对任何 URL 都走得完。
     若上游不收且现场再次命中：按上面要点自己贴，并在第 4 节把 `Frame.zig` 记为第 9 个 fork 文件（含增删行数与改动点数）、把本条从"待决策"改成"已 fork"、在第 5 节补一节逐行详情。
 
