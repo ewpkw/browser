@@ -2,7 +2,7 @@
 
 本文档的唯一用途：**让每一次上游同步又快又不出错**。因此只写两类内容——① 当前状态（分支目的、人设取值、fork 增量、已知限制），② 可重放流程（同步 SOP、验收、环境与编译、从零重建）。一次性迁移记录（某次要重抓哪个依赖、上次冲突长什么样）不写，处理完即丢。
 
-> **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `24092db4a`。
+> **fork 基线**：上游 `lightpanda-io/browser` 的 `main` @ `94d324136`。
 >
 > **版本类信息一律从仓库读，不在本文档写死**，否则必然过期：
 >
@@ -586,12 +586,10 @@ lightpanda fetch --load-resources iframe,worker --wait-until networkidle --wait-
 lightpanda fetch --load-resources iframe,worker --wait-until networkidle --wait-ms 15000 --dump markdown "https://abrahamjuliot.github.io/creepjs/"
 
 # 5b. 已实测基准（同一套命令的正常输出长这样，偏离就是回归）
-#     ⚠ 待复验：第 2 步的完整头集合（含 Accept-Encoding: deflate, gzip, br, zstd）、第 3 步
-#        JS 指纹、第 4 步 --locale 切换、第 6 步两条 CLI 拦截，这四项是在基线 c4b59af21
-#        （V8 15.5.35.13）上实测的。当前基线已推进到 24092db4a：fork 那 8 个文件逐行未变、
-#        人设取值一项没动、依赖与 V8 tag 零变化，所以沿用旧值，但**新基线上尚未重跑**。
-#        下列浏览器特征检测站三条更旧（基线 e8aa75939 上的记录），同样当成"预期大致如此"看。
-#        跑完请把实际结果回写本节，并把"待复验"去掉。
+#     第 2 步的完整头集合（含 Accept-Encoding: deflate, gzip, br, zstd）、第 3 步 JS 指纹、
+#     第 4 步 --locale 切换、第 6 步两条 CLI 拦截，四项已在当前基线 94d324136
+#     （V8 15.5.35.13）上实测，输出与本节基准一致。
+#     下列浏览器特征检测站三条仍是基线 e8aa75939 上的旧记录（未在新基线复跑），当"预期大致如此"看。
 #   browserscan Bot Detection：WebDriver / WebDriver Advance / Selenium / Webdriverio /
 #     NightmareJS / PhantomJS / Awesomium / Cef / CefSharp / Coaches / FMiner / Born /
 #     Phantomas / Rhino / Headless Chrome / CDP / Dev Tool —— 共 17 项全 Normal，0 Abnormal
@@ -732,6 +730,7 @@ TEST_FILTER="#location_javascript_url" make test
 ```
 
 - 上游测试 `src/browser/tests/window/location_javascript_url.html` 覆盖 `location.href` / `assign()` / `replace()` / 表单 `action` 四条路径，断言脚本**被执行**且**文档不被替换**（`window.__marker === 'kept'`、`location.href` 不变）。
+- 同区域的上游新增测试 `src/browser/tests/window/location_external_scheme.html`（§9-17）：`TEST_FILTER="#location_external_scheme" make test`，断言点击 `mailto:` / `tel:` 链接与 `location.href = 'sms:…'` 之后页面与 `location.href` 均不变。
 - 这不违反第 10 节"不跑 `make test`"的纪律：只跑这一个上游测试文件，本分支不维护任何测试适配。过滤器是子串匹配（`test_runner.zig` 的 `shouldRun`），`#` 后面写文件名即可。
 - 不想编测试二进制时的手工等价验证：CDP `Page.navigate` 到一个含 `location.href='javascript:window.__x=1'` 的页面，随后 `Runtime.evaluate` 读 `window.__x` 应为 `1`；**且这句 evaluate 必须能返回**——返回不了就是 §9-18 那条挂死路径又活了。
 - 反向确认（确认本分支没有偷偷压掉上游行为）：`git diff upstream/main..HEAD --stat -- src/browser/Frame.zig src/browser/URL.zig src/browser/frame/user_input.zig` 必须为空。
@@ -812,10 +811,13 @@ for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep
   timeout 600 zig fetch "$u" || echo "FAILED: $u"
 done
 
-# 2) GitHub git+https 类——GIT_CONFIG 临时把 https 改写成 SSH，不动全局 git 配置
+# 2) GitHub git+https 类——zig 0.17 的 fetch 是原生 git 实现：不调用 git 二进制（PATH
+#    放假 git 实测零调用）、不支持 git+ssh（unsupported URL scheme）、不读 GIT_CONFIG_*
+#    （env 与 GIT_CONFIG_GLOBAL 实测都无效）。直连 GitHub 必失败（unable to discover
+#    remote git server capabilities: HttpConnectionClosing / Timeout）。ghfast.top 能代理
+#    smart-HTTP：把镜像前缀直接拼进 URL，实测 zig fetch 输出的 hash 与 manifest 一致。
 for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+https://github.com'); do
-  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.git@github.com:.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/" \
-    timeout 600 zig fetch "$u" || echo "FAILED: $u"
+  timeout 600 zig fetch "git+https://ghfast.top/https://${u#git+https://}" || echo "FAILED: $u"
 done
 
 # 2b) 非 GitHub 的 git 源（如 codeberg.org 的 translate-c）——直连
@@ -918,8 +920,7 @@ for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep
 for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep -v '^git+' | grep -v github.com); do
   zig fetch "$u" || echo "FAILED: $u"; done
 for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+https://github.com'); do
-  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.git@github.com:.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/" \
-    zig fetch "$u" || echo "FAILED: $u"; done
+  zig fetch "git+https://ghfast.top/https://${u#git+https://}" || echo "FAILED: $u"; done
 for u in $(grep -oP '(?<=\.url = ")[^"]+' build.zig.zon | grep '^git+' | grep -v github.com); do
   zig fetch "$u" || echo "FAILED: $u"; done
 zig build --fetch                            # 报 hash mismatch 见 8.4 的 zig 0.17.0 坑
@@ -940,6 +941,7 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
 | `zig version` 与 `minimum_zig_version` 不符 | 按 8.2 重装 |
 | V8 下载失败 / 只有半截文件 | 按 8.3 的镜像法（`.part` + `mv -f`） |
 | `zig build` 卡在依赖解析 / `HttpConnectionClosing` | 按 8.4 离线抓取，再 `zig build --fetch` 验证 |
+| git 依赖报 `unable to discover remote git server capabilities` / `unsupported URL scheme: git+ssh` | zig 0.17 fetch 是原生 git 实现（不走 git 二进制、不读 GIT_CONFIG_*、无 SSH）：按 8.4 第 2 步用 ghfast 镜像前缀重抓 |
 | 输出里没有 `Using prebuilt V8: …` | 缓存不在 `action.yml` 所写 tag 的目录里：重跑 `make download-v8` |
 | 链接期报 undefined `v8__*` 符号 | 缓存里是旧 tag 的 `.a`；重跑 `make download-v8`（缓存按 tag 分目录） |
 | `make build` 比往常慢很多 | 正常：清过 `.zig-cache` / `make clean` 就是冷编译。若日志没有 `Using prebuilt V8: …` 才是在源码编 V8 |
@@ -977,15 +979,14 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
     它消除的挂死路径（本分支曾经中招，实证）：站点脚本 `location.href = 'javascript:history.back(-1);'` → 没有早退时走 `navigate()` 的补前缀分支，被拼成 `http://javascript:history.back(-1);` → curl `UrlMalformat` → `frameErrorCallback` → `errorPageNavigated()` 里 `Location.init` 解析该 URL 抛 `error.TypeError`（端口段不是数字）→ **`frame_navigated` 通知永不 dispatch** → CDP 客户端失去执行上下文（现场：`page.evaluate` 静默挂起、`Execution context destroyed`）。缺口本身仍在，见 §9-18。
     **副作用（必须知道，这不是缺陷）**：站点自己写的 `history.back(-1)` 现在会真的执行（`History.back` → `goInner` → `navigateInner(.traverse)` → 判定非同文档 → `scheduleNavigation` 回退到上一条历史），**当前文档被替换掉**。真实 Chrome 同样如此。所以"等页面停下来再 scrape DOM"的写法在这类站点上会读空；要拿导航当时的响应内容，改在响应层取：CDP `Network.enable` + `Network.responseReceived` → `Network.getResponseBody(requestId)`，不受后续导航影响，且在真实浏览器上同样成立。
     推论：**不要把"旧版 lightpanda 忽略 javascript: 所以文档留着"当成可依赖的契约**——那是偏离真实浏览器的行为，随上游同步消失是必然的。
-17. **`javascript:` 以外的非可导航 scheme（`mailto:` / `tel:` / `sms:` / `magnet:` …）仍会被当成文档请求**
-    `scheduleNavigationWithArena` 只拦 `javascript:` 一种。其余 scheme 会继续走到 `navigate()`，那里对"不是 complete HTTP URL"的输入一律补 `http://` 前缀，于是变成 `http://mailto:x@y` → curl `UrlMalformat` → 提交 "Navigation failed" 错误文档，把当前页覆盖掉（并可能撞上 §9-18 的挂死）。
-    两个入口覆盖面不同：页面侧（点 `<a href="mailto:">`、表单 `action`、`location.href`）走 `scheduleNavigationWithArena`；CDP `Page.navigate` **直接调 `frame.navigate()`，绕过它**（`src/server/cdp/domains/page.zig`），所以在 `scheduleNavigationWithArena` 里加白名单挡不住 CDP 入口。
-    **决定：不改。** 理由：① 不是任何已知现场故障的触发点；② 两个可能的落点都在 `Frame.zig`，成本见 §9-16；③ 真实 Chrome 对 `mailto:` 也不是"静默忽略"，而是交给外部协议处理器，本分支没有这个能力，两种做法都不像真浏览器（第 2 节原则 6）；④ 真正的灾害是"失败导航把客户端挂死"，那由 §9-18 一次性覆盖所有 scheme，比逐个 scheme 设白名单更省。
-    **失效条件（命中就回来改）**：自动化流程里出现点击 `mailto:` / `tel:` 链接、或 CDP 下发非 http(s) URL，且观察到"当前页被错误文档覆盖"或客户端挂起。
-    届时若只需覆盖页面侧入口，最小做法是在上游 `javascript:` 早退块**之后**（绝不能之前，否则压掉上游规范行为并弄坏它的新测试）加：取 `URL.getProtocol(resolved_url)`，非空且不在 `http:` / `https:` / `ws:` / `wss:` / `blob:` / `data:` / `about:` 之内 → `arena.release(); return;`（与 fragment 早退同款写法，早退发生在 `abortDocumentLoad()` 之前，连当前文档的 load 都不会被掐掉）。`scheme.len > 0` 这个守卫不能省：`getProtocol` 对无 scheme 的输入返回 `""`，落进白名单判断会把上游本来能处理的畸形输入一起吞掉，无故扩大行为差。
+17. **非可导航 scheme：页面侧入口已由上游跳过，CDP 入口仍绕守卫**
+    上游自 `199e00856` 起在 `scheduleNavigationWithArena` 的 `javascript:` 早退块**之后**加了守卫：`URL.isFetchable(resolved_url) == false` → `log.info` + `arena.release()` + return；白名单是 `about:` / `blob:` / `data:` / `file:` / `http:` / `https:`（无 scheme 的输入也判不可 fetch）。效果：页面侧入口（点 `<a href="mailto:">`、表单 `action`、`location.href` 置 `sms:` 等）不再把 `mailto:` / `tel:` 拼成 `http://mailto:…` 去打网络，当前页不被 "Navigation failed" 错误文档覆盖。上游新测试 `src/browser/tests/window/location_external_scheme.html` 断言点击与赋值后页面和 `location.href` 均不变；本分支零 fork，照跑（见第 7 节第九步）。
+    **CDP 入口不受保护**：`Page.navigate` / `navigateToHistoryEntry` / `reload` 与 BiDi 导航直接调 `frame.navigate()` / `Session.initiateRootNavigation()`（`src/server/cdp/domains/page.zig`、`src/server/bidi/browsing_context.zig`），绕过 `scheduleNavigationWithArena`；CDP 下发非 http(s) URL 时"失败导航 → 错误文档 / 客户端挂起"的路径仍然存在（§9-18）。
+    **决定：本分支零 fork。** 页面侧交上游；CDP 侧的真实灾害是"失败导航把客户端挂死"，由 §9-18 一次性覆盖所有 scheme，比逐个 scheme 设白名单更省。
+    **失效条件（命中就回来改）**：自动化流程里 CDP 下发非 http(s) URL，且观察到"当前页被错误文档覆盖"或客户端挂起。
 18. **⚠ 待决策：`errorPageNavigated()` 可失败 → 失败导航会把 CDP 客户端永久挂起（通用缺口，上游未修）**
     `Frame.zig` 的 `errorPageNavigated()` 里 `try self.js.setOrigin(null)` 与 `try Location.init(self.url, self)` 都是可失败的；任一抛错就让函数提前返回，**后面的 `frame_navigated` 通知不会 dispatch**，`self.window._location` 也仍指向已被替换掉的旧文档。`frameErrorCallback` 只把它打成一行 `log.err(.frame, "error page navigated", …)` 就继续往下走。
-    触发条件是"导航失败 + `self.url` 无法被 `URL.init` 重新解析"这个组合。`javascript:` 这一种已被上游消除（§9-16），其余入口仍在：CDP `Page.navigate` 传非 http(s) URL、表单 `action` 是奇怪 scheme 等（§9-17）——补 `http://` 前缀后 host/port 段往往非法。
+    触发条件是"导航失败 + `self.url` 无法被 `URL.init` 重新解析"这个组合。`javascript:` 已被上游消除（§9-16），页面侧非可导航 scheme 也被上游守卫覆盖（§9-17）；剩余入口是绕过 `scheduleNavigationWithArena` 的 CDP / BiDi 直连导航（`Page.navigate` 等）——失败导航的 URL 往往解析不出合法 host/port。
     危害等级高于普通缺陷：故障形态是**静默、无超时、无上报的永久挂起**（`page.evaluate` 永不返回），调用侧只能靠外层超时兜底，容易演变成批量任务的无限重试。
     **决定：本轮不改 fork，优先向上游提 issue / PR。** 理由：① 它是通用稳健性缺陷，不是本分支的伪造特征需求，归属上游最合适（上游明显接受外部 PR：`git log --format='%an' <旧基线>..upstream/main` 里非核心维护者的提交占相当比例，`javascript:` 那个修复本身就是外部贡献者提的）；② 上游收下 → fork 保持 8 个文件零增量；③ 落点仍是 `Frame.zig`。
     补丁要点（约 6 行，**未编译验证**；真要贴时按第 5 节的流程走，贴完 `zig fmt --check` + `zig build check`）：把 `js.setOrigin` 与 `Location.init` 两处从 `try` 降级为 `catch |e| { log.err(...) }`；`Location.init` 失败时保留旧 `_location` 不动；**保证函数末尾的 `frame_navigated` dispatch 无条件执行**。这样"失败导航 → 错误文档恢复"这条路对任何 URL 都走得完。
@@ -1010,6 +1011,6 @@ echo "完成：lightpanda serve --host 127.0.0.1 --port 9222"   # 故意用 loop
 
 - `src/server/cdp/domains/browser.zig` 的 `test` 直接拿 `CDP_USER_AGENT` / `PRODUCT` 常量作期望值，所以 5.8 改值不产生失败测试。
 - 上游自己的 Sec-Fetch 测试（`HttpClient.zig` 里的 `sec-fetch-*` 断言、`tests/net/fetch.html`）逐个头断言，不断言"头集合恰好等于哪几个"；本分支只剩 U-I-R + Priority 两个额外头，不跟这些断言冲突。旧版表格最后那一行（"fork 给每个请求新增 Sec-Fetch 元数据以至断言集不对"）已随 5.3(b) 收敛到上游而作废；**但若以后上游新增"恰好等于 N 个头"式的断言，失败原因就归到这一条**，处遇同上：不修不删。
-- 上游的导航类测试（`tests/window/location_javascript_url.html` 等）**不列入上表**：本分支在该区域零 fork——`git diff upstream/main..HEAD --stat -- src/browser/Frame.zig src/browser/URL.zig src/browser/frame/user_input.zig` 为空，跑的是纯上游代码。所以它一旦失败就是真回归（第 7 节第九步），**不许用"本分支故意改了行为"来解释**，也不许改测试。将来若真的 fork 了 `Frame.zig`（§9-17/18），这一条要重新评估。
+- 上游的导航类测试（`tests/window/location_javascript_url.html` 等）**不列入上表**：本分支在该区域零 fork——`git diff upstream/main..HEAD --stat -- src/browser/Frame.zig src/browser/URL.zig src/browser/frame/user_input.zig` 为空，跑的是纯上游代码。所以它一旦失败就是真回归（第 7 节第九步），**不许用"本分支故意改了行为"来解释**，也不许改测试。将来若真的 fork 了 `Frame.zig`（§9-18），这一条要重新评估。
 
 > 唯一需要守住的纪律：**永远不要把这类测试"反向改写"成断言接受 Mozilla UA**。那会让测试变绿但污染测试代码，并使 `git diff upstream/main --stat -- src` 多出文件——违反第 2 节原则 6。
